@@ -8,6 +8,7 @@ import math
 import time
 import weakref
 
+from . import lm_bridge
 from .archive_store import encode
 
 logger = logging.getLogger(__name__)
@@ -108,6 +109,14 @@ class HistoryCaptureFilter(CustomFilter):
             elif not getattr(event, "message_str", "").strip():
                 return False
             if not observation["uid"]:
+                return False
+            if observation.get("self_id") and umo:
+                plugin.history.bot_ids.setdefault(umo.split(":", 1)[0], set()).add(
+                    observation["self_id"]
+                )
+            if "kind" not in observation and lm_bridge.is_dm_capturing_group(
+                plugin.context, event
+            ):
                 return False
             plugin._spawn_bg(
                 plugin.history.capture(observation, cfg), label=f"history-observe:{umo}"

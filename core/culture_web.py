@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from datetime import datetime, timedelta, timezone
@@ -90,11 +91,16 @@ class CultureWeb:
         return await self.respond(self.overview_data)
 
     async def overview_data(self, body=None, actor=""):
-        groups = []
-        for umo in self.service.history.store.groups():
-            if await self.service.history.allowed(umo):
-                group = self.service.history.store.group(umo)
-                groups.append({"scope": umo, "name": group["name"]})
+        raw_groups = await asyncio.to_thread(self.service.history.store.groups)
+        allowed_umos = [
+            umo for umo in raw_groups if await self.service.history.allowed(umo)
+        ]
+        groups = await asyncio.to_thread(
+            lambda: [
+                {"scope": umo, "name": self.service.history.store.group(umo)["name"]}
+                for umo in allowed_umos
+            ]
+        )
         try:
             owner = lm_bridge.detect_lm(self.plugin.context)
             memory = (
@@ -125,35 +131,62 @@ class CultureWeb:
     async def handle(self):
         return await self.respond(self.dispatch, body=True)
 
-    async def inspect_entry(self, umo, item):
-        if self.service.blocked(umo, item):
-            return {
-                "id": item["id"],
-                "revision": item["revision"],
-                "status": "hidden",
-                "name": "已隐藏",
-                "unavailable": True,
-            }
-        if not await self.service.valid_sources(umo, item):
-            return {
-                "id": item["id"],
-                "revision": item["revision"],
-                "status": item["status"],
-                "name": "证据不可用",
-                "unavailable": True,
-                "unknowns": ["原文缺失、已撤回或来源已切换，暂停展示解释"],
-            }
-        return dict(
-            self.service.public_item(item),
-            status=item["status"],
-            kind=item["kind"],
-            proposed_origin=item.get("origin"),
-            subjects=item["subjects"],
-            risk=item["risk"],
-            conflict=item["conflict"],
-            merged_into=item.get("merged_into"),
-            review_note=item.get("review_note", ""),
+    async def inspect_entries(self, umo, items):
+        if not items:
+            return []
+        snapshot = await asyncio.to_thread(
+            self.service._privacy_snapshot, umo, {i.get("source") for i in items}
         )
+        blocked_ids = set()
+        non_blocked = []
+        for item in items:
+            if self.service._is_item_blocked(item, snapshot):
+                blocked_ids.add(id(item))
+            else:
+                non_blocked.append(item)
+        flags = await self.service._batch_valid_sources(umo, non_blocked)
+        valid_ids = {id(item) for item, ok in zip(non_blocked, flags) if ok}
+        result = []
+        for item in items:
+            if id(item) in blocked_ids:
+                result.append(
+                    {
+                        "id": item["id"],
+                        "revision": item["revision"],
+                        "status": "hidden",
+                        "name": "已隐藏",
+                        "unavailable": True,
+                    }
+                )
+            elif id(item) not in valid_ids:
+                result.append(
+                    {
+                        "id": item["id"],
+                        "revision": item["revision"],
+                        "status": item["status"],
+                        "name": "证据不可用",
+                        "unavailable": True,
+                        "unknowns": ["原文缺失、已撤回或来源已切换，暂停展示解释"],
+                    }
+                )
+            else:
+                result.append(
+                    dict(
+                        self.service.public_item(item),
+                        status=item["status"],
+                        kind=item["kind"],
+                        proposed_origin=item.get("origin"),
+                        subjects=item["subjects"],
+                        risk=item["risk"],
+                        conflict=item["conflict"],
+                        merged_into=item.get("merged_into"),
+                        review_note=item.get("review_note", ""),
+                    )
+                )
+        return result
+
+    async def inspect_entry(self, umo, item):
+        return (await self.inspect_entries(umo, [item]))[0]
 
     async def dispatch(self, body, actor):
         if set(body) - {
@@ -189,7 +222,7 @@ class CultureWeb:
                 raise ValueError("单次最多验证2批、临时增加2次额度")
             if (
                 not await self.service.allowed(umo)
-                or self.service.store.state(umo)["paused"]
+                or (await asyncio.to_thread(self.service.store.state, umo))["paused"]
             ):
                 raise ValueError("当前群文化未启用或已暂停")
             lock = self.service.history.cycle_lock
@@ -198,7 +231,7 @@ class CultureWeb:
             async with lock:
                 key = "history_daily_limit"
                 day = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
-                before = self.service.history.store.quota(day)
+                before = await asyncio.to_thread(self.service.history.store.quota, day)
                 steps = []
                 try:
                     for _ in range(batches):
@@ -214,22 +247,31 @@ class CultureWeb:
                         if not advanced:
                             break
                 finally:
-                    after = self.service.history.store.quota(day)
-                    record = {
-                        "steps": steps,
-                        "extra_quota": extra,
-                        "used_before": before,
-                        "used_after": after,
-                        "restored_limit": self.plugin.config.get(key, 20),
-                    }
-                    with self.service.history.store.connection(write=True) as db:
-                        db.execute(
-                            "INSERT INTO culture_revisions(umo,entry_id,before_data,actor,action,note,created) VALUES(?,0,'{}',?,'verification',?,?)",
-                            (umo, actor, encode(record), time.time()),
-                        )
+
+                    def _record_verification():
+                        after = self.service.history.store.quota(day)
+                        rec = {
+                            "steps": steps,
+                            "extra_quota": extra,
+                            "used_before": before,
+                            "used_after": after,
+                            "restored_limit": self.plugin.config.get(key, 20),
+                        }
+                        with self.service.history.store.connection(write=True) as db:
+                            db.execute(
+                                "INSERT INTO culture_revisions(umo,entry_id,before_data,actor,action,note,created) VALUES(?,0,'{}',?,'verification',?,?)",
+                                (umo, actor, encode(rec), time.time()),
+                            )
+                        return rec
+
+                    record = await asyncio.to_thread(_record_verification)
                 return record
         if op == "progress":
-            job = self.service.store.job(umo)
+
+            def _load_progress():
+                return self.service.store.job(umo), self.service.store.state(umo)
+
+            job, state = await asyncio.to_thread(_load_progress)
             if job:
                 job = {
                     key: value
@@ -237,7 +279,7 @@ class CultureWeb:
                     if not key.endswith(("_fragment_id", "_fragment_hash"))
                 }
             return {
-                "state": self.service.store.state(umo),
+                "state": state,
                 "job": job,
                 "error": self.service.errors.get(umo, ""),
             }
@@ -262,27 +304,41 @@ class CultureWeb:
                 or len(query) > 160
             ):
                 raise ValueError("分页或查询参数无效")
-            token = self.service.token(umo)
-            items, total = self.service.store.entries(
-                umo, status=status, query=query, limit=20, offset=(page - 1) * 20
-            )
-            entries = [await self.inspect_entry(umo, e) for e in items]
-            if token != self.service.token(
-                umo
-            ) or not await self.service.history.allowed(umo):
+
+            def _load_list():
+                return self.service.token(umo), self.service.store.entries(
+                    umo, status=status, query=query, limit=20, offset=(page - 1) * 20
+                )
+
+            token, (items, total) = await asyncio.to_thread(_load_list)
+            entries = await self.inspect_entries(umo, items)
+            if await asyncio.to_thread(
+                self.service.token, umo
+            ) != token or not await self.service.history.allowed(umo):
                 raise ValueError("资料已更新，请刷新")
             return {"entries": entries, "total": total, "page": page}
         if op == "detail":
-            token = self.service.token(umo)
-            item = self.service.store.entry(umo, body.get("id"))
+
+            def _load_detail():
+                return self.service.token(umo), self.service.store.entry(
+                    umo, body.get("id")
+                )
+
+            token, item = await asyncio.to_thread(_load_detail)
             if not item:
                 raise ValueError("词条不存在")
             detail = await self.inspect_entry(umo, item)
             revisions = []
             if not detail.get("unavailable"):
-                for r in self.service.store.revisions(umo, item["id"]):
-                    before = self.service.store.unpack(json.loads(r["before_data"]))
-                    old = await self.inspect_entry(umo, before)
+                raw_revs = await asyncio.to_thread(
+                    self.service.store.revisions, umo, item["id"]
+                )
+                befores = [
+                    self.service.store.unpack(json.loads(r["before_data"]))
+                    for r in raw_revs
+                ]
+                inspected_befores = await self.inspect_entries(umo, befores)
+                for r, old in zip(raw_revs, inspected_befores):
                     revisions.append(
                         {
                             "id": r["id"],
@@ -293,9 +349,9 @@ class CultureWeb:
                             "before": old,
                         }
                     )
-            if token != self.service.token(
-                umo
-            ) or not await self.service.history.allowed(umo):
+            if await asyncio.to_thread(
+                self.service.token, umo
+            ) != token or not await self.service.history.allowed(umo):
                 raise ValueError("资料已更新，请刷新")
             return {"entry": detail, "revisions": revisions}
         if op == "action":

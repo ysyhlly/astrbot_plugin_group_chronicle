@@ -6,6 +6,7 @@ import hashlib
 import difflib
 import json
 import math
+import os
 import re
 import sqlite3
 import threading
@@ -13,6 +14,145 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+
+_UNSAFE_FS_TYPES = frozenset(
+    {
+        "9p",
+        "9p2000",
+        "drvfs",
+        "virtiofs",
+        "grpcfuse",
+        "osxfs",
+        "vboxsf",
+        "vmhgfs",
+        "prl_fs",
+        "nfs",
+        "nfs4",
+        "cifs",
+        "smb3",
+        "smbfs",
+        "afs",
+        "ceph",
+        "glusterfs",
+        "lustre",
+        "sshfs",
+        "ecryptfs",
+    }
+)
+_JOURNAL_MODES: dict[tuple[str, int], str] = {}
+_JOURNAL_LOCK = threading.Lock()
+_MAX_FORCED_REVISION_PER_BASE = 10
+_MAX_FORCED_REVISION_PER_GROUP = 50
+_MAX_INVALID_FORCED_REVISION_PER_GROUP = 10
+
+
+def _mount_fstype(path: Path) -> str | None:
+    """Return the filesystem type hosting ``path``, or None if unavailable."""
+    try:
+        with open("/proc/self/mounts", encoding="utf-8", errors="replace") as mounts:
+            lines = mounts.readlines()
+    except OSError:
+        return None
+    target = str(path.resolve())
+    best_mount = ""
+    best_type = None
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 3:
+            continue
+        mp = (
+            fields[1]
+            .replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\012", "\n")
+            .replace("\\134", "\\")
+        )
+        if mp == "/" or target == mp or target.startswith(mp + "/"):
+            if len(mp) >= len(best_mount):
+                best_mount = mp
+                best_type = fields[2]
+    return best_type
+
+
+def _is_unsafe_mount(directory: Path) -> bool:
+    fstype = _mount_fstype(directory)
+    if fstype is None:
+        return False
+    return fstype in _UNSAFE_FS_TYPES or fstype.startswith("fuse.")
+
+
+def _remove_db_files(db_path: Path) -> None:
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        try:
+            Path(f"{db_path}{suffix}").unlink()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+
+
+def _probe_wal_support(directory: Path) -> bool:
+    """Verify WAL + multi-connection locking in ``directory`` without leaving probe files."""
+    probe = directory / f".wal_probe_{os.getpid()}_{threading.get_ident()}.db"
+    _remove_db_files(probe)
+    conns: list[sqlite3.Connection] = []
+    try:
+        c1 = sqlite3.connect(str(probe), timeout=5, isolation_level=None)
+        conns.append(c1)
+        row = c1.execute("PRAGMA journal_mode=WAL").fetchone()
+        if row is None or str(row[0]).lower() != "wal":
+            return False
+        c1.execute("CREATE TABLE probe (v INTEGER)")
+        c1.execute("INSERT INTO probe VALUES (1)")
+        c2 = sqlite3.connect(str(probe), timeout=5, isolation_level=None)
+        conns.append(c2)
+        c2.execute("BEGIN IMMEDIATE")
+        c2.execute("INSERT INTO probe VALUES (2)")
+        c2.execute("COMMIT")
+        c2.execute("SELECT COUNT(*) FROM probe").fetchone()
+        return True
+    except sqlite3.Error:
+        return False
+    finally:
+        for conn in conns:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+        _remove_db_files(probe)
+
+
+def _downgrade_to_rollback(db_path: Path) -> None:
+    """Checkpoint and switch an existing WAL database safely back to DELETE mode."""
+    if not db_path.exists():
+        return
+    conn = sqlite3.connect(str(db_path), timeout=5, isolation_level=None)
+    try:
+        conn.execute("PRAGMA busy_timeout=5000").fetchall()
+        conn.execute("PRAGMA locking_mode=EXCLUSIVE").fetchall()
+        conn.execute("PRAGMA journal_mode=DELETE").fetchall()
+    except sqlite3.Error:
+        pass
+    finally:
+        conn.close()
+
+
+def _resolve_journal_mode(db_path: Path) -> str:
+    directory = db_path.parent
+    key = (str(directory.resolve()), os.getpid())
+    with _JOURNAL_LOCK:
+        cached = _JOURNAL_MODES.get(key)
+        if cached is not None:
+            mode = cached
+        elif _is_unsafe_mount(directory):
+            mode = "DELETE"
+            _JOURNAL_MODES[key] = mode
+        else:
+            mode = "WAL" if _probe_wal_support(directory) else "DELETE"
+            _JOURNAL_MODES[key] = mode
+    if mode == "DELETE":
+        _downgrade_to_rollback(db_path)
+    return mode
 
 
 def encode(value):
@@ -60,6 +200,26 @@ class ArchiveStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = self._locks.setdefault(str(self.path.resolve()), threading.RLock())
+        self._local = threading.local()
+        self._generation = 0
+        self._journal_mode = _resolve_journal_mode(self.path)
+        with self._lock:
+            db = self._ensure_conn()
+            try:
+                row = db.execute(f"PRAGMA journal_mode={self._journal_mode}").fetchone()
+                if self._journal_mode == "WAL" and (
+                    not row or str(row[0]).lower() != "wal"
+                ):
+                    self._journal_mode = "DELETE"
+                    db.execute("PRAGMA journal_mode=DELETE").fetchall()
+            except sqlite3.Error:
+                self._journal_mode = "DELETE"
+                try:
+                    db.execute("PRAGMA journal_mode=DELETE").fetchall()
+                except sqlite3.Error:
+                    pass
+                self.close()
+                _downgrade_to_rollback(self.path)
         with self.connection(write=True) as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
             if version not in (0, 1):
@@ -106,10 +266,14 @@ class ArchiveStore:
                     coverage_max REAL DEFAULT 0, error TEXT NOT NULL DEFAULT '',
                     gaps TEXT NOT NULL DEFAULT '[]', updated REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS quota (day TEXT PRIMARY KEY, used INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS quota_buckets (
+                    day TEXT NOT NULL, kind TEXT NOT NULL, used INTEGER NOT NULL,
+                    PRIMARY KEY(day, kind));
                 CREATE TABLE IF NOT EXISTS reports (
                     id INTEGER PRIMARY KEY, umo TEXT NOT NULL, cache_key TEXT NOT NULL,
                     entry TEXT NOT NULL, created REAL NOT NULL, invalid INTEGER DEFAULT 0,
                     UNIQUE(umo,cache_key));
+                CREATE INDEX IF NOT EXISTS reports_umo_created ON reports(umo,invalid,created DESC,id DESC);
                 PRAGMA user_version=1;
             """)
             if "last_event_at" not in {
@@ -132,16 +296,74 @@ class ArchiveStore:
             db.execute(
                 "CREATE INDEX IF NOT EXISTS events_end ON events(umo,status,last_event_at)"
             )
-            columns = {r[1] for r in db.execute('PRAGMA table_info(jobs)')}
-            for mode in ('back','live'):
-                for field,decl in (('fragment_id','INTEGER NOT NULL DEFAULT 0'),('fragment_hash',"TEXT NOT NULL DEFAULT ''")):
-                    name=f'{mode}_{field}'
+            columns = {r[1] for r in db.execute("PRAGMA table_info(jobs)")}
+            for mode in ("back", "live"):
+                for field, decl in (
+                    ("fragment_id", "INTEGER NOT NULL DEFAULT 0"),
+                    ("fragment_hash", "TEXT NOT NULL DEFAULT ''"),
+                ):
+                    name = f"{mode}_{field}"
                     if name not in columns:
-                        db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {decl}')
+                        db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {decl}")
+
+    def _open_conn(self):
+        """Open one thread-affine SQLite connection with safe concurrency pragmas."""
+        db = sqlite3.connect(self.path, timeout=10, check_same_thread=True)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA busy_timeout=10000").close()
+        db.execute("PRAGMA foreign_keys=ON").close()
+        db.execute(
+            "PRAGMA synchronous=NORMAL"
+            if self._journal_mode == "WAL"
+            else "PRAGMA synchronous=FULL"
+        ).close()
+        db.execute("PRAGMA temp_store=MEMORY").close()
+        return db
+
+    def _ensure_conn(self):
+        """Return or recreate the current thread's cached connection."""
+        conn = getattr(self._local, "conn", None)
+        gen = getattr(self._local, "gen", -1)
+        if conn is not None:
+            if gen != self._generation:
+                try:
+                    if conn.in_transaction:
+                        conn.rollback()
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+                conn = None
+            else:
+                try:
+                    if conn.in_transaction and getattr(self._local, "depth", 0) == 0:
+                        conn.rollback()
+                except sqlite3.Error:
+                    conn = None
+        if conn is None:
+            conn = self._open_conn()
+            self._local.conn = conn
+            self._local.gen = self._generation
+        return conn
+
+    def close(self):
+        """Invalidate cached connections and close the calling thread's handle."""
+        with self._lock:
+            self._generation += 1
+            conn = getattr(self._local, "conn", None)
+            if conn is not None:
+                try:
+                    if conn.in_transaction:
+                        conn.rollback()
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+                self._local.conn = None
+                self._local.depth = 0
+                self._local.in_write = False
 
     @contextmanager
     def connection(self, *, write=False):
-        """Create a bounded, explicitly closed SQLite connection.
+        """Borrow the thread-cached SQLite connection with nested transaction safety.
 
         Args:
             write: Acquire the shared writer lock and start a transaction.
@@ -150,21 +372,59 @@ class ArchiveStore:
             A connection with named rows.
         """
         with self._lock:
-            db = sqlite3.connect(self.path, timeout=3)
-            db.row_factory = sqlite3.Row
-            try:
-                db.execute("PRAGMA journal_mode=WAL")
-                db.execute("PRAGMA foreign_keys=ON")
-                if write:
-                    db.execute("BEGIN IMMEDIATE")
-                yield db
-                if write:
-                    db.commit()
-            except BaseException:
-                db.rollback()
-                raise
-            finally:
-                db.close()
+            depth = getattr(self._local, "depth", 0)
+            if depth == 0:
+                db = self._ensure_conn()
+                if db.in_transaction:
+                    db.rollback()
+                self._local.depth = 1
+                self._local.in_write = bool(write)
+                try:
+                    if write:
+                        db.execute("BEGIN IMMEDIATE")
+                    yield db
+                    if write:
+                        db.commit()
+                    elif db.in_transaction:
+                        db.rollback()
+                except BaseException:
+                    if db.in_transaction:
+                        db.rollback()
+                    raise
+                finally:
+                    self._local.depth = 0
+                    self._local.in_write = False
+            else:
+                db = self._ensure_conn()
+                self._local.depth = depth + 1
+                in_write = getattr(self._local, "in_write", False)
+                sp_name = None
+                started_write = False
+                try:
+                    if write:
+                        if in_write:
+                            sp_name = f"_sp_{depth}"
+                            db.execute(f"SAVEPOINT {sp_name}")
+                        else:
+                            db.execute("BEGIN IMMEDIATE")
+                            self._local.in_write = True
+                            started_write = True
+                    yield db
+                    if sp_name is not None:
+                        db.execute(f"RELEASE SAVEPOINT {sp_name}")
+                    elif started_write:
+                        db.commit()
+                except BaseException:
+                    if sp_name is not None:
+                        db.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+                        db.execute(f"RELEASE SAVEPOINT {sp_name}")
+                    elif started_write and db.in_transaction:
+                        db.rollback()
+                    raise
+                finally:
+                    if started_write:
+                        self._local.in_write = False
+                    self._local.depth = depth
 
     @staticmethod
     def _bump(db, umo, *, invalidate=False):
@@ -485,6 +745,27 @@ class ArchiveStore:
                 )
             ]
 
+    def members_by_uids(self, umo, uids):
+        """Batch-load basic member rows for a set of UIDs in one read lock."""
+        clean = sorted({str(u) for u in uids if str(u)})
+        if not clean:
+            return {}
+        result = {}
+        with self.connection() as db:
+            for start in range(0, len(clean), 500):
+                chunk = clean[start : start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                for row in db.execute(
+                    f"SELECT uid,name,hidden FROM members WHERE umo=? AND uid IN ({placeholders})",
+                    (umo, *chunk),
+                ):
+                    result[str(row["uid"])] = {
+                        "uid": str(row["uid"]),
+                        "name": row["name"],
+                        "hidden": row["hidden"],
+                    }
+        return result
+
     def privacy_active(self, umo):
         """Check whether old unstructured prose needs suppression.
 
@@ -522,42 +803,90 @@ class ArchiveStore:
                 for s in json.loads(row[0]).get("sources", [])
             }
 
-    def _excluded_event(self, db, umo, event):
+    @staticmethod
+    def _hides_context(db, umo):
+        """Preload hidden-event matching state once per group read."""
+        hidden_entries = []
+        hidden_sources = set()
+        hidden_fingerprints = set()
+        for row in db.execute(
+            "SELECT h.uid,e.payload FROM hides h JOIN events e ON e.id=h.event_id AND e.umo=h.umo WHERE h.umo=?",
+            (umo,),
+        ):
+            hidden = json.loads(row["payload"])
+            hidden_sources.update(str(s["id"]) for s in hidden.get("sources", []))
+            fp = hidden.get("fingerprint")
+            if fp:
+                hidden_fingerprints.add(fp)
+            hidden_entries.append(
+                {
+                    "uid": row["uid"],
+                    "kind": hidden.get("kind"),
+                    "title": hidden["title"],
+                    "event_at": hidden["event_at"],
+                    "end": max(
+                        [hidden["event_at"]]
+                        + [f["event_at"] for f in hidden.get("followups", [])]
+                    ),
+                    "date_basis": hidden.get("date_basis"),
+                    "ongoing": hidden.get("ongoing"),
+                }
+            )
+        return {
+            "hidden_sources": hidden_sources,
+            "hidden_fingerprints": hidden_fingerprints,
+            "hidden_entries": hidden_entries,
+        }
+
+    @classmethod
+    def _privacy_context(cls, db, umo):
+        """Preload hides and hidden members once before iterating events."""
+        ctx = cls._hides_context(db, umo)
+        ctx["hidden_event_ids"] = {
+            r[0] for r in db.execute("SELECT event_id FROM hides WHERE umo=?", (umo,))
+        }
+        hidden_members = [
+            {"uid": r["uid"], "aliases": json.loads(r["aliases"])}
+            for r in db.execute(
+                "SELECT uid,aliases FROM members WHERE umo=? AND hidden=1", (umo,)
+            )
+        ]
+        ctx["hidden_members"] = hidden_members
+        ctx["hidden_uids"] = {m["uid"] for m in hidden_members}
+        return ctx
+
+    def _excluded_event(self, db, umo, event, *, privacy_ctx=None):
         """Protect exact sources and uncertain repeats of an excluded event.
 
         Args:
             db: Active connection.
             umo: Owning group.
             event: New or stored candidate.
+            privacy_ctx: Optional preloaded privacy context for batch filtering.
 
         Returns:
             Whether it matches a protected source or event family.
         """
+        ctx = privacy_ctx if privacy_ctx is not None else self._hides_context(db, umo)
+        if not ctx["hidden_entries"]:
+            return False
         sources = {str(s["id"]) for s in event.get("sources", [])}
+        if sources & ctx["hidden_sources"]:
+            return True
+        if event.get("fingerprint") in ctx["hidden_fingerprints"]:
+            return True
         involved = {p["uid"] for p in event.get("participants", [])} | {
             s.get("uid") for s in event.get("sources", [])
         }
-        for row in db.execute(
-            "SELECT h.uid,e.payload FROM hides h JOIN events e ON e.id=h.event_id AND e.umo=h.umo WHERE h.umo=?",
-            (umo,),
-        ):
-            hidden = json.loads(row["payload"])
-            if sources & {str(s["id"]) for s in hidden.get("sources", [])}:
-                return True
-            if hidden.get("fingerprint") == event.get("fingerprint"):
-                return True
-            if row["uid"] not in involved or hidden.get("kind") != event.get("kind"):
+        for hidden in ctx["hidden_entries"]:
+            if hidden["uid"] not in involved or hidden["kind"] != event.get("kind"):
                 continue
-            end = max(
-                [hidden["event_at"]]
-                + [f["event_at"] for f in hidden.get("followups", [])]
-            )
             close = (
-                hidden.get("date_basis") == "recorded"
-                or hidden.get("ongoing")
+                hidden["date_basis"] == "recorded"
+                or hidden["ongoing"]
                 or hidden["event_at"] - 7 * 86400
                 <= event["event_at"]
-                <= end + 7 * 86400
+                <= hidden["end"] + 7 * 86400
             )
             if (
                 close
@@ -569,25 +898,30 @@ class ArchiveStore:
                 return True
         return False
 
-    def _visible(self, db, umo, event):
+    def _visible(self, db, umo, event, *, privacy_ctx=None):
         """Conservatively suppress facts that cannot safely be anonymized.
 
         Args:
             db: Active connection.
             umo: Group session.
             event: Decoded fact.
+            privacy_ctx: Optional preloaded privacy context for batch filtering.
 
         Returns:
             Whether the event is safe for public use.
         """
-        if db.execute(
-            "SELECT 1 FROM hides WHERE umo=? AND event_id=?", (umo, event["id"])
-        ).fetchone():
+        ctx = privacy_ctx if privacy_ctx is not None else self._privacy_context(db, umo)
+        if event["id"] in ctx["hidden_event_ids"]:
             return False
-        if self._excluded_event(db, umo, event):
+        if self._excluded_event(db, umo, event, privacy_ctx=ctx):
             return False
+        hidden_members = ctx["hidden_members"]
+        if not hidden_members:
+            return True
         identifiers = {str(p["uid"]) for p in event.get("participants", [])}
         identifiers.update(str(s.get("uid", "")) for s in event.get("sources", []))
+        if ctx["hidden_uids"] & identifiers:
+            return False
         text = encode(
             [
                 event.get("title", ""),
@@ -596,14 +930,7 @@ class ArchiveStore:
                 event.get("sources", []),
             ]
         )
-        for row in db.execute(
-            "SELECT uid,aliases FROM members WHERE umo=? AND hidden=1", (umo,)
-        ):
-            if row["uid"] in identifiers or private_text(
-                text, {"uid": row["uid"], "aliases": json.loads(row["aliases"])}
-            ):
-                return False
-        return True
+        return not any(private_text(text, member) for member in hidden_members)
 
     def events(self, umo, *, status="approved", since=0, public=True, uid=None):
         """Read bounded-by-time facts scoped to one group.
@@ -624,7 +951,8 @@ class ArchiveStore:
             if status is not None:
                 query += " AND status=?"
                 args.append(status)
-            rows = db.execute(query + " ORDER BY event_at,id", args)
+            rows = db.execute(query + " ORDER BY event_at,id", args).fetchall()
+            privacy_ctx = self._privacy_context(db, umo) if (public and rows) else None
             result = []
             for row in rows:
                 event = {
@@ -638,7 +966,9 @@ class ArchiveStore:
                     str(p["uid"]) for p in event.get("participants", [])
                 }:
                     continue
-                if public and not self._visible(db, umo, event):
+                if public and not self._visible(
+                    db, umo, event, privacy_ctx=privacy_ctx
+                ):
                     continue
                 result.append(event)
             return result
@@ -654,14 +984,23 @@ class ArchiveStore:
         Returns:
             The scoped event or None.
         """
-        return next(
-            (
-                e
-                for e in self.events(umo, status=None, public=public)
-                if e["id"] == int(event_id)
-            ),
-            None,
-        )
+        eid = int(event_id)
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT * FROM events WHERE umo=? AND id=?", (umo, eid)
+            ).fetchone()
+            if not row:
+                return None
+            event = {
+                **json.loads(row["payload"]),
+                "id": row["id"],
+                "status": row["status"],
+                "event_at": row["event_at"],
+                "revision": row["revision"],
+            }
+            if public and not self._visible(db, umo, event):
+                return None
+            return event
 
     def _put_event(self, db, umo, fact, status, actor="system", merge_into=None):
         """Insert a validated candidate or attach its follow-up atomically.
@@ -764,7 +1103,17 @@ class ArchiveStore:
             return dict(row) if row else None
 
     def commit_batch(
-        self, umo, mode, expected, cursor, offset, messages, facts, *, gap=None, fragment=None
+        self,
+        umo,
+        mode,
+        expected,
+        cursor,
+        offset,
+        messages,
+        facts,
+        *,
+        gap=None,
+        fragment=None,
     ):
         """Commit all candidates and the source checkpoint in one transaction.
 
@@ -812,8 +1161,8 @@ class ArchiveStore:
                 (
                     int(cursor),
                     int(offset),
-                    int(fragment.get('id',0)) if offset else 0,
-                    str(fragment.get('sha256','')) if offset else '',
+                    int(fragment.get("id", 0)) if offset else 0,
+                    str(fragment.get("sha256", "")) if offset else "",
                     len(messages),
                     low,
                     high,
@@ -837,24 +1186,48 @@ class ArchiveStore:
                 (str(message)[:300], time.time(), umo),
             )
 
-    def consume_quota(self, day, limit):
+    def consume_quota(self, day, limit, *, kind=None, reserved_history=0, extra=0):
         """Reserve a global daily extraction slot, including failed attempts.
 
         Args:
             day: Calendar day in the configured timezone.
             limit: Maximum extraction tasks for that day.
+            kind: Optional bucket ('history' or 'culture') for isolation.
+            reserved_history: Minimum daily slots kept exclusively for history.
+            extra: Explicit temporary headroom (e.g. manual verification).
 
         Returns:
             Whether a slot was acquired.
         """
+        total_cap = max(0, int(limit)) + max(0, int(extra))
         with self.connection(write=True) as db:
             db.execute("INSERT OR IGNORE INTO quota VALUES(?,0)", (day,))
-            if (
-                db.execute("SELECT used FROM quota WHERE day=?", (day,)).fetchone()[0]
-                >= limit
-            ):
+            total_used = db.execute(
+                "SELECT used FROM quota WHERE day=?", (day,)
+            ).fetchone()[0]
+            if total_used >= total_cap:
                 return False
+            if kind == "culture":
+                reserved = max(0, int(reserved_history))
+                culture_cap = max(0, int(limit) - reserved) + max(0, int(extra))
+                db.execute(
+                    "INSERT OR IGNORE INTO quota_buckets VALUES(?,'culture',0)", (day,)
+                )
+                culture_used = db.execute(
+                    "SELECT used FROM quota_buckets WHERE day=? AND kind='culture'",
+                    (day,),
+                ).fetchone()[0]
+                if culture_used >= culture_cap:
+                    return False
             db.execute("UPDATE quota SET used=used+1 WHERE day=?", (day,))
+            if kind in ("history", "culture"):
+                db.execute(
+                    "INSERT OR IGNORE INTO quota_buckets VALUES(?,?,0)", (day, kind)
+                )
+                db.execute(
+                    "UPDATE quota_buckets SET used=used+1 WHERE day=? AND kind=?",
+                    (day, kind),
+                )
             return True
 
     def quota(self, day):
@@ -869,6 +1242,23 @@ class ArchiveStore:
         with self.connection() as db:
             row = db.execute("SELECT used FROM quota WHERE day=?", (day,)).fetchone()
             return row[0] if row else 0
+
+    def quota_breakdown(self, day):
+        """Read total and per-kind daily extraction usage."""
+        with self.connection() as db:
+            row = db.execute("SELECT used FROM quota WHERE day=?", (day,)).fetchone()
+            total = row[0] if row else 0
+            buckets = {
+                r["kind"]: r["used"]
+                for r in db.execute(
+                    "SELECT kind,used FROM quota_buckets WHERE day=?", (day,)
+                )
+            }
+            return {
+                "total": total,
+                "history": buckets.get("history", 0),
+                "culture": buckets.get("culture", 0),
+            }
 
     def _merge(self, db, umo, target_id, source_id, actor):
         """Merge follow-ups and roles without multiplying contribution.
@@ -1226,6 +1616,46 @@ class ArchiveStore:
             ).fetchone()
             return {**json.loads(row["entry"]), "report_id": row["id"]} if row else None
 
+    @staticmethod
+    def _like_prefix(prefix):
+        return str(prefix).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    @classmethod
+    def _prune_reports(cls, db, umo, base_key):
+        escaped = cls._like_prefix(base_key)
+        forced_pat = escaped + ":forced:%"
+        rev_pat = escaped + ":revision:%"
+        db.execute(
+            """DELETE FROM reports WHERE id IN (
+                   SELECT id FROM reports
+                   WHERE umo=? AND invalid=0
+                     AND (cache_key LIKE ? ESCAPE '\\' OR cache_key LIKE ? ESCAPE '\\')
+                   ORDER BY created DESC, id DESC
+                   LIMIT -1 OFFSET ?
+               )""",
+            (umo, forced_pat, rev_pat, _MAX_FORCED_REVISION_PER_BASE),
+        )
+        db.execute(
+            """DELETE FROM reports WHERE id IN (
+                   SELECT id FROM reports
+                   WHERE umo=? AND invalid=0
+                     AND (cache_key LIKE '%:forced:%' OR cache_key LIKE '%:revision:%')
+                   ORDER BY created DESC, id DESC
+                   LIMIT -1 OFFSET ?
+               )""",
+            (umo, _MAX_FORCED_REVISION_PER_GROUP),
+        )
+        db.execute(
+            """DELETE FROM reports WHERE id IN (
+                   SELECT id FROM reports
+                   WHERE umo=? AND invalid=1
+                     AND (cache_key LIKE '%:forced:%' OR cache_key LIKE '%:revision:%')
+                   ORDER BY created DESC, id DESC
+                   LIMIT -1 OFFSET ?
+               )""",
+            (umo, _MAX_INVALID_FORCED_REVISION_PER_GROUP),
+        )
+
     def save_report(self, umo, key, entry, *, expected_revision=None):
         """Save a new edition without overwriting previous revisions.
 
@@ -1238,6 +1668,7 @@ class ArchiveStore:
         Returns:
             Stored report ID.
         """
+        base_key = key.split(":forced:", 1)[0].split(":revision:", 1)[0]
         with self.connection(write=True) as db:
             if expected_revision is not None:
                 group = db.execute(
@@ -1254,17 +1685,27 @@ class ArchiveStore:
                 key += ":revision:" + str(time.time_ns())
             entry = {**entry, "umo": umo, "archive": True, "cache_key": key}
             if entry.get("report_kind") == "chronicle":
-                entry["version"] = (
-                    db.execute(
-                        "SELECT COUNT(*) FROM reports WHERE umo=? AND cache_key LIKE 'chronicle:%'",
-                        (umo,),
-                    ).fetchone()[0]
-                    + 1
-                )
-            return db.execute(
+                count = db.execute(
+                    "SELECT COUNT(*) FROM reports WHERE umo=? AND cache_key LIKE 'chronicle:%'",
+                    (umo,),
+                ).fetchone()[0]
+                last_row = db.execute(
+                    "SELECT entry FROM reports WHERE umo=? AND cache_key LIKE 'chronicle:%' ORDER BY id DESC LIMIT 1",
+                    (umo,),
+                ).fetchone()
+                last_ver = 0
+                if last_row:
+                    try:
+                        last_ver = int(json.loads(last_row[0]).get("version") or 0)
+                    except (ValueError, TypeError):
+                        last_ver = 0
+                entry["version"] = max(count + 1, last_ver + 1)
+            report_id = db.execute(
                 "INSERT INTO reports(umo,cache_key,entry,created) VALUES(?,?,?,?)",
                 (umo, key, encode(entry), float(entry.get("created_at", time.time()))),
             ).lastrowid
+            self._prune_reports(db, umo, base_key)
+            return report_id
 
     def public_report(self, umo, report_id, text):
         """Check an already fetched edition immediately before export or delivery.

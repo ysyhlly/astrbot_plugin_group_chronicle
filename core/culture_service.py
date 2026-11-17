@@ -19,6 +19,30 @@ from .lifetime import (
 )
 from .llm_call import call_llm
 
+_SOURCE_BATCH_SIZE = 500
+
+
+def _source_row_valid(row, src):
+    """Verify one source row matches its stored quote, author, and visibility."""
+    return bool(
+        row
+        and row["role"] == "user"
+        and row["uid"] == src["uid"]
+        and row["ts"] == src["ts"]
+        and digest(row["content"]) == src["hash"]
+        and src["quote"] in row["content"]
+        and not any(
+            row["metadata"].get(k)
+            for k in (
+                "is_bot_message",
+                "recalled",
+                "withdrawn",
+                "deleted",
+                "hidden",
+            )
+        )
+    )
+
 
 class CultureService:
     def __init__(self, plugin):
@@ -38,56 +62,94 @@ class CultureService:
     def token(self, umo):
         return (self.store.state(umo)["revision"], self.history.privacy_key(umo))
 
-    def blocked(self, umo, item):
-        excluded = self.history.store.excluded_sources(umo) | self.store.excluded(
-            umo, item["source"]
-        )
+    def _privacy_snapshot(self, umo, sources):
+        base_excluded = self.history.store.excluded_sources(umo)
+        by_source = {
+            src: base_excluded | self.store.excluded(umo, src)
+            for src in sorted({s for s in sources if s})
+        }
+        hidden = self.history.store.hidden(umo)
+        return base_excluded, by_source, hidden
+
+    @staticmethod
+    def _is_item_blocked(item, snapshot):
+        base_excluded, by_source, hidden = snapshot
+        excluded = by_source.get(item.get("source"), base_excluded)
         if item["status"] == "hidden" or any(
             s["id"] in excluded for s in item["sources"]
         ):
             return True
-        hidden = self.history.store.hidden(umo)
+        if not hidden:
+            return False
         involved = set(item["subjects"]) | {s["uid"] for s in item["sources"]}
-        return any(
-            h["uid"] in involved or private_text(encode(item), h) for h in hidden
-        )
+        encoded = None
+        for h in hidden:
+            if h["uid"] in involved:
+                return True
+            if encoded is None:
+                encoded = encode(item)
+            if private_text(encoded, h):
+                return True
+        return False
+
+    def blocked(self, umo, item):
+        snapshot = self._privacy_snapshot(umo, [item["source"]])
+        return self._is_item_blocked(item, snapshot)
+
+    async def _batch_valid_sources(self, umo, items):
+        if not items:
+            return []
+        try:
+            sources = {item.get("source") for item in items}
+            pre_snapshot = await asyncio.to_thread(self._privacy_snapshot, umo, sources)
+            before_source = lm_bridge.source_identity(self.plugin.context)
+            candidates = [
+                idx
+                for idx, item in enumerate(items)
+                if item.get("source") == before_source
+                and not self._is_item_blocked(item, pre_snapshot)
+            ]
+            if not candidates:
+                return [False] * len(items)
+            all_ids = list(
+                dict.fromkeys(
+                    s["id"] for idx in candidates for s in items[idx]["sources"]
+                )
+            )
+            rows = {}
+            if not all_ids:
+                fetched = await lm_bridge.history_sources(self.plugin.context, umo, [])
+                if isinstance(fetched, dict):
+                    rows.update(fetched)
+            else:
+                for start in range(0, len(all_ids), _SOURCE_BATCH_SIZE):
+                    chunk = all_ids[start : start + _SOURCE_BATCH_SIZE]
+                    fetched = await lm_bridge.history_sources(
+                        self.plugin.context, umo, chunk
+                    )
+                    if isinstance(fetched, dict):
+                        rows.update(fetched)
+            after_source = lm_bridge.source_identity(self.plugin.context)
+            post_snapshot = await asyncio.to_thread(
+                self._privacy_snapshot, umo, sources
+            )
+            results = [False] * len(items)
+            for idx in candidates:
+                item = items[idx]
+                if item.get("source") != after_source or self._is_item_blocked(
+                    item, post_snapshot
+                ):
+                    continue
+                if all(
+                    _source_row_valid(rows.get(s["id"]), s) for s in item["sources"]
+                ):
+                    results[idx] = True
+            return results
+        except Exception:
+            return [False] * len(items)
 
     async def valid_sources(self, umo, item):
-        if self.blocked(umo, item):
-            return False
-        try:
-            if lm_bridge.source_identity(self.plugin.context) != item["source"]:
-                return False
-            rows = await lm_bridge.history_sources(
-                self.plugin.context, umo, [s["id"] for s in item["sources"]]
-            )
-            if lm_bridge.source_identity(self.plugin.context) != item["source"]:
-                return False
-            for s in item["sources"]:
-                row = rows.get(s["id"])
-                if (
-                    not row
-                    or row["role"] != "user"
-                    or row["uid"] != s["uid"]
-                    or row["ts"] != s["ts"]
-                    or digest(row["content"]) != s["hash"]
-                    or s["quote"] not in row["content"]
-                ):
-                    return False
-                if any(
-                    row["metadata"].get(k)
-                    for k in (
-                        "is_bot_message",
-                        "recalled",
-                        "withdrawn",
-                        "deleted",
-                        "hidden",
-                    )
-                ):
-                    return False
-            return not self.blocked(umo, item)
-        except Exception:
-            return False
+        return (await self._batch_valid_sources(umo, [item]))[0]
 
     async def learning_clues(self, umo, query):
         getter = getattr(self.plugin.context, "get_registered_star", None)
@@ -121,7 +183,10 @@ class CultureService:
 
     @tracked_operation
     async def process_one(self, umo, mode="back", *, verification_extra_quota=0):
-        if not await self.allowed(umo) or self.store.state(umo)["paused"]:
+        if not await self.allowed(umo):
+            return False
+        initial_state = await asyncio.to_thread(self.store.state, umo)
+        if initial_state["paused"]:
             return False
         lock = self.locks.setdefault(umo, asyncio.Lock())
         if lock.locked():
@@ -129,12 +194,14 @@ class CultureService:
         async with lock:
             source = lm_bridge.source_identity(self.plugin.context)
             bounds = await lm_bridge.history_bounds(self.plugin.context, umo)
-            job = self.store.init_job(umo, source, bounds["high"])
+            job = await asyncio.to_thread(
+                self.store.init_job, umo, source, bounds["high"]
+            )
             high = bounds["high"] if mode == "live" else job["frozen_high"]
             cursor, offset = job[f"{mode}_cursor"], job[f"{mode}_offset"]
             if cursor >= high and not offset:
                 return False
-            token = self.token(umo)
+            token = await asyncio.to_thread(self.token, umo)
             rows = await lm_bridge.history_page(
                 self.plugin.context,
                 umo,
@@ -142,9 +209,15 @@ class CultureService:
                 high,
                 self.plugin._cfg("history_batch_size", 200),
             )
-            excluded = self.history.store.excluded_sources(umo) | self.store.excluded(
-                umo, source
-            )
+
+            def _page_privacy():
+                return (
+                    self.history.store.excluded_sources(umo)
+                    | self.store.excluded(umo, source),
+                    self.history.store.hidden(umo),
+                )
+
+            excluded, hidden_identities = await asyncio.to_thread(_page_privacy)
             filtered = [dict(r) for r in rows]
             for row in filtered:
                 if any(
@@ -157,7 +230,7 @@ class CultureService:
                 filtered,
                 cursor,
                 pack_offset,
-                hidden=self.history.store.hidden(umo),
+                hidden=hidden_identities,
                 bot_ids=self.history.bot_ids.get(umo.split(":", 1)[0], set()),
                 excluded_ids=excluded,
             )
@@ -185,21 +258,15 @@ class CultureService:
                 )
             proposals = []
             if material:
-                day = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
-                limit = (
-                    self.plugin._cfg("history_daily_limit", 20)
-                    + verification_extra_quota
+                existing_raw, _ = await asyncio.to_thread(
+                    self.store.entries, umo, limit=20
                 )
-                if not self.history.store.consume_quota(day, limit):
-                    return False
-                existing, _ = self.store.entries(umo, limit=20)
                 # Disputed/hidden/rejected records never enter the model prompt.
-                existing = [
-                    e
-                    for e in existing
-                    if e["status"] in {"approved", "pending"}
-                    and await self.valid_sources(umo, e)
+                existing_candidates = [
+                    e for e in existing_raw if e["status"] in {"approved", "pending"}
                 ]
+                valid_flags = await self._batch_valid_sources(umo, existing_candidates)
+                existing = [e for e, ok in zip(existing_candidates, valid_flags) if ok]
                 targets = [
                     {"id": e["id"], "name": e["name"], "meaning": e["meaning"][:200]}
                     for e in existing
@@ -212,6 +279,31 @@ class CultureService:
                     "learning_clues": clues,
                     "messages": material,
                 }
+
+                def _pre_llm_ok():
+                    return (
+                        not self.store.state(umo)["paused"] and self.token(umo) == token
+                    )
+
+                if (
+                    not await self.allowed(umo)
+                    or lm_bridge.source_identity(self.plugin.context) != source
+                    or not await asyncio.to_thread(_pre_llm_ok)
+                ):
+                    return False
+                day = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
+                raw_limit = self.plugin._cfg("history_daily_limit", 20)
+                daily_limit = max(0, int(20 if raw_limit is None else raw_limit))
+                reserved = daily_limit // 2 if daily_limit >= 2 else 0
+                if not await asyncio.to_thread(
+                    self.history.store.consume_quota,
+                    day,
+                    daily_limit,
+                    kind="culture",
+                    reserved_history=reserved,
+                    extra=verification_extra_quota,
+                ):
+                    return False
                 raw = await asyncio.wait_for(
                     call_llm(
                         self.plugin.context,
@@ -235,20 +327,28 @@ class CultureService:
                         if len(matches) == 1:
                             p["target_id"] = matches[0]["id"]
                 # Refetch source hashes before committing a potentially slow model result.
+                proposal_items = [
+                    {**p, "source": source, "status": p["admission"]} for p in proposals
+                ]
+                existing_by_id = {e["id"]: e for e in existing}
+                target_items = []
+                seen_targets = set()
                 for p in proposals:
-                    if not await self.valid_sources(
-                        umo, {**p, "source": source, "status": p["admission"]}
-                    ):
+                    tid = p.get("target_id")
+                    if tid in existing_by_id and tid not in seen_targets:
+                        seen_targets.add(tid)
+                        target_items.append(existing_by_id[tid])
+                verify_items = proposal_items + target_items
+                if verify_items:
+                    flags = await self._batch_valid_sources(umo, verify_items)
+                    if not all(flags[: len(proposal_items)]):
                         raise ValueError("整理期间来源失效，进度保留")
-                    target = next(
-                        (e for e in existing if e["id"] == p.get("target_id")), None
-                    )
-                    if target and not await self.valid_sources(umo, target):
+                    if not all(flags[len(proposal_items) :]):
                         raise ValueError("整理期间沿革目标来源失效，进度保留")
             if (
                 not await self.allowed(umo)
-                or self.token(umo) != token
                 or lm_bridge.source_identity(self.plugin.context) != source
+                or await asyncio.to_thread(self.token, umo) != token
             ):
                 return False
             gap = None
@@ -259,7 +359,8 @@ class CultureService:
                 raise ValueError("文化素材预算不足，未推进进度")
             if bounds.get("first") and not job["processed"]:
                 gap = "覆盖仅限仍留存的消息，留存前的起源未知"
-            ok = self.store.commit(
+            ok = await asyncio.to_thread(
+                self.store.commit,
                 umo,
                 source,
                 mode,
@@ -291,7 +392,7 @@ class CultureService:
                 else f"文化整理失败：{type(exc).__name__}；请检查记忆来源和模型配置"
             )
             self.errors[umo] = message[:300]
-            self.store.error(umo, message)
+            await asyncio.to_thread(self.store.error, umo, message)
             return False
 
     @staticmethod
@@ -359,26 +460,36 @@ class CultureService:
                 "reason": "当前群未启用群文化",
                 "entries": [],
             }
-        token = self.token(umo)
-        entries, total = self.store.entries(
-            umo,
-            status="approved",
-            query=query.strip(),
-            limit=max(1, min(int(limit), 20)),
-        )
+
+        def _load_query_inputs():
+            return self.token(umo), self.store.entries(
+                umo,
+                status="approved",
+                query=query.strip(),
+                limit=max(1, min(int(limit), 20)),
+            )
+
+        token, (entries, total) = await asyncio.to_thread(_load_query_inputs)
         valid, missing = [], False
-        for item in entries:
-            if self.blocked(umo, item):
-                continue
-            if await self.valid_sources(umo, item):
-                compact = self.public_item(
-                    item, detail=kind == "origin", for_reply=True
-                )
-                if len(encode(valid + [compact])) <= 18000:
-                    valid.append(compact)
-            else:
-                missing = True
-        if not await self.allowed(umo) or token != self.token(umo):
+        if entries:
+            snapshot = await asyncio.to_thread(
+                self._privacy_snapshot, umo, {e["source"] for e in entries}
+            )
+            non_blocked = [e for e in entries if not self._is_item_blocked(e, snapshot)]
+            flags = await self._batch_valid_sources(umo, non_blocked)
+            for item, is_valid in zip(non_blocked, flags):
+                if is_valid:
+                    compact = self.public_item(
+                        item, detail=kind == "origin", for_reply=True
+                    )
+                    if len(encode(valid + [compact])) <= 18000:
+                        valid.append(compact)
+                else:
+                    missing = True
+        if (
+            not await self.allowed(umo)
+            or await asyncio.to_thread(self.token, umo) != token
+        ):
             return {
                 "schema_version": 1,
                 "available": False,
@@ -398,42 +509,38 @@ class CultureService:
         }
 
     async def receipt_current(self, umo, receipt):
-        if not await self.allowed(umo) or receipt[
-            "privacy"
-        ] != self.history.privacy_key(umo):
-            return False
-        for entry_id, revision in receipt["entries"]:
-            item = self.store.entry(umo, entry_id)
-            if (
-                not item
-                or item["revision"] != revision
-                or item["status"] != "approved"
-                or not await self.valid_sources(umo, item)
-            ):
-                return False
-        # Authorization and revisions can change while the sources are read.
-        return (
-            await self.allowed(umo)
-            and receipt["privacy"] == self.history.privacy_key(umo)
-            and all(
-                (
-                    lambda e: (
-                        e is not None
-                        and e["revision"] == rev
-                        and e["status"] == "approved"
-                    )
-                )(self.store.entry(umo, eid))
-                for eid, rev in receipt["entries"]
+        def _read_receipt_state():
+            return (
+                self.history.privacy_key(umo),
+                [self.store.entry(umo, eid) for eid, _ in receipt["entries"]],
             )
+
+        if not await self.allowed(umo):
+            return False
+        privacy_now, items = await asyncio.to_thread(_read_receipt_state)
+        if receipt["privacy"] != privacy_now:
+            return False
+        for (_, revision), item in zip(receipt["entries"], items):
+            if not item or item["revision"] != revision or item["status"] != "approved":
+                return False
+        if not all(await self._batch_valid_sources(umo, items)):
+            return False
+        # Authorization and revisions can change while the sources are read.
+        if not await self.allowed(umo):
+            return False
+        privacy_after, items_after = await asyncio.to_thread(_read_receipt_state)
+        return privacy_after == receipt["privacy"] and all(
+            e is not None and e["revision"] == rev and e["status"] == "approved"
+            for (_, rev), e in zip(receipt["entries"], items_after)
         )
 
-    def bind_guard(self, event, entries):
+    def bind_guard(self, event, entries, *, privacy=None):
         """Guard this event's direct and streamed sends, including deferred replies."""
         if not entries:
             return
         umo = event.unified_msg_origin
         receipt = {
-            "privacy": self.history.privacy_key(umo),
+            "privacy": self.history.privacy_key(umo) if privacy is None else privacy,
             "entries": [(e["id"], e["revision"]) for e in entries],
         }
         receipts = (
@@ -485,11 +592,15 @@ class CultureService:
         event._culture_guard_installed_v1 = True
 
     async def tool(self, event, query="", kind="search"):
-        result = await self.query(
-            str(event.unified_msg_origin), str(event.get_sender_id()), query, kind
+        umo = str(event.unified_msg_origin)
+        result = await self.query(umo, str(event.get_sender_id()), query, kind)
+        privacy = (
+            await asyncio.to_thread(self.history.privacy_key, umo)
+            if result["entries"]
+            else None
         )
         try:
-            self.bind_guard(event, result["entries"])
+            self.bind_guard(event, result["entries"], privacy=privacy)
         except Exception:
             return encode(
                 {
@@ -521,10 +632,10 @@ class CultureService:
         if action in {"pause", "resume"}:
             if not admin:
                 raise PermissionError("需要管理员权限")
-            self.store.set_paused(umo, action == "pause")
+            await asyncio.to_thread(self.store.set_paused, umo, action == "pause")
             self.history.cancel_operations(umo)
             return {"ok": True}
-        item = self.store.entry(umo, entry_id)
+        item = await asyncio.to_thread(self.store.entry, umo, entry_id)
         if not item:
             raise ValueError("当前群没有该词条")
         if not admin:
@@ -535,13 +646,19 @@ class CultureService:
             }:
                 raise PermissionError("只能隐藏涉及自己的文化词条")
         if action in {"approve", "edit", "merge"}:
-            if not await self.valid_sources(umo, item):
-                raise ValueError("词条证据已失效，不能发布、编辑或合并")
             if action == "merge":
-                target = self.store.entry(umo, target_id)
-                if not target or not await self.valid_sources(umo, target):
+                target = await asyncio.to_thread(self.store.entry, umo, target_id)
+                if not target:
                     raise ValueError("合并目标证据不可用")
-        result = self.store.mutate(
+                flags = await self._batch_valid_sources(umo, [item, target])
+                if not flags[0]:
+                    raise ValueError("词条证据已失效，不能发布、编辑或合并")
+                if not flags[1]:
+                    raise ValueError("合并目标证据不可用")
+            elif not (await self._batch_valid_sources(umo, [item]))[0]:
+                raise ValueError("词条证据已失效，不能发布、编辑或合并")
+        result = await asyncio.to_thread(
+            self.store.mutate,
             umo,
             entry_id,
             revision,
@@ -572,7 +689,7 @@ class CultureService:
                 or (command == "文化纠正" and len(parts) < 2)
             ):
                 return "用法：/文化纠正 <ID> <说明> 或 /文化隐藏 <ID>"
-            item = self.store.entry(umo, int(parts[0]))
+            item = await asyncio.to_thread(self.store.entry, umo, int(parts[0]))
             if not item:
                 return "当前群没有该词条。"
             result = await self.action(
@@ -596,7 +713,12 @@ class CultureService:
             "origin" if command == "梗溯源" else "search",
             limit=10,
         )
-        self.bind_guard(event, result["entries"])
+        privacy = (
+            await asyncio.to_thread(self.history.privacy_key, umo)
+            if result["entries"]
+            else None
+        )
+        self.bind_guard(event, result["entries"], privacy=privacy)
         if not result["entries"]:
             return result.get("reason") or result["note"]
         lines = []

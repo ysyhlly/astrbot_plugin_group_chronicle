@@ -4,7 +4,6 @@
 """
 
 import asyncio
-import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -196,37 +195,52 @@ def test_sl_empty_ranking_missing():
     assert all(set(r["breakdown"]) == {"lm"} for r in result)
 
 
-# ---------- 4. RA SQLite 缺失 → 来源缺失, 仅 LM 排行 ----------
+# ---------- 4. RA 能力缺失 → 来源缺失, 仅 LM 排行 ----------
 
 
-def test_ra_sqlite_missing(monkeypatch, tmp_path):
+def test_ra_capability_missing():
     stats = {"a": 5, "b": 3}
     msgs = [FakeMessage("a", "A", now()), FakeMessage("b", "B", now())]
     ev = make_evidence(stats, msgs)
 
-    monkeypatch.setattr(
-        inf,
-        "_resolve_ra_db_path",
-        lambda: tmp_path / "no_such_dir" / "relations.sqlite3",
+    disabled_ra = SimpleNamespace(
+        get_dynamics_capabilities=lambda: {
+            "enabled": False,
+            "ready": False,
+            "capabilities": {"relations": True},
+        },
+        get_relations_overview=lambda gid, **kw: {
+            "centers": [{"user_id": "a", "score": 99}]
+        },
     )
-    result = run(inf.rank_influential(ev, no_star_context(), "qq:1:group:g1"))
+    ctx = FakeContext(
+        stars=[FakeStar(disabled_ra, name="astrbot_plugin_relation_analyzer")]
+    )
+    result = run(inf.rank_influential(ev, ctx, "qq:1:group:g1"))
     assert len(result) == 2
     assert all(set(r["breakdown"]) == {"lm"} for r in result)
 
 
-# ---------- 5. RA SQLite 损坏 → 来源缺失, 不抛异常 ----------
+# ---------- 5. RA 公开接口异常 → 来源缺失, 不抛异常 ----------
 
 
-def test_ra_sqlite_corrupt(monkeypatch, tmp_path):
-    bad = tmp_path / "relations.sqlite3"
-    bad.write_bytes(b"this is not a sqlite file at all" * 10)
-
+def test_ra_public_error():
     stats = {"a": 5}
     msgs = [FakeMessage("a", "A", now())]
     ev = make_evidence(stats, msgs)
 
-    monkeypatch.setattr(inf, "_resolve_ra_db_path", lambda: bad)
-    result = run(inf.rank_influential(ev, no_star_context(), "qq:1:group:g1"))
+    bad_ra = SimpleNamespace(
+        get_dynamics_capabilities=lambda: {
+            "enabled": True,
+            "ready": True,
+            "capabilities": {"relations": True},
+        },
+        get_relations_overview=lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("ra failed")
+        ),
+    )
+    ctx = FakeContext(stars=[FakeStar(bad_ra, name="astrbot_plugin_relation_analyzer")])
+    result = run(inf.rank_influential(ev, ctx, "qq:1:group:g1"))
     assert len(result) == 1
     assert result[0]["sender_id"] == "a"
     assert result[0]["score"] == pytest.approx(1.0)
@@ -340,31 +354,29 @@ def test_sender_name_resolution():
     assert names["u2"] == "u2"
 
 
-# ---------- 13. RA SQLite 有数据 → 参与排行 ----------
+# ---------- 13. RA 公开能力接口有数据 → 参与排行 ----------
 
 
-def test_ra_sqlite_usable(monkeypatch, tmp_path):
-    db = tmp_path / "relations.sqlite3"
-    conn = sqlite3.connect(str(db))
-    conn.execute("CREATE TABLE relations (group_id TEXT, a TEXT, b TEXT, score REAL)")
-    conn.executemany(
-        "INSERT INTO relations (group_id, a, b, score) VALUES (?, ?, ?, ?)",
-        [
-            ("g1", "u1", "u2", 10.0),
-            ("g1", "u1", "u3", 5.0),
-            ("g2", "u9", "u8", 99.0),
-        ],
+def test_ra_capability_usable():
+    ra_plugin = SimpleNamespace(
+        get_dynamics_capabilities=lambda: {
+            "enabled": True,
+            "ready": True,
+            "capabilities": {"relations": True},
+        },
+        get_relations_overview=lambda gid, **kw: {
+            "centers": [
+                {"user_id": "u1", "score": 10.0},
+                {"user_id": "u2", "score": 5.0},
+                {"user_id": "u3", "score": 0.0},
+            ]
+        },
     )
-    conn.commit()
-    conn.close()
-
-    monkeypatch.setattr(inf, "_resolve_ra_db_path", lambda: db)
+    ctx = FakeContext(stars=[FakeStar(ra_plugin, name="custom_relations_provider")])
     # LM 缺失 → 仅 RA 来源
     ev = make_evidence({}, [FakeMessage(uid, uid, now()) for uid in ("u1", "u2", "u3")])
     result = run(
-        inf.rank_influential(
-            ev, no_star_context(), "qq:1:group:g1", weights={"ra": 1, "lm": 0}
-        )
+        inf.rank_influential(ev, ctx, "qq:1:group:g1", weights={"ra": 1, "lm": 0})
     )
 
     assert [r["sender_id"] for r in result] == ["u1", "u2", "u3"]
@@ -444,124 +456,128 @@ def test_ra_in_process_used():
     assert ra_store.calls == ["g1"]
 
 
-# ---------- 18. relation_pairs (ABC 批次: 关系弧数据源) ----------
+# ---------- 18. relation_pairs (ABC 批次: 关系弧公开能力数据源) ----------
 
 
-def test_relation_pairs_sorted_desc_and_bots_skipped(monkeypatch, tmp_path):
-    db = tmp_path / "relations.sqlite3"
-    conn = sqlite3.connect(str(db))
-    conn.execute(
-        f"CREATE TABLE relations (group_id TEXT, a TEXT, b TEXT, score REAL, last_ts REAL DEFAULT {time.time()})"
-    )
-    conn.executemany(
-        "INSERT INTO relations (group_id, a, b, score) VALUES (?, ?, ?, ?)",
-        [
-            ("g1", "u1", "u2", 3.0),
-            ("g1", "u1", "u3", 9.0),
-            ("g1", "bot", "u4", 99.0),  # bot id -> 剔除
-            ("g1", "", "u5", 5.0),  # 空 id -> 剔除
-            ("g2", "x1", "x2", 1.0),  # 其他群 -> 不返回
+def test_relation_pairs_sorted_desc_and_bots_skipped():
+    ts = now()
+    ra_plugin = SimpleNamespace(
+        get_dynamics_capabilities=lambda: {
+            "enabled": True,
+            "ready": True,
+            "capabilities": {"relations": True},
+        },
+        get_relation_pairs=lambda **kw: [
+            {"group_id": "g1", "a": "u1", "b": "u2", "score": 3.0, "last_ts": ts},
+            {"group_id": "g1", "a": "u1", "b": "u3", "score": 9.0, "last_ts": ts},
+            {"group_id": "g1", "a": "bot", "b": "u4", "score": 99.0, "last_ts": ts},
+            {"group_id": "g1", "a": "", "b": "u5", "score": 5.0, "last_ts": ts},
+            {"group_id": "g2", "a": "x1", "b": "x2", "score": 1.0, "last_ts": ts},
         ],
     )
-    conn.commit()
-    conn.close()
-
-    monkeypatch.setattr(inf, "_resolve_ra_db_path", lambda: db)
-    pairs = run(inf.relation_pairs(None, "qq:1:group:g1", top_k=5))
+    ctx = FakeContext(
+        stars=[FakeStar(ra_plugin, name="astrbot_plugin_relation_analyzer")]
+    )
+    pairs = run(inf.relation_pairs(ctx, "qq:1:group:g1", top_k=5))
     assert pairs == [("u1", "u3", 9.0), ("u1", "u2", 3.0)]
 
 
-def test_relation_pairs_top_k_respected(monkeypatch, tmp_path):
-    db = tmp_path / "relations.sqlite3"
-    conn = sqlite3.connect(str(db))
-    conn.execute(
-        f"CREATE TABLE relations (group_id TEXT, a TEXT, b TEXT, score REAL, last_ts REAL DEFAULT {time.time()})"
+def test_relation_pairs_top_k_respected():
+    ra_plugin = SimpleNamespace(
+        get_dynamics_capabilities=lambda: {
+            "enabled": True,
+            "ready": True,
+            "capabilities": {"relations": True},
+        },
+        get_relation_pairs=lambda **kw: [
+            (f"u{i}", f"v{i}", float(i)) for i in range(1, 8)
+        ],
     )
-    conn.executemany(
-        "INSERT INTO relations (group_id, a, b, score) VALUES (?, ?, ?, ?)",
-        [("g1", f"u{i}", f"v{i}", float(i)) for i in range(1, 8)],
+    ctx = FakeContext(
+        stars=[FakeStar(ra_plugin, name="astrbot_plugin_relation_analyzer")]
     )
-    conn.commit()
-    conn.close()
-
-    monkeypatch.setattr(inf, "_resolve_ra_db_path", lambda: db)
-    pairs = run(inf.relation_pairs(None, "qq:1:group:g1", top_k=3))
+    pairs = run(inf.relation_pairs(ctx, "qq:1:group:g1", top_k=3))
     assert len(pairs) == 3
     assert pairs[0][2] == 7.0
 
 
-def test_relation_pairs_missing_db_returns_none(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        inf, "_resolve_ra_db_path", lambda: tmp_path / "no_such" / "relations.sqlite3"
+def test_relation_pairs_missing_plugin_returns_none():
+    assert run(inf.relation_pairs(no_star_context(), "qq:1:group:g1")) is None
+
+
+def test_relation_pairs_error_returns_none():
+    ra_plugin = SimpleNamespace(
+        get_dynamics_capabilities=lambda: {
+            "enabled": True,
+            "ready": True,
+            "capabilities": {"relations": True},
+        },
+        get_relation_pairs=lambda **kw: (_ for _ in ()).throw(RuntimeError("boom")),
     )
-    assert run(inf.relation_pairs(None, "qq:1:group:g1")) is None
+    ctx = FakeContext(
+        stars=[FakeStar(ra_plugin, name="astrbot_plugin_relation_analyzer")]
+    )
+    assert run(inf.relation_pairs(ctx, "qq:1:group:g1")) is None
 
 
-def test_relation_pairs_corrupt_db_returns_none(monkeypatch, tmp_path):
-    bad = tmp_path / "relations.sqlite3"
-    bad.write_bytes(b"not a sqlite db at all" * 5)
-    monkeypatch.setattr(inf, "_resolve_ra_db_path", lambda: bad)
-    assert run(inf.relation_pairs(None, "qq:1:group:g1")) is None
+def test_relation_pairs_no_rows_returns_none():
+    ra_plugin = SimpleNamespace(
+        get_dynamics_capabilities=lambda: {
+            "enabled": True,
+            "ready": True,
+            "capabilities": {"relations": True},
+        },
+        get_relation_pairs=lambda **kw: {"pairs": []},
+    )
+    ctx = FakeContext(
+        stars=[FakeStar(ra_plugin, name="astrbot_plugin_relation_analyzer")]
+    )
+    assert run(inf.relation_pairs(ctx, "qq:1:group:g1")) is None
 
 
-def test_relation_pairs_no_rows_returns_none(monkeypatch, tmp_path):
-    db = tmp_path / "relations.sqlite3"
-    conn = sqlite3.connect(str(db))
-    conn.execute("CREATE TABLE relations (group_id TEXT, a TEXT, b TEXT, score REAL)")
-    conn.commit()
-    conn.close()
-    monkeypatch.setattr(inf, "_resolve_ra_db_path", lambda: db)
-    assert run(inf.relation_pairs(None, "qq:1:group:g1")) is None
+# ---------- 19. 去深层 BFS 反射探测与公开能力清单门控 ----------
 
 
-# ---------- 19. P3 探测缓存: 第二次排行不再 BFS ----------
+def test_find_influence_analyzer_skips_private_deep_attrs():
+    """私有嵌套属性不参与探测, 公开 services/analyzer 路径正常识别。"""
+    hidden_analyzer = FakeInfluenceAnalyzer([{"user_id": "u1", "score": 1.0}])
+    opaque_plugin = SimpleNamespace(
+        _private=SimpleNamespace(nested=SimpleNamespace(analyzer=hidden_analyzer))
+    )
+    assert inf._find_influence_analyzer(opaque_plugin) is None
+
+    public_analyzer = FakeInfluenceAnalyzer([{"user_id": "u1", "score": 2.0}])
+    service_plugin = SimpleNamespace(services=SimpleNamespace(social=public_analyzer))
+    assert inf._find_influence_analyzer(service_plugin) is public_analyzer
 
 
-def test_probe_cache_avoids_second_bfs(monkeypatch):
-    """相同插件实例二次排行 → 命中 TTL 缓存, 不再触发 BFS 探测。
-
-    SL 星无已知属性名 (无 social_graph_analyzer 等) → 必走 BFS 兜底路径;
-    第一次调用 BFS 1 次, 第二次命中缓存 0 次。
-    """
-    stats = {"u1": 10, "u2": 4}
-    msgs = [FakeMessage("u1", "A", now()), FakeMessage("u2", "B", now())]
-    ev = make_evidence(stats, msgs)
-
-    plugin = SimpleNamespace()  # 无已知属性 → 触发 BFS
-    ctx = FakeContext(stars=[FakeStar(plugin, name="astrbot_plugin_self_learning")])
-
-    bfs_calls = []
-
-    def spy_bfs(obj):
-        bfs_calls.append(1)
-        return None  # 未找到分析器 → SL 来源缺失
-
-    monkeypatch.setattr(inf, "_bfs_influence_analyzer", spy_bfs)
-    run(inf.rank_influential(ev, ctx, "qq:1:group:g1"))
-    run(inf.rank_influential(ev, ctx, "qq:1:group:g1"))
-    assert bfs_calls == [1]  # 仅第一次 BFS
-
-
-def test_probe_cache_expired_after_ttl(monkeypatch):
-    """TTL 过期后再次解析 → 重新执行探测。"""
-    stats = {"u1": 5}
-    msgs = [FakeMessage("u1", "A", now())]
-    ev = make_evidence(stats, msgs)
-    plugin = SimpleNamespace()
-    ctx = FakeContext(stars=[FakeStar(plugin, name="astrbot_plugin_self_learning")])
-
-    bfs_calls = []
-
-    def spy_bfs(obj):
-        bfs_calls.append(1)
-        return None
-
-    monkeypatch.setattr(inf, "_bfs_influence_analyzer", spy_bfs)
-    run(inf.rank_influential(ev, ctx, "qq:1:group:g1"))
-    assert bfs_calls == [1]
-    # 模拟 TTL 过期
-    key = ("influence_analyzer", id(plugin))
-    old = inf._PROBE_CACHE[key]
-    inf._PROBE_CACHE[key] = (old[0] - inf._PROBE_TTL - 1, old[1])
-    run(inf.rank_influential(ev, ctx, "qq:1:group:g1"))
-    assert bfs_calls == [1, 1]  # TTL 过期 → 重新执行探测
+def test_capability_manifest_skips_disabled_or_unready():
+    """未启用或未就绪的能力声明应被跳过, 继续选中就绪提供者。"""
+    unready = FakeInfluenceAnalyzer([{"user_id": "u1", "score": 99.0}])
+    ready = FakeInfluenceAnalyzer([{"user_id": "u2", "score": 10.0}])
+    plugin_unready = SimpleNamespace(
+        get_dynamics_capabilities=lambda: {
+            "enabled": True,
+            "ready": False,
+            "capabilities": {"social": True},
+        },
+        get_influence_ranking=unready.get_influence_ranking,
+    )
+    plugin_ready = SimpleNamespace(
+        get_dynamics_capabilities=lambda: {
+            "enabled": True,
+            "ready": True,
+            "capabilities": {"social": True},
+        },
+        get_influence_ranking=ready.get_influence_ranking,
+    )
+    ctx = FakeContext(
+        stars=[
+            FakeStar(plugin_unready, name="disabled_sl"),
+            FakeStar(plugin_ready, name="ready_sl"),
+        ]
+    )
+    resolved = inf._resolve_star_instance(
+        ctx, inf._SL_ALIASES, capability_names=("social", "learning")
+    )
+    assert resolved is plugin_ready

@@ -23,6 +23,8 @@ from .render import render_text_or_image
 
 logger = logging.getLogger(__name__)
 GROUP_PATTERN = re.compile(r"^[^:\s]+:GroupMessage:[^\s]+$")
+_WATCH_SCOPE_INTERVAL_SEC = 30
+_HOURLY_CYCLE_DIVISOR = 6
 KINDS = {
     "activity",
     "achievement",
@@ -161,29 +163,37 @@ def scope_lists(config):
 
 
 def source_fingerprint(row):
-    return hashlib.sha256(encode({k:row.get(k) for k in ('id','uid','role','ts','content')}).encode()).hexdigest()
+    return hashlib.sha256(
+        encode({k: row.get(k) for k in ("id", "uid", "role", "ts", "content")}).encode()
+    ).hexdigest()
 
 
 def resume_offset(job, mode, rows):
     """An offset belongs to one exact source, never simply the next available row."""
-    offset = job[f'{mode}_offset']
+    offset = job[f"{mode}_offset"]
     if not offset or not rows:
         return offset, None
     row = rows[0]
     digest = source_fingerprint(row)
-    if (job.get(f'{mode}_fragment_id') == row['id'] and job.get(f'{mode}_fragment_hash') == digest
-            and 0 < offset < len(row['content'])):
+    if (
+        job.get(f"{mode}_fragment_id") == row["id"]
+        and job.get(f"{mode}_fragment_hash") == digest
+        and 0 < offset < len(row["content"])
+    ):
         return offset, None
-    return 0, '原未完成分片已变化或无法核验，已从当前可用消息开头重新整理；缺失内容未补造'
+    return (
+        0,
+        "原未完成分片已变化或无法核验，已从当前可用消息开头重新整理；缺失内容未补造",
+    )
 
 
 def fragment_checkpoint(rows, cursor, offset):
     if not offset:
         return None
-    row = next((r for r in rows if r['id'] > cursor), None)
+    row = next((r for r in rows if r["id"] > cursor), None)
     if row is None:
-        raise ValueError('Partial checkpoint has no matching source')
-    return {'id':row['id'], 'sha256':source_fingerprint(row)}
+        raise ValueError("Partial checkpoint has no matching source")
+    return {"id": row["id"], "sha256": source_fingerprint(row)}
 
 
 def pack_messages(
@@ -587,7 +597,7 @@ class HistoryService:
                     self.plugin._spawn_bg(
                         self.run_cycle(), label="history-scope-refresh"
                     )
-            await asyncio.sleep(5)
+            await asyncio.sleep(_WATCH_SCOPE_INTERVAL_SEC)
 
     async def terminate(self):
         """Remove the hourly job and cancel source/model work."""
@@ -603,6 +613,7 @@ class HistoryService:
         tasks = self.cancel_operations()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self.store.close()
 
     def cancel_operations(self, umo=None):
         """Cancel tracked work while keeping the current privacy/unload caller alive.
@@ -640,7 +651,7 @@ class HistoryService:
         Returns:
             Allowed group sessions.
         """
-        groups = set(self.store.groups())
+        groups = set(await asyncio.to_thread(self.store.groups))
         try:
             groups.update(await lm_bridge.history_sessions(self.plugin.context))
         except Exception:
@@ -777,27 +788,67 @@ class HistoryService:
                     return
                 await self.refresh_scope()
                 groups = await self.discover()
-                groups.sort(
-                    key=lambda umo: (self.store.job(umo) or {}).get("updated", 0)
+                culture = getattr(self.plugin, "culture", None)
+                culture_enabled = bool(
+                    culture is not None and self.plugin._cfg("culture_enabled", False)
                 )
+
+                def _group_sort_keys():
+                    keys = {
+                        u: (self.store.job(u) or {}).get("updated", 0) for u in groups
+                    }
+                    if (
+                        culture_enabled
+                        and hasattr(culture, "store")
+                        and hasattr(culture.store, "job")
+                    ):
+                        for u in groups:
+                            c_updated = (culture.store.job(u) or {}).get("updated", 0)
+                            keys[u] = min(keys[u], c_updated)
+                    return keys
+
+                sort_keys = await asyncio.to_thread(_group_sort_keys)
+                groups.sort(key=lambda umo: sort_keys.get(umo, 0))
+                day = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
+                raw_limit = self.plugin._cfg("history_daily_limit", 20)
+                daily_limit = max(0, int(20 if raw_limit is None else raw_limit))
+                cycle_budget = (
+                    max(1, math.ceil(daily_limit / _HOURLY_CYCLE_DIVISOR))
+                    if daily_limit > 0
+                    else 0
+                )
+                start_quota = await asyncio.to_thread(self.store.quota, day)
+                if start_quota >= daily_limit or cycle_budget <= 0:
+                    return
+                max_empty_passes = max(4, cycle_budget + 2)
+
+                async def _budget_exhausted():
+                    used_now = await asyncio.to_thread(self.store.quota, day)
+                    return (
+                        used_now >= daily_limit
+                        or used_now - start_quota >= cycle_budget
+                    )
+
                 for mode in ("live", "back"):
+                    empty_passes = 0
                     while not self.plugin._terminating:
+                        before_quota = await asyncio.to_thread(self.store.quota, day)
+                        if (
+                            before_quota >= daily_limit
+                            or before_quota - start_quota >= cycle_budget
+                        ):
+                            return
                         progressed = False
                         for umo in groups:
-                            if not await self.allowed(umo):
+                            if self.plugin._terminating or not await self.allowed(umo):
                                 continue
+                            if await _budget_exhausted():
+                                return
                             try:
-                                culture = getattr(self.plugin, "culture", None)
-                                if culture is not None:
-                                    operation = asyncio.create_task(
-                                        culture.step(umo, mode)
-                                    )
-                                    progressed |= await operation
                                 operation = asyncio.create_task(
                                     self.process_one(umo, mode)
                                 )
-                                result = await operation
-                                progressed |= result
+                                progressed |= await operation
                             except asyncio.CancelledError:
                                 if (
                                     self.plugin._terminating
@@ -817,15 +868,49 @@ class HistoryService:
                                     "Lifetime batch failed without advancing its checkpoint",
                                     exc_info=True,
                                 )
-                        day = (
-                            datetime.now(timezone(timedelta(hours=8)))
-                            .date()
-                            .isoformat()
-                        )
-                        if not progressed or self.store.quota(day) >= self.plugin._cfg(
-                            "history_daily_limit", 20
-                        ):
+                        if culture is not None:
+                            for umo in groups:
+                                if self.plugin._terminating or not await self.allowed(
+                                    umo
+                                ):
+                                    continue
+                                if await _budget_exhausted():
+                                    return
+                                try:
+                                    operation = asyncio.create_task(
+                                        culture.step(umo, mode)
+                                    )
+                                    progressed |= await operation
+                                except asyncio.CancelledError:
+                                    if (
+                                        self.plugin._terminating
+                                        or getattr(
+                                            asyncio.current_task(),
+                                            "cancelling",
+                                            lambda: 0,
+                                        )()
+                                    ):
+                                        raise
+                                    continue
+                                except Exception:
+                                    logger.warning(
+                                        "Culture step failed inside lifetime cycle",
+                                        exc_info=True,
+                                    )
+                        if not progressed:
                             break
+                        after_quota = await asyncio.to_thread(self.store.quota, day)
+                        if (
+                            after_quota >= daily_limit
+                            or after_quota - start_quota >= cycle_budget
+                        ):
+                            return
+                        if after_quota == before_quota:
+                            empty_passes += 1
+                            if empty_passes >= max_empty_passes:
+                                break
+                        else:
+                            empty_passes = 0
         finally:
             self.plugin._bg_tasks.discard(task)
 
@@ -872,9 +957,16 @@ class HistoryService:
                         [],
                         gap="部分源消息已不可获取；此区间未能恢复",
                     )
-                privacy = self.privacy_key(umo)
+
+                def _precheck_state():
+                    return (
+                        self.privacy_key(umo),
+                        self.store.hidden(umo),
+                        self.store.excluded_sources(umo),
+                    )
+
+                privacy, hidden, excluded_ids = await asyncio.to_thread(_precheck_state)
                 pack_offset, resume_gap = resume_offset(job, mode, rows)
-                hidden = self.store.hidden(umo)
                 for identity in hidden:
                     identity["aliases"] = list(
                         set(identity["aliases"])
@@ -890,57 +982,65 @@ class HistoryService:
                     pack_offset,
                     hidden=hidden,
                     bot_ids=self.bot_ids.get(umo.split(":", 1)[0], set()),
-                    excluded_ids=self.store.excluded_sources(umo),
+                    excluded_ids=excluded_ids,
                 )
                 if end == cursor and next_offset == offset and not material:
                     raise RuntimeError("素材预算无法容纳消息标识")
                 facts = []
                 if material:
-                    day = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
-                    if not await asyncio.to_thread(
-                        self.store.consume_quota,
-                        day,
-                        self.plugin._cfg("history_daily_limit", 20),
-                    ):
-                        return False
-                    previous = self.store.events(umo, status=None, public=True)
-                    previous = [
-                        e for e in previous if e["status"] in ("approved", "pending")
-                    ]
-                    previous = sorted(
-                        previous, key=lambda e: (not e.get("ongoing"), -e["event_at"])
-                    )[:20]
-                    targets = []
-                    for e in previous:
-                        target = {
-                            "id": e["id"],
-                            "kind": e["kind"],
-                            "title": e["title"],
-                            "detail": e["detail"][:100],
-                            "participants": e["participants"][:10],
-                            "ongoing": e.get("ongoing", False),
-                        }
-                        if len(encode(targets + [target])) <= 4000:
-                            targets.append(target)
-                    known = {e["id"] for e in targets}
-                    previous = [e for e in previous if e["id"] in known]
-                    mentioned = set(
-                        re.findall(
-                            r"\[At:([^\]\s]+)\]",
-                            "\n".join(m["content"] for m in material),
-                        )
+
+                    def _prepare_extraction_inputs():
+                        prev_all = self.store.events(umo, status=None, public=True)
+                        prev_filtered = [
+                            e
+                            for e in prev_all
+                            if e["status"] in ("approved", "pending")
+                        ]
+                        prev_filtered = sorted(
+                            prev_filtered,
+                            key=lambda e: (not e.get("ongoing"), -e["event_at"]),
+                        )[:20]
+                        targets_list = []
+                        for e in prev_filtered:
+                            target = {
+                                "id": e["id"],
+                                "kind": e["kind"],
+                                "title": e["title"],
+                                "detail": e["detail"][:100],
+                                "participants": e["participants"][:10],
+                                "ongoing": e.get("ongoing", False),
+                            }
+                            if len(encode(targets_list + [target])) <= 4000:
+                                targets_list.append(target)
+                        known_ids = {e["id"] for e in targets_list}
+                        prev_filtered = [
+                            e for e in prev_filtered if e["id"] in known_ids
+                        ]
+                        mentioned_uids = sorted(
+                            set(
+                                re.findall(
+                                    r"\[At:([^\]\s]+)\]",
+                                    "\n".join(m["content"] for m in material),
+                                )
+                            )
+                        )[:80]
+                        members_map = self.store.members_by_uids(umo, mentioned_uids)
+                        bot_set = self.bot_ids.get(umo.split(":", 1)[0], set())
+                        known_map = {}
+                        for uid in mentioned_uids:
+                            member = members_map.get(uid)
+                            if member and not member["hidden"] and uid not in bot_set:
+                                candidate = {
+                                    **known_map,
+                                    uid: member["name"][:60],
+                                }
+                                if len(encode(candidate)) <= 2000:
+                                    known_map = candidate
+                        return prev_filtered, targets_list, known_map
+
+                    previous, targets, known = await asyncio.to_thread(
+                        _prepare_extraction_inputs
                     )
-                    known = {}
-                    for uid in sorted(mentioned)[:80]:
-                        member = self.store.member(umo, uid)
-                        if (
-                            member
-                            and not member["hidden"]
-                            and uid not in self.bot_ids.get(umo.split(":", 1)[0], set())
-                        ):
-                            candidate = {**known, uid: member["name"][:60]}
-                            if len(encode(candidate)) <= 2000:
-                                known = candidate
                     prompt = (
                         "本群已有事件（仅用于识别续记）：\n"
                         + encode(targets)
@@ -949,6 +1049,19 @@ class HistoryService:
                         + "\n待整理材料：\n"
                         + encode(material)
                     )
+                    if (
+                        not await self.allowed(umo)
+                        or await asyncio.to_thread(self.privacy_key, umo) != privacy
+                    ):
+                        return False
+                    day = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
+                    if not await asyncio.to_thread(
+                        self.store.consume_quota,
+                        day,
+                        self.plugin._cfg("history_daily_limit", 20),
+                        kind="history",
+                    ):
+                        return False
                     raw = await asyncio.wait_for(
                         call_llm(
                             self.plugin.context,
@@ -962,7 +1075,10 @@ class HistoryService:
                     facts = validate_extraction(
                         raw, material, previous, known_members=known
                     )
-                if not await self.allowed(umo) or self.privacy_key(umo) != privacy:
+                if (
+                    not await self.allowed(umo)
+                    or await asyncio.to_thread(self.privacy_key, umo) != privacy
+                ):
                     return False
                 gap = (
                     "部分来源时间无效或超前，已跳过无法核实的素材"
@@ -982,7 +1098,7 @@ class HistoryService:
                     next_offset,
                     observed,
                     facts,
-                    gap='；'.join(v for v in (resume_gap, gap) if v) or None,
+                    gap="；".join(v for v in (resume_gap, gap) if v) or None,
                     fragment=fragment_checkpoint(rows, end, next_offset),
                 )
             finally:
@@ -1024,10 +1140,8 @@ class HistoryService:
             return False
         if text.startswith("此时间范围尚无已入史的大事。"):
             return True
-        return any(
-            e.get("chronicle_text") == text
-            for e in self.store.reports(umo, include_bios=True)
-        )
+        reports = await asyncio.to_thread(self.store.reports, umo, include_bios=True)
+        return any(e.get("chronicle_text") == text for e in reports)
 
     @tracked_operation
     async def biography(self, umo, uid, *, style=None):
@@ -1059,7 +1173,7 @@ class HistoryService:
         sp = self.plugin._cfg("prompt_biography", "") or await resolve_system_prompt(
             self.plugin.context, self.plugin.config, umo
         )
-        privacy = self.privacy_key(umo)
+        privacy = await asyncio.to_thread(self.privacy_key, umo)
         key = (
             "bio:"
             + hashlib.sha256(
@@ -1079,7 +1193,7 @@ class HistoryService:
                 ).encode()
             ).hexdigest()
         )
-        cached = self.store.cache(umo, key)
+        cached = await asyncio.to_thread(self.store.cache, umo, key)
         if cached:
             return cached["chronicle_text"]
         first_at = min([member["first_seen"]] + [e["event_at"] for e in facts])
@@ -1148,24 +1262,30 @@ class HistoryService:
                 provider_id=self.plugin._llm_provider_id(),
             )
             text = text[:limit]
-        if (
-            self.privacy_key(umo) != privacy
-            or self.store.member(umo, uid)["hidden"]
-            or self.store.revision(umo) != revision
-        ):
-            raise ValueError("档案事实或隐私设置已更新，请重新查询")
-        self.store.save_report(
-            umo,
-            key,
-            {
-                "report_kind": "biography",
-                "member_id": uid,
-                "chronicle_text": text,
-                "created_at": time.time(),
-                "delivery_complete": False,
-            },
-            expected_revision=revision,
-        )
+
+        def _commit_bio_report():
+            member_now = self.store.member(umo, uid)
+            if (
+                self.privacy_key(umo) != privacy
+                or not member_now
+                or member_now["hidden"]
+                or self.store.revision(umo) != revision
+            ):
+                raise ValueError("档案事实或隐私设置已更新，请重新查询")
+            self.store.save_report(
+                umo,
+                key,
+                {
+                    "report_kind": "biography",
+                    "member_id": uid,
+                    "chronicle_text": text,
+                    "created_at": time.time(),
+                    "delivery_complete": False,
+                },
+                expected_revision=revision,
+            )
+
+        await asyncio.to_thread(_commit_bio_report)
         return text
 
     @tracked_operation
@@ -1203,25 +1323,40 @@ class HistoryService:
         snapshot = await asyncio.to_thread(self.store.snapshot, umo, since=since)
         facts, revision = snapshot["facts"], snapshot["revision"]
         if not facts:
-            return "此时间范围尚无已入史的大事。" + self.coverage(umo), None, False
+            return (
+                "此时间范围尚无已入史的大事。"
+                + await asyncio.to_thread(self.coverage, umo),
+                None,
+                False,
+            )
         style = style or self.plugin._cfg("chronicle_style", "official")
         sp = self.plugin._cfg("prompt_chronicle", "") or await resolve_system_prompt(
             self.plugin.context, self.plugin.config, umo
         )
-        privacy = self.privacy_key(umo)
-        top = (
-            self.store.top(umo, since, self.plugin._cfg("top_n_bios", 3))
-            if include_bios
-            else []
-        )
-        # Period identity remains stable during repeated queries on the same day/week.
+
+        def _prepare_report_key_inputs():
+            priv = self.privacy_key(umo)
+            top_uids = (
+                self.store.top(umo, since, self.plugin._cfg("top_n_bios", 3))
+                if include_bios
+                else []
+            )
+            members_map = self.store.members_by_uids(umo, top_uids)
+            # Period identity remains stable during repeated queries on the same day/week.
+            idents = [
+                {
+                    k: v
+                    for k, v in (members_map.get(uid) or {}).items()
+                    if k != "last_seen"
+                }
+                for uid in top_uids
+            ]
+            return priv, top_uids, idents
+
+        privacy, top, identities = await asyncio.to_thread(_prepare_report_key_inputs)
         now = datetime.now()
         year, week = now.isocalendar()[:2]
         period = f"window:{days}"
-        identities = [
-            {k: v for k, v in self.store.member(umo, uid).items() if k != "last_seen"}
-            for uid in top
-        ]
         key = (
             "chronicle:"
             + hashlib.sha256(
@@ -1243,7 +1378,7 @@ class HistoryService:
                 ).encode()
             ).hexdigest()
         )
-        cached = self.store.cache(umo, key)
+        cached = await asyncio.to_thread(self.store.cache, umo, key)
         if cached and not force:
             return (
                 cached["chronicle_text"],
@@ -1272,22 +1407,29 @@ class HistoryService:
             provider_id=self.plugin._llm_provider_id(),
         )
         biographies = []
-        for uid in top:
-            bio = await self.biography(umo, uid, style=style)
-            text += "\n\n" + bio
-            member = self.store.member(umo, uid)
-            biographies.append(
-                {"sender_id": uid, "sender_name": member["name"], "biography": bio}
-            )
+        if top:
+            bios = []
+            for uid in top:
+                bios.append(await self.biography(umo, uid, style=style))
+            bio_members = await asyncio.to_thread(self.store.members_by_uids, umo, top)
+            for uid, bio in zip(top, bios):
+                text += "\n\n" + bio
+                member = bio_members.get(uid) or {"name": uid}
+                biographies.append(
+                    {"sender_id": uid, "sender_name": member["name"], "biography": bio}
+                )
+        cov_text = await asyncio.to_thread(self.coverage, umo)
         text += (
             f"\n\n—— 最近{days}天正式事件 {len(facts)} 件，本篇选录 {len(material)} 件。\n"
-            + self.coverage(umo)
+            + cov_text
         )
-        if (
-            self.privacy_key(umo) != privacy
-            or not await self.allowed(umo)
-            or self.store.revision(umo) != revision
-        ):
+
+        def _pre_render_mismatch():
+            return (
+                self.privacy_key(umo) != privacy or self.store.revision(umo) != revision
+            )
+
+        if not await self.allowed(umo) or await asyncio.to_thread(_pre_render_mismatch):
             raise ValueError("群范围或隐私设置已变化，本次结果未发布，请重新生成")
         image_path = None
         try:
@@ -1307,39 +1449,41 @@ class HistoryService:
             logger.warning(
                 "Lifetime edition image rendering failed; text remains available"
             )
-        if (
-            self.privacy_key(umo) != privacy
-            or not await self.allowed(umo)
-            or self.store.revision(umo) != revision
-        ):
+        if not await self.allowed(umo):
             raise ValueError("群范围或隐私设置已变化，本次结果未发布")
         if force:
             key += ":forced:" + str(time.time_ns())
-        self.store.save_report(
-            umo,
-            key,
-            {
-                "iso_year": year,
-                "iso_week": week,
-                "period_days": days,
-                "report_kind": "chronicle",
-                "group_name": group_name,
-                "created_at": time.time(),
-                "chronicle_text": text,
-                "biographies": biographies,
-                "biographies_embedded": True,
-                "image_path": image_path,
-                "newest_msg_ts": max(e["event_at"] for e in facts),
-                "event_ids": [e["id"] for e in facts],
-                "event_count": len(facts),
-                "msg_count": 0,
-                "event_versions": [[e["id"], e["revision"]] for e in facts],
-                "delivery_complete": False,
-                "facts_key": key,
-                "version": 1,
-            },
-            expected_revision=revision,
-        )
+
+        def _save_final_report():
+            if self.privacy_key(umo) != privacy or self.store.revision(umo) != revision:
+                raise ValueError("群范围或隐私设置已变化，本次结果未发布")
+            self.store.save_report(
+                umo,
+                key,
+                {
+                    "iso_year": year,
+                    "iso_week": week,
+                    "period_days": days,
+                    "report_kind": "chronicle",
+                    "group_name": group_name,
+                    "created_at": time.time(),
+                    "chronicle_text": text,
+                    "biographies": biographies,
+                    "biographies_embedded": True,
+                    "image_path": image_path,
+                    "newest_msg_ts": max(e["event_at"] for e in facts),
+                    "event_ids": [e["id"] for e in facts],
+                    "event_count": len(facts),
+                    "msg_count": 0,
+                    "event_versions": [[e["id"], e["revision"]] for e in facts],
+                    "delivery_complete": False,
+                    "facts_key": key,
+                    "version": 1,
+                },
+                expected_revision=revision,
+            )
+
+        await asyncio.to_thread(_save_final_report)
         return text, image_path, False
 
     async def record_valuable_outcome(self, umo: str, outcome: dict) -> dict:
@@ -1349,12 +1493,27 @@ class HistoryService:
         gated: non-completed payloads are rejected; risky payloads enter 'pending'.
         """
         if not isinstance(umo, str) or not GROUP_PATTERN.fullmatch(umo.strip()):
-            return {"schema_version": 1, "admitted": False, "status": "rejected", "reason": "invalid_group_umo"}
+            return {
+                "schema_version": 1,
+                "admitted": False,
+                "status": "rejected",
+                "reason": "invalid_group_umo",
+            }
         umo = umo.strip()
         if not await self.allowed(umo):
-            return {"schema_version": 1, "admitted": False, "status": "disabled", "reason": "group_scope_not_allowed"}
+            return {
+                "schema_version": 1,
+                "admitted": False,
+                "status": "disabled",
+                "reason": "group_scope_not_allowed",
+            }
         if not isinstance(outcome, dict) or outcome.get("schema_version") != 1:
-            return {"schema_version": 1, "admitted": False, "status": "rejected", "reason": "invalid_schema"}
+            return {
+                "schema_version": 1,
+                "admitted": False,
+                "status": "rejected",
+                "reason": "invalid_schema",
+            }
 
         kind = str(outcome.get("kind") or "activity").strip()
         if kind not in KINDS:
@@ -1362,9 +1521,18 @@ class HistoryService:
         title = str(outcome.get("title") or "").strip()[:200]
         detail = str(outcome.get("detail") or "").strip()[:3000]
         if not title or not detail:
-            return {"schema_version": 1, "admitted": False, "status": "rejected", "reason": "empty_title_or_detail"}
+            return {
+                "schema_version": 1,
+                "admitted": False,
+                "status": "rejected",
+                "reason": "empty_title_or_detail",
+            }
 
-        raw_participants = outcome.get("participants") if isinstance(outcome.get("participants"), list) else []
+        raw_participants = (
+            outcome.get("participants")
+            if isinstance(outcome.get("participants"), list)
+            else []
+        )
         participants = []
         seen_uids = set()
         for p in raw_participants[:30]:
@@ -1380,20 +1548,32 @@ class HistoryService:
             participants.append({"uid": uid, "name": name, "role": role})
 
         if len(participants) < 2:
-            return {"schema_version": 1, "admitted": False, "status": "rejected", "reason": "insufficient_participants"}
+            return {
+                "schema_version": 1,
+                "admitted": False,
+                "status": "rejected",
+                "reason": "insufficient_participants",
+            }
 
         now = time.time()
         event_at = float(outcome.get("event_at") or now)
         if not math.isfinite(event_at) or event_at <= 0 or event_at > now + 60:
             event_at = now
 
-        raw_sources = outcome.get("sources") if isinstance(outcome.get("sources"), list) else []
+        raw_sources = (
+            outcome.get("sources") if isinstance(outcome.get("sources"), list) else []
+        )
         sources = []
         for s in raw_sources[:24]:
             if not isinstance(s, dict):
                 continue
             sid = s.get("id")
-            if isinstance(sid, str) and sid.isascii() and sid.isdecimal() and len(sid) <= 19:
+            if (
+                isinstance(sid, str)
+                and sid.isascii()
+                and sid.isdecimal()
+                and len(sid) <= 19
+            ):
                 sid = int(sid)
             if type(sid) is not int or not 0 < sid < 2**63:
                 continue
@@ -1417,7 +1597,14 @@ class HistoryService:
         fingerprint = str(outcome.get("fingerprint") or "").strip()
         if not fingerprint or len(fingerprint) < 16:
             fingerprint = hashlib.sha256(
-                encode({"source": "dynamics_games", "umo": umo, "kind": kind, "title": title}).encode("utf-8")
+                encode(
+                    {
+                        "source": "dynamics_games",
+                        "umo": umo,
+                        "kind": kind,
+                        "title": title,
+                    }
+                ).encode("utf-8")
             ).hexdigest()
 
         fact = {
@@ -1459,4 +1646,3 @@ class HistoryService:
             "event_id": int(eid),
             "status": admission,
         }
-

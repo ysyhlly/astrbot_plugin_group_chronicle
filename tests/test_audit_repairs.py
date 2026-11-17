@@ -1,9 +1,8 @@
 """Behavioral regressions for the 2026-10-05 audit findings."""
 
 import asyncio
-from datetime import date, datetime, timedelta
+from datetime import datetime
 import json
-import sqlite3
 import time
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock
@@ -383,24 +382,55 @@ def test_weekly_rank_excludes_inactive_historical_members():
 
 
 @pytest.mark.asyncio
-async def test_relation_arc_uses_daily_window(tmp_path, monkeypatch):
-    db = tmp_path / "relations.sqlite3"
-    with sqlite3.connect(db) as conn:
-        conn.execute(
-            "CREATE TABLE relation_daily(group_id TEXT,day TEXT,a TEXT,b TEXT,evidence REAL)"
-        )
-        conn.executemany(
-            "INSERT INTO relation_daily VALUES(?,?,?,?,?)",
-            [
-                ("g1", str(date.today() - timedelta(days=365)), "old_a", "old_b", 100),
-                ("g1", str(date.today()), "new_a", "new_b", 3),
-                ("g2", str(date.today()), "other_a", "other_b", 999),
-            ],
-        )
-    monkeypatch.setattr(influence, "_resolve_ra_db_path", lambda: db)
-    assert await influence.relation_pairs(None, "fake:GroupMessage:g1", top_k=1) == [
-        ("new_a", "new_b", 3)
+async def test_relation_arc_uses_daily_window():
+    now_ts = time.time()
+    seen_calls = []
+    ra_plugin = NS(
+        get_dynamics_capabilities=lambda: {
+            "enabled": True,
+            "ready": True,
+            "capabilities": {"relations": True},
+        },
+        get_relation_pairs=lambda **kw: (
+            seen_calls.append(kw)
+            or [
+                {
+                    "group_id": "g1",
+                    "a": "old_a",
+                    "b": "old_b",
+                    "score": 100,
+                    "last_ts": now_ts - 365 * 86400,
+                },
+                {
+                    "group_id": "g1",
+                    "a": "new_a",
+                    "b": "new_b",
+                    "score": 3,
+                    "last_ts": now_ts,
+                },
+                {
+                    "group_id": "g2",
+                    "a": "other_a",
+                    "b": "other_b",
+                    "score": 999,
+                    "last_ts": now_ts,
+                },
+            ]
+        ),
+    )
+    ctx = NS(
+        get_all_stars=lambda: [
+            NS(
+                star_cls=ra_plugin,
+                activated=True,
+                name="astrbot_plugin_relation_analyzer",
+            )
+        ]
+    )
+    assert await influence.relation_pairs(ctx, "fake:GroupMessage:g1", top_k=1) == [
+        ("new_a", "new_b", 3.0)
     ]
+    assert seen_calls and seen_calls[0]["window_days"] == 7
 
 
 @pytest.mark.asyncio

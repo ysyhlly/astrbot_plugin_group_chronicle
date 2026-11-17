@@ -1225,3 +1225,160 @@ def test_scope_change_cancels_article_model_work_too(plugin, monkeypatch):
         assert plugin.history.store.reports(U) == []
 
     run(case())
+
+
+def test_archive_store_wal_fallback_privacy_and_report_retention(tmp_path, monkeypatch):
+    """ArchiveStore falls back to DELETE cleanly, matches event() vs events() privacy, and prunes forced reports."""
+    import core.archive_store as archive_store_mod
+
+    archive_store_mod._JOURNAL_MODES.clear()
+    monkeypatch.setattr(archive_store_mod, "_probe_wal_support", lambda _d: False)
+    db_path = tmp_path / "wal_fallback.db"
+    store = ArchiveStore(db_path)
+    try:
+        with store.connection() as db:
+            mode = db.execute("PRAGMA journal_mode").fetchone()[0].lower()
+        assert mode == "delete"
+
+        store.observe(U, "1", "甲")
+        store.observe(U, "2", "乙")
+        id1 = store.add_event(U, fact("vis1", uid="1"), status="approved")
+        id2 = store.add_event(U, fact("vis2", uid="2"), status="approved")
+        store.hide(U, "2", None)
+
+        events = store.events(U)
+        assert [e["id"] for e in events] == [id1]
+        assert store.event(U, id1)["id"] == id1
+        assert store.event(U, id2) is None
+
+        # Forced report retention keeps bounded latest reports while bumping version monotonically.
+        last_ver = 0
+        for i in range(15):
+            rid = store.save_report(
+                U,
+                f"chronicle:base:forced:{i:04d}",
+                {
+                    "chronicle_text": f"text-{i}",
+                    "created_at": 1000.0 + i,
+                    "report_kind": "chronicle",
+                    "delivery_complete": False,
+                },
+            )
+            saved = next(r for r in store.reports(U) if r["report_id"] == rid)
+            assert saved["version"] > last_ver
+            last_ver = saved["version"]
+        with store.connection() as db:
+            cnt = db.execute(
+                "SELECT COUNT(*) FROM reports WHERE umo=? AND cache_key LIKE '%:forced:%'",
+                (U,),
+            ).fetchone()[0]
+        assert cnt == archive_store_mod._MAX_FORCED_REVISION_PER_BASE
+    finally:
+        store.close()
+        archive_store_mod._JOURNAL_MODES.clear()
+
+
+def test_run_cycle_hourly_budget_caps_per_cycle(plugin, monkeypatch):
+    """run_cycle caps work per cycle by ceil(daily_limit / 6) instead of draining daily quota."""
+    plugin.config["history_enabled"] = True
+    plugin.config["history_daily_limit"] = 20
+    plugin.config["history_batch_size"] = 1
+
+    calls = 0
+
+    async def fake_process_one(umo, mode="back"):
+        nonlocal calls
+        calls += 1
+        day = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
+        return plugin.history.store.consume_quota(day, 20, kind="history")
+
+    plugin.history.store.group(U)
+    monkeypatch.setattr(lm_bridge, "history_connection", lambda ctx: object())
+    monkeypatch.setattr(plugin.history, "process_one", fake_process_one)
+    run(plugin.history.run_cycle())
+    # Hourly budget = ceil(20 / 6) = 4, rather than draining all 20 in one cycle.
+    assert calls == 4
+
+
+def test_process_one_precheck_saves_quota(plugin, monkeypatch):
+    """Pre-check failure before call_llm in process_one must NOT charge quota."""
+    plugin.config["history_enabled"] = True
+    plugin.config["history_daily_limit"] = 20
+    plugin.config["history_batch_size"] = 3
+
+    plugin.history.store.group(V)
+    rows_v = [
+        {**message(i, f"群项目第{i}次推进内容比较详细", uid="1"), "umo": V}
+        for i in range(1, 4)
+    ]
+    db_v = run(source(plugin, rows_v))
+    llm_mock = AsyncMock(
+        side_effect=AssertionError("LLM should not run after privacy/scope change")
+    )
+    monkeypatch.setattr(lifetime, "call_llm", llm_mock)
+
+    orig_allowed = plugin.history.allowed
+    allowed_calls = 0
+
+    async def allowed_flips(umo, recording=True):
+        nonlocal allowed_calls
+        allowed_calls += 1
+        if umo == V and allowed_calls >= 2:
+            return False
+        return await orig_allowed(umo, recording=recording)
+
+    monkeypatch.setattr(plugin.history, "allowed", allowed_flips)
+    day = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
+    before_q = plugin.history.store.quota(day)
+    try:
+        assert run(plugin.history.process_one(V, "live")) is False
+        assert plugin.history.store.quota(day) == before_q
+        llm_mock.assert_not_called()
+    finally:
+        run(db_v.close())
+
+
+def test_history_capture_skips_chat_when_dm_capturing_keeps_notice(plugin, monkeypatch):
+    """Regular group chat skips duplicate capture when DM is active, while OneBot notices still capture."""
+    plugin.config["history_enabled"] = True
+    set_active(plugin)
+    filt = HistoryCaptureFilter()
+    captured = []
+    spawned = []
+
+    def fake_capture(obs, cfg=None):
+        captured.append(obs)
+        return obs
+
+    def fake_spawn(coro, label=None):
+        spawned.append(coro)
+        return None
+
+    monkeypatch.setattr(plugin.history, "capture", fake_capture)
+    monkeypatch.setattr(plugin, "_spawn_bg", fake_spawn)
+    monkeypatch.setattr(lm_bridge, "is_dm_capturing_group", lambda ctx, ev: True)
+
+    chat_ev = Event("normal group chat")
+    notice_ev = Event(
+        "",
+        raw={
+            "post_type": "notice",
+            "notice_type": "group_increase",
+            "user_id": 777,
+            "self_id": 999,
+            "time": time.time(),
+        },
+    )
+
+    filt.filter(chat_ev, {})
+    assert "0" in plugin.history.bot_ids.get("synthetic", set())
+    filt.filter(notice_ev, {})
+    assert len(captured) == 1
+    assert captured[0]["kind"] == "join"
+    assert captured[0]["uid"] == "777"
+
+    # When DM is not capturing that group, normal chat capture still triggers.
+    monkeypatch.setattr(lm_bridge, "is_dm_capturing_group", lambda ctx, ev: False)
+    filt.filter(chat_ev, {})
+    assert len(captured) == 2
+    assert captured[1]["uid"] == "1"

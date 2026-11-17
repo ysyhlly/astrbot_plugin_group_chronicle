@@ -133,3 +133,112 @@ def test_all_stars_fallback_matches_by_metadata():
     star.name = "astrbot_plugin_livingmemory"
     ctx = DummyContext(star_by_alias={}, stars=[star])
     assert lm_bridge.detect_lm(ctx) is plugin
+
+
+def test_detect_lm_skips_disabled_dm_and_avoids_false_conflict(monkeypatch):
+    """Disabled DM paired with active legacy LM returns legacy without conflict."""
+    import pytest
+
+    monkeypatch.setattr(lm_bridge, "_lm_get_active", None)
+    dm_disabled = FakePlugin(FakeInitializer())
+    dm_disabled.get_dynamics_capabilities = lambda: {
+        "schema_version": 1,
+        "provider_id": "astrbot_plugin_dynamics_memory",
+        "enabled": False,
+        "ready": False,
+        "capabilities": {"memory": 1},
+    }
+    legacy = FakePlugin(FakeInitializer())
+
+    dm_star = FakeStar(star_cls=dm_disabled, activated=True)
+    dm_star.name = "astrbot_plugin_dynamics_memory"
+    legacy_star = FakeStar(star_cls=legacy, activated=True)
+    legacy_star.name = "astrbot_plugin_livingmemory"
+
+    ctx = DummyContext(
+        star_by_alias={
+            "astrbot_plugin_dynamics_memory": dm_star,
+            "astrbot_plugin_livingmemory": legacy_star,
+        },
+        stars=[dm_star, legacy_star],
+    )
+    assert lm_bridge.detect_lm(ctx) is legacy
+
+    # Genuine dual-active conflict must still raise.
+    dm_disabled.get_dynamics_capabilities = lambda: {
+        "schema_version": 1,
+        "provider_id": "astrbot_plugin_dynamics_memory",
+        "enabled": True,
+        "ready": True,
+        "capabilities": {"memory": 1},
+    }
+    with pytest.raises(RuntimeError, match="冲突"):
+        lm_bridge.detect_lm(ctx)
+
+
+def test_facade_cache_refreshes_on_module_reload(monkeypatch):
+    """Facade cache hits per module identity and refreshes when sys.modules changes."""
+    lm_bridge._clear_facade_cache()
+    calls = []
+    mod1 = types.ModuleType("astrbot_plugin_dynamics_memory.api.public")
+    mod1.ping = lambda: calls.append("m1") or "v1"
+    monkeypatch.setitem(sys.modules, "astrbot_plugin_dynamics_memory.api.public", mod1)
+    monkeypatch.delitem(
+        sys.modules, "astrbot_plugin_livingmemory.api.public", raising=False
+    )
+    monkeypatch.setattr(
+        lm_bridge, "_LM_FACADE_MODULES", ("astrbot_plugin_dynamics_memory.api.public",)
+    )
+
+    fn1 = lm_bridge._facade_fn("ping")
+    assert fn1() == "v1"
+    # Second resolution hits cache (same function object returned).
+    assert lm_bridge._facade_fn("ping") is fn1
+
+    # Replacing module in sys.modules invalidates cached entry automatically.
+    mod2 = types.ModuleType("astrbot_plugin_dynamics_memory.api.public")
+    mod2.ping = lambda: calls.append("m2") or "v2"
+    monkeypatch.setitem(sys.modules, "astrbot_plugin_dynamics_memory.api.public", mod2)
+    fn2 = lm_bridge._facade_fn("ping")
+    assert fn2 is not fn1
+    assert fn2() == "v2"
+    assert calls == ["m1", "m2"]
+
+
+def test_is_dm_capturing_group_respects_whitelist_and_readiness(monkeypatch):
+    monkeypatch.setattr(lm_bridge, "_lm_get_active", None)
+    cfg = {
+        "session_manager.enable_full_group_capture": True,
+        "access_control.whitelist_enabled": True,
+        "access_control.allowed_ids": "1001, other:GroupMessage:999",
+    }
+    dm = FakePlugin(FakeInitializer())
+    dm.get_dynamics_capabilities = lambda: {
+        "schema_version": 1,
+        "provider_id": "astrbot_plugin_dynamics_memory",
+        "enabled": True,
+        "ready": True,
+        "capabilities": {"memory": 1},
+    }
+    dm.config_manager = types.SimpleNamespace(get=lambda k, d=None: cfg.get(k, d))
+    dm_star = FakeStar(star_cls=dm, activated=True)
+    dm_star.name = "astrbot_plugin_dynamics_memory"
+    ctx = DummyContext(
+        star_by_alias={"astrbot_plugin_dynamics_memory": dm_star}, stars=[dm_star]
+    )
+
+    allowed_ev = types.SimpleNamespace(
+        unified_msg_origin="qq:GroupMessage:1001",
+        get_group_id=lambda: "1001",
+        get_sender_id=lambda: "42",
+    )
+    blocked_ev = types.SimpleNamespace(
+        unified_msg_origin="qq:GroupMessage:2002",
+        get_group_id=lambda: "2002",
+        get_sender_id=lambda: "42",
+    )
+    assert lm_bridge.is_dm_capturing_group(ctx, allowed_ev) is True
+    assert lm_bridge.is_dm_capturing_group(ctx, blocked_ev) is False
+
+    cfg["session_manager.enable_full_group_capture"] = False
+    assert lm_bridge.is_dm_capturing_group(ctx, allowed_ev) is False

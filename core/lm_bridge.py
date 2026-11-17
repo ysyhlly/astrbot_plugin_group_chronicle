@@ -28,6 +28,7 @@ fingerprint changes. The ``messages`` SQL now lives in the facade
 from __future__ import annotations
 
 import importlib
+import sys
 from typing import Any
 
 #: 门面模块列表（优先群间记忆 Dynamics Memory，兼容旧版 LivingMemory）。
@@ -64,7 +65,11 @@ except Exception:
 
 
 def _combined_get_active():
-    for getter in (_dm_public_get_active_plugin, _lm_public_get_active_plugin, _lm_legacy_get_active):
+    for getter in (
+        _dm_public_get_active_plugin,
+        _lm_public_get_active_plugin,
+        _lm_legacy_get_active,
+    ):
         if getter is not None:
             try:
                 inst = getter()
@@ -78,13 +83,20 @@ def _combined_get_active():
 #: 保留 _lm_get_active is None == "记忆包均不可导入" 的既有测试语义，且支持 monkeypatch。
 _lm_get_active = (
     _combined_get_active
-    if any((_dm_public_get_active_plugin, _lm_public_get_active_plugin, _lm_legacy_get_active))
+    if any(
+        (
+            _dm_public_get_active_plugin,
+            _lm_public_get_active_plugin,
+            _lm_legacy_get_active,
+        )
+    )
     else None
 )
 
 _merged_aliases: list[str] = []
 for _src in (
-    _DM_PUBLIC_ALIASES or ("astrbot_plugin_dynamics_memory", "DynamicsMemory", "群间记忆"),
+    _DM_PUBLIC_ALIASES
+    or ("astrbot_plugin_dynamics_memory", "DynamicsMemory", "群间记忆"),
     _LM_PUBLIC_ALIASES or ("LivingMemory", "astrbot_plugin_livingmemory"),
 ):
     for _a in _src:
@@ -93,17 +105,51 @@ for _src in (
 _LM_ALIASES: tuple[str, ...] = tuple(_merged_aliases)
 
 
+_FACADE_CACHE: dict[tuple[str, str], tuple[Any, Any]] = {}
+_FACADE_MISSING: set[str] = set()
+_REQUIRED_HISTORY_COLUMNS = frozenset(
+    {"id", "role", "content", "sender_id", "sender_name", "timestamp", "metadata"}
+)
+
+
+def _clear_facade_cache() -> None:
+    """Clear cached facade module/function references."""
+    _FACADE_CACHE.clear()
+    _FACADE_MISSING.clear()
+
+
+def _import_facade_module(mod_name: str) -> Any | None:
+    current = sys.modules.get(mod_name)
+    if current is not None:
+        _FACADE_MISSING.discard(mod_name)
+        return current
+    if mod_name in _FACADE_MISSING:
+        return None
+    try:
+        module = importlib.import_module(mod_name)
+    except Exception:
+        _FACADE_MISSING.add(mod_name)
+        return None
+    return module
+
+
 def _facade_fn(name: str):
-    """按优先级惰性解析 Dynamics Memory / LivingMemory 门面函数。"""
+    """按优先级惰性解析 Dynamics Memory / LivingMemory 门面函数并按模块对象版本缓存。"""
     fns = []
     for mod_name in _LM_FACADE_MODULES:
-        try:
-            module = importlib.import_module(mod_name)
-            fn = getattr(module, name, None)
-            if callable(fn):
-                fns.append(fn)
-        except Exception:
+        module = _import_facade_module(mod_name)
+        if module is None:
             continue
+        key = (mod_name, name)
+        cached = _FACADE_CACHE.get(key)
+        if cached is not None and cached[0] is module:
+            fn = cached[1]
+        else:
+            raw_fn = getattr(module, name, None)
+            fn = raw_fn if callable(raw_fn) else None
+            _FACADE_CACHE[key] = (module, fn)
+        if fn is not None:
+            fns.append(fn)
     if not fns:
         return None
     if len(fns) == 1:
@@ -145,6 +191,39 @@ def _is_active_star(star: Any) -> bool:
     return getattr(star, "star_cls", None) is not None
 
 
+def _is_enabled_owner(owner: Any, *, strict_caps: bool = False) -> bool:
+    """Skip terminating, series-disabled, or capability-disabled memory instances."""
+    if owner is None:
+        return False
+    if (
+        getattr(owner, "_terminating", False) is True
+        or getattr(owner, "closed", False) is True
+    ):
+        return False
+    if getattr(owner, "series_runtime_enabled", None) is False:
+        return False
+    if getattr(owner, "_series_enabled", None) is False:
+        return False
+    cfg = getattr(owner, "config", None)
+    if isinstance(cfg, dict) and cfg.get("series_runtime_enabled") is False:
+        return False
+    caps = getattr(owner, "get_dynamics_capabilities", None)
+    if callable(caps):
+        try:
+            result = caps()
+        except Exception:
+            if strict_caps:
+                raise
+            return False
+        if isinstance(result, dict):
+            if result.get("enabled") is False:
+                return False
+            inner = result.get("capabilities")
+            if isinstance(inner, dict) and inner.get("enabled") is False:
+                return False
+    return True
+
+
 def _detect_legacy_lm(context: Any) -> Any | None:
     """Return the LivingMemory plugin instance (``star.star_cls``), or None.
 
@@ -170,11 +249,11 @@ def _detect_legacy_lm(context: Any) -> Any | None:
             plugin = _lm_get_active()
         except Exception:
             plugin = None
-        if plugin is not None:
+        if plugin is not None and _is_enabled_owner(plugin):
             return plugin
 
     plugin = _facade_find_plugin(context)
-    if plugin is not None:
+    if plugin is not None and _is_enabled_owner(plugin):
         return plugin
 
     getter = getattr(context, "get_registered_star", None)
@@ -185,7 +264,9 @@ def _detect_legacy_lm(context: Any) -> Any | None:
             except Exception:
                 star = None
             if _is_active_star(star):
-                return getattr(star, "star_cls", None)
+                owner = getattr(star, "star_cls", None)
+                if _is_enabled_owner(owner):
+                    return owner
 
     all_stars_getter = getattr(context, "get_all_stars", None)
     if not callable(all_stars_getter):
@@ -211,23 +292,29 @@ def _detect_legacy_lm(context: Any) -> Any | None:
             if str(candidate or "").strip()
         }
         if normalized & wanted:
-            return getattr(star, "star_cls", None)
+            owner = getattr(star, "star_cls", None)
+            if _is_enabled_owner(owner):
+                return owner
     return None
 
 
 def detect_lm(context: Any) -> Any | None:
-    """Resolve one active memory owner; never silently combine two stores."""
+    """Resolve one active, enabled memory owner; never silently combine two stores."""
     owners = []
     getter = getattr(context, "get_registered_star", None)
     if callable(getter):
-        for alias in ("astrbot_plugin_dynamics_memory", "astrbot_plugin_livingmemory", "LivingMemory"):
+        for alias in (
+            "astrbot_plugin_dynamics_memory",
+            "astrbot_plugin_livingmemory",
+            "LivingMemory",
+        ):
             try:
                 star = getter(alias)
             except Exception:
                 continue
             if _is_active_star(star):
                 owner = star.star_cls
-                if all(owner is not p for p in owners):
+                if _is_enabled_owner(owner) and all(owner is not p for p in owners):
                     owners.append(owner)
     scanner = getattr(context, "get_all_stars", None)
     if callable(scanner):
@@ -241,15 +328,26 @@ def detect_lm(context: Any) -> Any | None:
                 caps = getattr(owner, "get_dynamics_capabilities", None)
                 if callable(caps):
                     result = caps()
-                    capabilities = result.get("capabilities") if isinstance(result, dict) else None
-                    if isinstance(capabilities, dict) and capabilities.get("memory") == 1:
-                        if all(owner is not p for p in owners):
+                    capabilities = (
+                        result.get("capabilities") if isinstance(result, dict) else None
+                    )
+                    if (
+                        isinstance(capabilities, dict)
+                        and capabilities.get("memory") == 1
+                    ):
+                        if _is_enabled_owner(owner, strict_caps=True) and all(
+                            owner is not p for p in owners
+                        ):
                             owners.append(owner)
         except Exception:
             # A broken registry cannot safely establish unique ownership.
             raise RuntimeError("记忆能力发现失败，已暂停读取") from None
     legacy = _detect_legacy_lm(context)
-    if legacy is not None and all(legacy is not p for p in owners):
+    if (
+        legacy is not None
+        and _is_enabled_owner(legacy)
+        and all(legacy is not p for p in owners)
+    ):
         owners.append(legacy)
     if len(owners) > 1:
         raise RuntimeError("新旧记忆来源冲突，请仅启用一个记忆提供者")
@@ -259,13 +357,37 @@ def detect_lm(context: Any) -> Any | None:
 def source_identity(context):
     """Stable provider/store identity; a provider change must not reuse cursors."""
     import hashlib
+
     plugin = detect_lm(context)
     if plugin is None:
         raise RuntimeError("记忆来源不可用")
+    public_id = getattr(plugin, "get_history_source_identity", None)
+    if callable(public_id):
+        try:
+            ident = public_id()
+            if isinstance(ident, str) and ident:
+                return ident
+        except Exception:
+            pass
     manager = get_conversation_manager(plugin)
     store = getattr(manager, "store", None)
     path = str(getattr(store, "db_path", "") or getattr(store, "path", ""))
-    return hashlib.sha256((type(plugin).__module__ + ":" + type(plugin).__qualname__ + ":" + path).encode()).hexdigest()
+    return hashlib.sha256(
+        (
+            type(plugin).__module__ + ":" + type(plugin).__qualname__ + ":" + path
+        ).encode()
+    ).hexdigest()
+
+
+def _check_history_schema() -> None:
+    """Verify facade-advertised history schema/columns when a facade module is loaded."""
+    for mod_name in _LM_FACADE_MODULES:
+        module = sys.modules.get(mod_name)
+        if module is None:
+            continue
+        cols = getattr(module, "HISTORY_COLUMNS", None)
+        if cols is not None and not _REQUIRED_HISTORY_COLUMNS.issubset(set(cols)):
+            raise RuntimeError("记忆来源表结构不兼容，已暂停读取")
 
 
 async def history_sources(context, umo, ids):
@@ -278,8 +400,18 @@ async def history_sources(context, umo, ids):
     connection = history_connection(context)
     if connection is None:
         raise RuntimeError("记忆来源不可用")
+    facade_sources = _facade_fn("query_history_sources")
+    if callable(facade_sources):
+        try:
+            data = await facade_sources(connection, umo, ids)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    _check_history_schema()
     placeholders = ",".join("?" for _ in ids)
     import json
+
     async with connection.execute(
         f"SELECT id,role,content,sender_id,sender_name,timestamp,metadata FROM messages WHERE session_id=? AND id IN ({placeholders})",
         (umo, *ids),
@@ -291,8 +423,15 @@ async def history_sources(context, umo, ids):
             meta = json.loads(r[6]) if isinstance(r[6], str) else r[6]
         except (ValueError, TypeError):
             meta = {}
-        result[str(r[0])] = dict(id=r[0], role=r[1], content=r[2] or "", uid=str(r[3] or ""),
-                                  name=r[4] or "", ts=r[5], metadata=meta if isinstance(meta, dict) else {})
+        result[str(r[0])] = dict(
+            id=r[0],
+            role=r[1],
+            content=r[2] or "",
+            uid=str(r[3] or ""),
+            name=r[4] or "",
+            ts=r[5],
+            metadata=meta if isinstance(meta, dict) else {},
+        )
     return result
 
 
@@ -413,17 +552,9 @@ def lm_unavailable_reason(context: Any = None, stage: str | None = None) -> str:
 def history_connection(context):
     """Resolve the active read-only history query surface.
 
-    Prefers the facade ``api.public.get_history_reader(context)`` so the private
-    attribute chain (``initializer.conversation_manager.store.connection``) is
-    owned by LivingMemory instead of being duplicated here. The local chain
-    below is kept verbatim as a fallback for LivingMemory versions without the
-    facade.
-
-    Note (B6):
-        这是本模块唯一的读取器"接缝"：``history_sessions`` / ``history_bounds`` /
-        ``history_page`` 都经由它取连接（测试也在此处注入）。SQL 与表/列名已交给
-        门面的 ``query_history_*``；本模块只保留一份冻结的 legacy 副本，供没有
-        ``api`` 包的旧版本 LivingMemory 使用。
+    Prefers the facade ``api.public.get_history_reader(context)`` when the facade
+    resolves the same owner as :func:`detect_lm`. Falls back to the legacy store
+    chain only when no public reader matches (older LivingMemory / minimal fakes).
 
     Args:
         context: AstrBot context.
@@ -432,25 +563,109 @@ def history_connection(context):
         The active SQLite connection, or None when unavailable.
     """
     plugin = detect_lm(context)
+    if plugin is None:
+        return None
     capability = getattr(plugin, "get_dynamics_capabilities", None)
     if callable(capability):
         manifest = capability()
-        if not isinstance(manifest, dict) or manifest.get("ready") is not True or manifest.get("enabled") is False:
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("ready") is not True
+            or manifest.get("enabled") is False
+        ):
             return None
-    manager = get_conversation_manager(plugin) if plugin else None
-    store = getattr(manager, "store", None)
-    connection = getattr(store, "connection", None)
-    # Resolve ownership before invoking a facade; never let a stale facade select
-    # another active provider's store and bypass the conflict check above.
-    facade_get_history_reader = _facade_fn("get_history_reader")
-    if callable(facade_get_history_reader):
+
+    direct_reader = getattr(plugin, "get_history_reader", None)
+    if callable(direct_reader):
         try:
-            reader = facade_get_history_reader(context)
-            if reader is connection and callable(getattr(reader, "execute", None)):
+            reader = direct_reader()
+            if callable(getattr(reader, "execute", None)):
                 return reader
         except Exception:
             pass
+
+    facade_get_history_reader = _facade_fn("get_history_reader")
+    if callable(facade_get_history_reader) and _facade_find_plugin(context) is plugin:
+        try:
+            reader = facade_get_history_reader(context)
+            if callable(getattr(reader, "execute", None)):
+                return reader
+        except Exception:
+            pass
+
+    manager = get_conversation_manager(plugin)
+    store = getattr(manager, "store", None)
+    connection = getattr(store, "connection", None)
     return connection if callable(getattr(connection, "execute", None)) else None
+
+
+def is_dm_capturing_group(context: Any, event: Any) -> bool:
+    """Return True when active, ready Dynamics Memory already captures this group message."""
+    try:
+        plugin = detect_lm(context)
+    except Exception:
+        return False
+    if plugin is None:
+        return False
+    capability = getattr(plugin, "get_dynamics_capabilities", None)
+    if not callable(capability):
+        return False
+    try:
+        manifest = capability()
+    except Exception:
+        return False
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("provider_id") != "astrbot_plugin_dynamics_memory"
+        or manifest.get("enabled") is not True
+        or manifest.get("ready") is not True
+    ):
+        return False
+
+    cfg = getattr(plugin, "config_manager", None)
+    getter = getattr(cfg, "get", None)
+    if not callable(getter):
+        return True
+    try:
+        if getter("session_manager.enable_full_group_capture", True) is False:
+            return False
+        if getter("access_control.whitelist_enabled", False):
+            raw_allowed = getter("access_control.allowed_ids", "")
+            if isinstance(raw_allowed, str):
+                items = [
+                    p.strip().casefold()
+                    for part in raw_allowed.replace("\n", ",").split(",")
+                    if (p := part.strip())
+                ]
+            elif isinstance(raw_allowed, (list, tuple, set)):
+                items = [
+                    str(v).strip().casefold() for v in raw_allowed if str(v).strip()
+                ]
+            else:
+                items = []
+            allowed = set(items)
+            if not allowed:
+                return False
+            umo = str(getattr(event, "unified_msg_origin", "") or "").casefold()
+            gid = ""
+            group_getter = getattr(event, "get_group_id", None)
+            if callable(group_getter):
+                try:
+                    gid = str(group_getter() or "").casefold()
+                except Exception:
+                    gid = ""
+            sid = ""
+            sender_getter = getattr(event, "get_sender_id", None)
+            if callable(sender_getter):
+                try:
+                    sid = str(sender_getter() or "").casefold()
+                except Exception:
+                    sid = ""
+            if not ({umo, gid, sid} & allowed):
+                return False
+    except Exception:
+        return False
+    return True
 
 
 async def history_sessions(context):
@@ -474,6 +689,7 @@ async def history_sessions(context):
             return await facade_query(connection)
         except Exception:
             pass  # 退回 legacy 副本；若 schema 真的坏了，下面会原样抛错
+    _check_history_schema()
     async with connection.execute(
         "SELECT DISTINCT session_id FROM messages WHERE session_id LIKE ?",
         ("%:GroupMessage:%",),
@@ -505,6 +721,7 @@ async def history_bounds(context, umo):
             return await facade_query(connection, umo)
         except Exception:
             pass  # 退回 legacy 副本
+    _check_history_schema()
     async with connection.execute(
         "SELECT COUNT(*),COALESCE(MAX(id),0),MIN(timestamp),MAX(timestamp) FROM messages WHERE session_id=?",
         (umo,),
@@ -544,6 +761,7 @@ async def history_page(context, umo, after, high, limit):
             return await facade_query(connection, umo, after, high, limit)
         except Exception:
             pass  # 退回 legacy 副本
+    _check_history_schema()
     async with connection.execute(
         "SELECT id,role,content,sender_id,sender_name,timestamp,metadata FROM messages "
         "WHERE session_id=? AND id>? AND id<=? ORDER BY id ASC LIMIT ?",

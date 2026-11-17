@@ -1,4 +1,5 @@
 """Evidence-bound culture proposals. Model assertions never supply source text."""
+
 from __future__ import annotations
 
 import hashlib
@@ -31,7 +32,11 @@ def digest(text):
 
 
 def bounded_text(value, limit, required=False):
-    if not isinstance(value, str) or len(value) > limit or (required and not value.strip()):
+    if (
+        not isinstance(value, str)
+        or len(value) > limit
+        or (required and not value.strip())
+    ):
         raise ValueError("文化文本字段无效或过长")
     return value.strip()
 
@@ -61,7 +66,11 @@ def validate(raw, material, existing=()):
         if raw.startswith("```"):
             raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
         raw = json.loads(raw)
-    if not isinstance(raw, dict) or not isinstance(raw.get("entries"), list) or len(raw["entries"]) > 20:
+    if (
+        not isinstance(raw, dict)
+        or not isinstance(raw.get("entries"), list)
+        or len(raw["entries"]) > 20
+    ):
         raise ValueError("文化抽取结果不是有效词条列表")
     rows = {str(m["id"]): m for m in material}
     known = {e["id"]: e for e in existing}
@@ -90,12 +99,23 @@ def validate(raw, material, existing=()):
             support = ref.get("support")
             if support not in {"independent", "repeat", "reported", "context"}:
                 raise ValueError("来源支持类型无效")
-            sources.append(dict(id=str(row["id"]), uid=row["uid"], name=row["name"], ts=row["ts"],
-                                hash=row.get("_source_hash", digest(row["content"])), quote=quote,
-                                support=support, quoted=bool(row.get("_quoted"))))
+            sources.append(
+                dict(
+                    id=str(row["id"]),
+                    uid=row["uid"],
+                    name=row["name"],
+                    ts=row["ts"],
+                    hash=row.get("_source_hash", digest(row["content"])),
+                    quote=quote,
+                    support=support,
+                    quoted=bool(row.get("_quoted")),
+                )
+            )
         sources = list({(s["id"], s["quote"]): s for s in sources}.values())
         source_ids = {s["id"] for s in sources}
-        if not any(name in r["content"] for r in rows.values() if str(r["id"]) in source_ids):
+        if not any(
+            name in r["content"] for r in rows.values() if str(r["id"]) in source_ids
+        ):
             raise ValueError("词语不在引用材料中")
 
         def node(value):
@@ -103,19 +123,41 @@ def validate(raw, material, existing=()):
                 raise ValueError("沿革节点无效")
             text = bounded_text(value.get("text"), 800, True)
             ids = value.get("source_ids")
-            if not isinstance(ids, list) or not ids or not {str(i) for i in ids} <= source_ids:
+            if (
+                not isinstance(ids, list)
+                or not ids
+                or not {str(i) for i in ids} <= source_ids
+            ):
                 raise ValueError("沿革节点缺少本批原文依据")
             event_at = value.get("event_at")
             if event_at is not None:
-                if isinstance(event_at, bool) or not isinstance(event_at, (float, int)) or not math.isfinite(event_at) or not 0 < event_at <= time.time() + 30:
+                if (
+                    isinstance(event_at, bool)
+                    or not isinstance(event_at, (float, int))
+                    or not math.isfinite(event_at)
+                    or not 0 < event_at <= time.time() + 30
+                ):
                     raise ValueError("事件发生时间无效")
-            return dict(text=text, source_ids=sorted({str(i) for i in ids}), event_at=event_at,
-                        recorded_at=min(s["ts"] for s in sources if s["id"] in {str(i) for i in ids}))
+            return dict(
+                text=text,
+                source_ids=sorted({str(i) for i in ids}),
+                event_at=event_at,
+                recorded_at=min(
+                    s["ts"] for s in sources if s["id"] in {str(i) for i in ids}
+                ),
+            )
 
         timeline = item.get("timeline", [])
         aliases = item.get("aliases", [])
         subjects = item.get("subjects", [])
-        if not isinstance(timeline, list) or len(timeline) > 10 or not isinstance(aliases, list) or len(aliases) > 10 or not isinstance(subjects, list) or len(subjects) > 20:
+        if (
+            not isinstance(timeline, list)
+            or len(timeline) > 10
+            or not isinstance(aliases, list)
+            or len(aliases) > 10
+            or not isinstance(subjects, list)
+            or len(subjects) > 20
+        ):
             raise ValueError("文化字段数量无效")
         subjects = list(dict.fromkeys(str(v) for v in subjects))
         unknown_subject = not set(subjects) <= members
@@ -132,18 +174,49 @@ def validate(raw, material, existing=()):
         if target is not None and (type(target) is not int or target not in known):
             raise ValueError("沿革目标不属于本次本群候选")
         conflict = item.get("conflict") is not False
-        risk = item.get("risk") is not False or unknown_subject or kind == "nickname" or any(w in encode(item) for w in RISK_WORDS)
+        risk = (
+            item.get("risk") is not False
+            or unknown_subject
+            or kind == "nickname"
+            or any(w in encode(item) for w in RISK_WORDS)
+        )
         independent = independent_sources(sources)
         if origin:
             # Independent support for a meaning does not independently prove its origin.
             # Origin claims receive a separate human review in v1.
             origin["confirmed"] = False
-        status = "approved" if len(independent) >= 2 and not risk and not conflict else "pending"
+        status = (
+            "approved"
+            if len(independent) >= 2 and not risk and not conflict
+            else "pending"
+        )
         if origin and not origin["confirmed"]:
             status = "pending"
-        entries.append(dict(name=name, meaning=meaning, usage=usage, kind=kind, subjects=subjects,
-                            aliases=alias_results, origin=origin, timeline=[node(n) for n in timeline],
-                            sources=sources, risk=risk, conflict=conflict, target_id=target, admission=status,
-                            first_seen=min(s["ts"] for s in sources),
-                            fingerprint=digest(encode([name, meaning, [(s["id"], s["hash"], s["quote"]) for s in sources]]))))
+        entries.append(
+            dict(
+                name=name,
+                meaning=meaning,
+                usage=usage,
+                kind=kind,
+                subjects=subjects,
+                aliases=alias_results,
+                origin=origin,
+                timeline=[node(n) for n in timeline],
+                sources=sources,
+                risk=risk,
+                conflict=conflict,
+                target_id=target,
+                admission=status,
+                first_seen=min(s["ts"] for s in sources),
+                fingerprint=digest(
+                    encode(
+                        [
+                            name,
+                            meaning,
+                            [(s["id"], s["hash"], s["quote"]) for s in sources],
+                        ]
+                    )
+                ),
+            )
+        )
     return entries

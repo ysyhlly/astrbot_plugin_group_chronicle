@@ -365,11 +365,12 @@ class GroupChroniclePlugin(Star):
     ):
         """Read-only v1 public interface. Consumers must revalidate before sending."""
         result = await self.culture.query(scope, member, query, kind, limit)
+        privacy = await asyncio.to_thread(self.history.privacy_key, scope)
         result["receipt"] = {
             "schema_version": 1,
             "scope": scope,
             "member": member,
-            "privacy": self.history.privacy_key(scope),
+            "privacy": privacy,
             "entries": [(e["id"], e["revision"]) for e in result["entries"]],
         }
         return result
@@ -833,7 +834,7 @@ class GroupChroniclePlugin(Star):
                     and self._cfg("history_enabled", True)
                 ):
                     try:
-                        self.store.mark_delivered(umo, text)
+                        await asyncio.to_thread(self.store.mark_delivered, umo, text)
                     except Exception:
                         logger.error(
                             "Result delivered but delivery state could not be saved",
@@ -907,7 +908,7 @@ class GroupChroniclePlugin(Star):
                 raise NoActivityError(text)
             return text, image_path
         iso_year, iso_week = datetime.now().isocalendar()[:2]
-        existing = self.store.get(umo, iso_year, iso_week)
+        existing = await asyncio.to_thread(self.store.get, umo, iso_year, iso_week)
         if (
             save
             and skip_check
@@ -927,7 +928,9 @@ class GroupChroniclePlugin(Star):
         if (
             skip_check
             and not force
-            and self.store.should_skip(umo, iso_year, iso_week, evidence.newest_ts)
+            and await asyncio.to_thread(
+                self.store.should_skip, umo, iso_year, iso_week, evidence.newest_ts
+            )
         ):
             raise _SkipWeek()
 
@@ -1070,7 +1073,8 @@ class GroupChroniclePlugin(Star):
         # 保存 (保存失败只记录, 不影响发送; 月/年视图不落盘)
         if save:
             try:
-                self.store.save(
+                await asyncio.to_thread(
+                    self.store.save,
                     {
                         "umo": umo,
                         "group_name": group_name,
@@ -1094,7 +1098,7 @@ class GroupChroniclePlugin(Star):
                         "version": 1,
                         "delivery_complete": False,
                         "biographies_embedded": True,
-                    }
+                    },
                 )
             except Exception as e:  # noqa: BLE001 - 持久化失败不阻断本次发送
                 logger.error(f"保存史记失败 (umo={umo}): {e}", exc_info=True)
@@ -1166,7 +1170,9 @@ class GroupChroniclePlugin(Star):
             NoActivityError: 时间窗内无足够活动或数据异常。
         """
         history = getattr(self, "history", None)
-        if history is not None and history.store.privacy_active(umo):
+        if history is not None and await asyncio.to_thread(
+            history.store.privacy_active, umo
+        ):
             raise LLMUnavailableError(
                 "本群已有史记隐私保护；原始聊天生成路径已暂停，请使用长期档案命令"
             )
@@ -1310,7 +1316,7 @@ class GroupChroniclePlugin(Star):
         if not umo:
             yield event.plain_result("无法获取会话标识")
             return
-        entry = self.store.get_by_id(umo, self._parse_idx(idx))
+        entry = await asyncio.to_thread(self.store.get_by_id, umo, self._parse_idx(idx))
         if entry is None:
             yield event.plain_result("未找到该条史记")
             return
@@ -1327,7 +1333,7 @@ class GroupChroniclePlugin(Star):
             return
         # 优先发送文件; 平台/API 不支持时回退分段文本 (含导出头)
         try:
-            if not self._entry_public(umo, entry):
+            if not await asyncio.to_thread(self._entry_public, umo, entry):
                 yield event.plain_result("该卷内容已隐藏或修订，请重新查看。")
                 return
             await self._send(
@@ -1342,7 +1348,7 @@ class GroupChroniclePlugin(Star):
         for segment in split_text(
             f"📄 导出内容：\n\n{md}", int(self._cfg("max_reply_chars", 1500))
         ):
-            if not self._entry_public(umo, entry):
+            if not await asyncio.to_thread(self._entry_public, umo, entry):
                 yield event.plain_result("该卷内容已隐藏或修订，请重新查看。")
                 return
             yield event.plain_result(segment)
@@ -1354,7 +1360,7 @@ class GroupChroniclePlugin(Star):
         if not umo:
             yield event.plain_result("无法获取会话标识")
             return
-        entries = self.store.list(umo)
+        entries = await asyncio.to_thread(self.store.list, umo)
         if len(entries) < 2:
             yield event.plain_result("至少需要两条史记才能对比")
             return
@@ -1618,7 +1624,7 @@ class GroupChroniclePlugin(Star):
         if not umo:
             yield event.plain_result("无法获取会话标识")
             return
-        entry = self.store.get_by_id(umo, self._parse_idx(idx))
+        entry = await asyncio.to_thread(self.store.get_by_id, umo, self._parse_idx(idx))
         if entry is None:
             yield event.plain_result("未找到该条史记")
             return
@@ -1649,7 +1655,7 @@ class GroupChroniclePlugin(Star):
             return
         # 优先发送文件; 平台/API 不支持时回退路径文本
         try:
-            if not self._entry_public(umo, entry):
+            if not await asyncio.to_thread(self._entry_public, umo, entry):
                 yield event.plain_result("该卷内容已隐藏或修订，请重新查看。")
                 return
             await self._send(
@@ -1668,7 +1674,7 @@ class GroupChroniclePlugin(Star):
             "网页文件发送失败，以下为史记内容：\n\n" + entry_text,
             int(self._cfg("max_reply_chars", 1500)),
         ):
-            if not self._entry_public(umo, entry):
+            if not await asyncio.to_thread(self._entry_public, umo, entry):
                 yield event.plain_result("该卷内容已隐藏或修订，请重新查看。")
                 return
             yield event.plain_result(segment)
@@ -1823,7 +1829,7 @@ class GroupChroniclePlugin(Star):
         if not umo:
             yield event.plain_result("无法获取会话标识")
             return
-        entries = self.store.list(umo)
+        entries = await asyncio.to_thread(self.store.list, umo)
         if not entries:
             yield event.plain_result("暂无史记")
             return
@@ -1843,7 +1849,7 @@ class GroupChroniclePlugin(Star):
         if not umo:
             yield event.plain_result("无法获取会话标识")
             return
-        entry = self.store.get_by_id(umo, self._parse_idx(idx))
+        entry = await asyncio.to_thread(self.store.get_by_id, umo, self._parse_idx(idx))
         if entry is None:
             yield event.plain_result("未找到该条史记")
             return
@@ -1851,7 +1857,7 @@ class GroupChroniclePlugin(Star):
         image_path = entry.get("image_path")
         if image_path and os.path.isfile(image_path):
             try:
-                if not self._entry_public(umo, entry):
+                if not await asyncio.to_thread(self._entry_public, umo, entry):
                     yield event.plain_result("该卷内容已隐藏或修订，请重新查看。")
                     return
                 await self._send(event, umo, MessageChain().file_image(image_path))
@@ -1859,7 +1865,7 @@ class GroupChroniclePlugin(Star):
             except Exception:
                 logger.warning("Stored image delivery failed; falling back to text")
         for segment in split_text(text, int(self._cfg("max_reply_chars", 1500))):
-            if not self._entry_public(umo, entry):
+            if not await asyncio.to_thread(self._entry_public, umo, entry):
                 yield event.plain_result("该卷内容已隐藏或修订，请重新查看。")
                 return
             yield event.plain_result(segment)
@@ -1921,17 +1927,20 @@ class GroupChroniclePlugin(Star):
                     prefer_context=prefer_context,
                 )
                 return
-            targets = (
-                [target_sender_id]
-                if target_sender_id
-                else history.store.top(
-                    umo,
-                    time.time() - self._cfg("chronicle_days", 7) * 86400,
-                    self._cfg("top_n_bios", 3),
+
+            def _load_bio_inputs():
+                tgts = (
+                    [target_sender_id]
+                    if target_sender_id
+                    else history.store.top(
+                        umo,
+                        time.time() - self._cfg("chronicle_days", 7) * 86400,
+                        self._cfg("top_n_bios", 3),
+                    )
                 )
-            )
-            privacy = history.privacy_key(umo)
-            revision = history.store.revision(umo)
+                return tgts, history.privacy_key(umo), history.store.revision(umo)
+
+            targets, privacy, revision = await asyncio.to_thread(_load_bio_inputs)
             text = (
                 "\n\n".join([await history.biography(umo, uid) for uid in targets])
                 if targets
@@ -1939,11 +1948,16 @@ class GroupChroniclePlugin(Star):
             )
 
             async def still_public():
-                return (
-                    await history.allowed(umo)
-                    and history.privacy_key(umo) == privacy
-                    and history.store.revision(umo) == revision
-                )
+                if not await history.allowed(umo):
+                    return False
+
+                def _check_bio_state():
+                    return (
+                        history.privacy_key(umo) == privacy
+                        and history.store.revision(umo) == revision
+                    )
+
+                return await asyncio.to_thread(_check_bio_state)
 
             await deliver_text(
                 self.context,
@@ -2081,7 +2095,7 @@ class GroupChroniclePlugin(Star):
         self, event, umo: str, *, prefer_context: bool = True
     ) -> None:
         """续写主体: 取最新一条史记 → 采集新证据 → 生成续篇 → 发送。"""
-        prev = self.store.get_by_id(umo, 1)
+        prev = await asyncio.to_thread(self.store.get_by_id, umo, 1)
         if prev is None:
             await self._reply(
                 event,
@@ -2093,7 +2107,9 @@ class GroupChroniclePlugin(Star):
         history = getattr(self, "history", None)
         if history is not None and self._cfg("history_enabled", True):
             days = int(prev.get("period_days") or self._cfg("chronicle_days", 7))
-            current = history.store.events(umo, since=time.time() - days * 86400)
+            current = await asyncio.to_thread(
+                history.store.events, umo, since=time.time() - days * 86400
+            )
             old_versions = dict(prev.get("event_versions", []))
             if not current or not any(
                 old_versions.get(e["id"]) != e["revision"] for e in current
@@ -2126,7 +2142,7 @@ class GroupChroniclePlugin(Star):
                 guard=lambda: history.publishable(umo, text),
             )
             if ok:
-                self.store.mark_delivered(umo, text)
+                await asyncio.to_thread(self.store.mark_delivered, umo, text)
             return
         timeout = float(self._cfg("generation_timeout_sec", 180))
         try:
@@ -2242,7 +2258,7 @@ class GroupChroniclePlugin(Star):
                     "delivery_complete": True,
                 }
             )
-            self.store.save(entry)
+            await asyncio.to_thread(self.store.save, entry)
             logger.info("Continuation delivered and watermark advanced")
         else:
             logger.warning("Continuation delivery failed; watermark was not advanced")
@@ -2328,7 +2344,7 @@ class GroupChroniclePlugin(Star):
             )
             if ok:
                 try:
-                    self.store.mark_delivered(umo, text)
+                    await asyncio.to_thread(self.store.mark_delivered, umo, text)
                 except Exception:
                     logger.error(
                         "Weekly result delivered but delivery state could not be saved",

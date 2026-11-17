@@ -164,7 +164,7 @@ def _install_astrbot_stubs() -> None:
     event_filter.CustomFilter = CustomFilter
     event_filter.custom_filter = _custom_filter
     event_filter.llm_tool = lambda name=None, **kw: _command(name)
-    event_filter.on_decorating_result = lambda **kw: (lambda func: func)
+    event_filter.on_decorating_result = lambda **kw: lambda func: func
 
     # --- astrbot.api.event ---
     api_event = types.ModuleType("astrbot.api.event")

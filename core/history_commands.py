@@ -218,7 +218,9 @@ async def handle_command(service, event, supplied=None):
                 store.events, umo, since=time.time() - days * 86400 if days else 0
             )
             if not facts:
-                return "暂无已入史的大事。" + service.coverage(umo)
+                return "暂无已入史的大事。" + await asyncio.to_thread(
+                    service.coverage, umo
+                )
             lines = ["本群大事记："]
             for fact in facts:
                 names = "、".join(p["name"] for p in fact["participants"])
@@ -234,7 +236,7 @@ async def handle_command(service, event, supplied=None):
                     lines.append(
                         f"  续记 {datetime.fromtimestamp(update['event_at']):%Y-%m-%d}：{update['detail']}"
                     )
-            lines.append(service.coverage(umo))
+            lines.append(await asyncio.to_thread(service.coverage, umo))
             return "\n".join(lines)
         if command == "人物等级":
             target = plugin._extract_at_sender(event) or (
@@ -242,13 +244,20 @@ async def handle_command(service, event, supplied=None):
             )
             if target != actor and plugin._cfg("bio_admin_only", True) and not admin:
                 return "查询其他成员档案需要管理员权限。"
-            member = store.member(umo, target)
+
+            def _load_grade_info():
+                mem = store.member(umo, target)
+                if not mem or mem["hidden"]:
+                    return mem, None, None
+                grd = store.grade(umo, target, service.rules())
+                vis = {f["id"] for f in store.events(umo, uid=target)}
+                return mem, grd, vis
+
+            member, grade, visible = await asyncio.to_thread(_load_grade_info)
             if not member:
                 return "尚未找到该成员档案。"
             if member["hidden"]:
                 return "该成员档案已隐藏。"
-            grade = store.grade(umo, target, service.rules())
-            visible = {f["id"] for f in store.events(umo, uid=target)}
             basis = [
                 f"#{b['id']} {b['title']}：{b['points']} 分"
                 for b in grade["basis"]
@@ -266,11 +275,19 @@ async def handle_command(service, event, supplied=None):
                 )
             )
         if command == "史记进度":
-            job = store.job(umo)
             day = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
+
+            def _load_progress_info():
+                return (
+                    store.job(umo),
+                    service.coverage(umo),
+                    store.quota(day),
+                )
+
+            job, cov, used_quota = await asyncio.to_thread(_load_progress_info)
             lines = [
-                service.coverage(umo),
-                f"今日全局抽取任务 {store.quota(day)}/{plugin._cfg('history_daily_limit', 20)}；失败尝试也占额度。",
+                cov,
+                f"今日全局抽取任务 {used_quota}/{plugin._cfg('history_daily_limit', 20)}；失败尝试也占额度。",
             ]
             if job:
                 lines.append(
@@ -287,12 +304,18 @@ async def handle_command(service, event, supplied=None):
                 )
             return "\n".join(lines)
         if command == "史记待审":
-            facts = store.events(umo, status="pending", public=False)
+
+            def _load_pending_and_corrections():
+                return (
+                    store.events(umo, status="pending", public=False),
+                    store.corrections(umo),
+                )
+
+            facts, corrections = await asyncio.to_thread(_load_pending_and_corrections)
             if tail:
                 if not tail.isdigit():
                     return "用法：史记待审 [事件ID]，审核详情私发给调用者。"
                 facts = [f for f in facts if f["id"] == int(tail)]
-            corrections = store.corrections(umo)
             if not facts and not corrections:
                 return "暂无待审事件或更正请求。"
             details = ["本群审核详情（仅发给调用者）：", umo]
@@ -360,16 +383,22 @@ async def handle_command(service, event, supplied=None):
                     fields[0][:200],
                     ("｜".join(fields[1:]) if len(fields) > 1 else fields[0])[:3000],
                 )
-                participants, unknown = [], []
-                for uid in participant_ids(event, actor):
-                    member = store.member(umo, uid)
-                    if not member:
-                        if uid != actor:
-                            unknown.append(uid)
-                            continue
-                        store.observe(umo, uid, event.get_sender_name())
+                pids = participant_ids(event, actor)
+
+                def _resolve_participants():
+                    parts, unk = [], []
+                    for uid in pids:
                         member = store.member(umo, uid)
-                    participants.append({"uid": uid, "name": member["name"], "role": 1})
+                        if not member:
+                            if uid != actor:
+                                unk.append(uid)
+                                continue
+                            store.observe(umo, uid, event.get_sender_name())
+                            member = store.member(umo, uid)
+                        parts.append({"uid": uid, "name": member["name"], "role": 1})
+                    return parts, unk
+
+                participants, unknown = await asyncio.to_thread(_resolve_participants)
                 risk = bool(unknown) or any(
                     word in title + detail for word in RISK_WORDS
                 )
@@ -453,10 +482,16 @@ async def handle_command(service, event, supplied=None):
                 )
                 return f"事件 #{rest} 已并入 #{event_id}，贡献按同一事件计算。"
             if command == "史记修订":
-                fact = store.event(umo, event_id, public=False)
-                if not fact:
+
+                def _prepare_revision():
+                    fact_row = store.event(umo, event_id, public=False)
+                    if not fact_row:
+                        return None, None
+                    return revise_payload(store, umo, fact_row, rest)
+
+                payload, note = await asyncio.to_thread(_prepare_revision)
+                if payload is None:
                     return "本群没有该事件。"
-                payload, note = revise_payload(store, umo, fact, rest)
                 await asyncio.to_thread(
                     store.review,
                     umo,
@@ -489,7 +524,11 @@ async def command_reply(plugin, event, supplied=None):
             r"(?:^|\s)(群大事|人物等级)(?=\s|$)", str(getattr(event, "message_str", ""))
         )
     )
-    revision = plugin.history.store.revision(umo) if GROUP_PATTERN.fullmatch(umo) else 0
+    revision = (
+        await asyncio.to_thread(plugin.history.store.revision, umo)
+        if GROUP_PATTERN.fullmatch(umo)
+        else 0
+    )
     try:
         reply = await asyncio.wait_for(
             handle_command(plugin.history, event, supplied),
@@ -501,7 +540,10 @@ async def command_reply(plugin, event, supplied=None):
         logger.error("Lifetime command storage operation failed", exc_info=True)
         reply = "档案存储暂不可用，请管理员检查日志；未完成的事务不会写入一半。"
     for part in split_text(reply, plugin._cfg("max_reply_chars", 1500)):
-        if guarded and plugin.history.store.revision(umo) != revision:
+        if (
+            guarded
+            and await asyncio.to_thread(plugin.history.store.revision, umo) != revision
+        ):
             yield event.plain_result("事实或隐私设置已更新，请重新查询。")
             return
         yield event.plain_result(part)
