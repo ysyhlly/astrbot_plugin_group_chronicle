@@ -1147,9 +1147,17 @@ class GroupChroniclePlugin(Star):
         }
 
     def _llm_provider_id(self) -> str | None:
-        """插件配置的 LLM Provider ID; 空字符串视为未配置 (用会话默认)。"""
-        pid = self._cfg("llm_provider_id", "") or ""
-        pid = str(pid).strip()
+        """插件配置的 LLM Provider ID; 空字符串时只读继承 Chat Dynamics 默认回复模型。"""
+        pid = str(self._cfg("llm_provider_id", "") or "").strip()
+        if not pid:
+            try:
+                if __package__:
+                    from .series_panels import inherit_provider
+                else:
+                    from series_panels import inherit_provider
+                pid = inherit_provider("", getattr(self, "context", None), role="reply")
+            except ImportError:
+                pid = ""
         return pid or None
 
     async def _lm_and_gather(

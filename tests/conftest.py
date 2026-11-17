@@ -221,6 +221,11 @@ def _install_astrbot_stubs() -> None:
 
     api_mod.sp = types.SimpleNamespace(get_async=get_async)
 
+    # --- astrbot.api.web ---
+    api_web = types.ModuleType("astrbot.api.web")
+    api_web.request = types.SimpleNamespace(_request=None)
+    api_web.json_response = lambda data, status_code=200: (status_code, data)
+
     # --- astrbot ---
     astrbot_mod = types.ModuleType("astrbot")
     astrbot_mod.__path__ = []
@@ -232,6 +237,7 @@ def _install_astrbot_stubs() -> None:
         ("astrbot.api.event.filter", event_filter),
         ("astrbot.api.star", star_mod),
         ("astrbot.api.message_components", message_components),
+        ("astrbot.api.web", api_web),
     ]:
         sys.modules[name] = module
 

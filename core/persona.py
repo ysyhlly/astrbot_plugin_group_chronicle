@@ -24,6 +24,17 @@ PERSONA_MODE_CORE = "core_persona"
 PERSONA_MODE_CUSTOM = "custom_prompt"
 
 
+def _series_defaults(context) -> dict:
+    try:
+        if __package__ and "." in __package__:
+            from ..series_panels import get_series_defaults
+        else:
+            from series_panels import get_series_defaults
+    except ImportError:
+        return {}
+    return get_series_defaults(context)
+
+
 async def resolve_system_prompt(context, config, umo: str | None = None) -> str | None:
     """解析用于史记 / 传记生成的系统提示词; 返回 None 表示按中立史官处理。
 
@@ -53,8 +64,10 @@ async def resolve_system_prompt(context, config, umo: str | None = None) -> str 
         )
         return None
 
-    persona_id = _cfg_get(config, "persona_id", "")
-    if not persona_id or not str(persona_id).strip():
+    persona_id = str(_cfg_get(config, "persona_id", "") or "").strip()
+    if not persona_id:
+        persona_id = str(_series_defaults(context).get("persona_id", "") or "").strip()
+    if not persona_id:
         logger.warning(
             "未配置有效的 persona_id, 无法加载核心人格, 本次生成按中立史官处理"
         )
