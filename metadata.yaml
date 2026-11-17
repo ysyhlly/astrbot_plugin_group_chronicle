@@ -1,0 +1,7 @@
+name: astrbot_plugin_group_chronicle
+display_name: 群史记
+desc: 长期群史、人物传记与可追溯的群文化沿革，支持梗溯源及审查面板
+version: v0.3.0-rc.1
+author: user
+repo: https://github.com/ysyhlly/astrbot_plugin_group_chronicle
+astrbot_version: ">=4.29.4,<5"
