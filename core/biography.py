@@ -11,14 +11,11 @@
 必须基于聊天记录、分节输出、不虚构。
 """
 
-import logging
 import re
 import time
 from datetime import datetime
 
 from .llm_call import call_llm
-
-logger = logging.getLogger(__name__)
 
 #: 每成员最多纳入 prompt 的发言条数(保留最近 N 条)
 BIO_MAX_MSGS_PER_SENDER = 8

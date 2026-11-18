@@ -19,12 +19,11 @@
 """
 
 import json
-import logging
 import os
 import tempfile
 import threading
 
-logger = logging.getLogger(__name__)
+from astrbot.api import logger
 
 
 class ChronicleStore:

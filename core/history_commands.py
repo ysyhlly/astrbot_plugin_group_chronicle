@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import logging
 import re
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
+
+from astrbot.api import logger
 
 from .archive_store import encode
 from .deliver import deliver_text, split_text
@@ -28,8 +29,6 @@ COMMANDS = (
     "史记隐藏",
     "史记进度",
 )
-logger = logging.getLogger(__name__)
-
 
 def administrator(plugin, event):
     """Accept an AstrBot administrator or a trusted current-group OneBot role.

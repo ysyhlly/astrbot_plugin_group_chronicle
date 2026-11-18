@@ -14,12 +14,11 @@
 """
 
 import inspect
-import logging
+
+from astrbot.api import logger
 
 from .influence import _SL_ALIASES, _resolve_star_instance
 from .llm_call import call_llm
-
-logger = logging.getLogger(__name__)
 
 #: 图鉴生成系统提示词: 严格按「名称｜称号｜一句话标签」逐行输出
 GALLERY_SYSTEM_PROMPT = """你是「群史记」的图鉴作者。请基于提供的群聊材料，为下列每位成员写一行「群友图鉴」条目。

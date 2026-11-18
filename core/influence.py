@@ -18,13 +18,12 @@
 """
 
 import inspect
-import logging
 import time
 from collections import Counter
 from datetime import date
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from astrbot.api import logger
 
 DEFAULT_WEIGHTS = {"lm": 0.5, "sl": 0.3, "ra": 0.2}
 

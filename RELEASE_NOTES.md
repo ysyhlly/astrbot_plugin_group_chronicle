@@ -1,4 +1,6 @@
-# astrbot_plugin_group_chronicle v0.3.0-rc.2
+# astrbot_plugin_group_chronicle v0.3.0-rc.3
+
+生成、投递、群文化与历史归档统一使用 AstrBot SDK 日志。打包检查覆盖全部随包 Python 模块。
 
 通过原文校验的文化候选可独立提交。未通过的候选随进度保存并单独复核。
 

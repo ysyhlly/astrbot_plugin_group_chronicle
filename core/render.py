@@ -17,13 +17,13 @@ core/render.py — 群史记图片渲染器（带纯文本降级）。
 import asyncio
 import hashlib
 import html
-import logging
 import os
 import re
 import time
 from datetime import datetime
 
-logger = logging.getLogger(__name__)
+from astrbot.api import logger
+
 
 _PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _TEMPLATES_DIR = os.path.join(_PLUGIN_DIR, "templates")

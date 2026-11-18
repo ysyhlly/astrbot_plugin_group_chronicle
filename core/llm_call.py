@@ -17,10 +17,10 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import inspect
 
-logger = logging.getLogger(__name__)
+from astrbot.api import logger
+
 
 _RETRY_ATTEMPTS = 2  # 首次 + 1 次重试
 _RETRY_SLEEP_SECONDS = 1.0

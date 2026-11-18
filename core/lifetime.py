@@ -6,13 +6,14 @@ import asyncio
 import hashlib
 import inspect
 import json
-import logging
 import math
 import re
 import time
 from functools import wraps
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from astrbot.api import logger
 
 from . import lm_bridge
 from .archive_store import ArchiveStore, EditionStore, encode, private_text
@@ -21,7 +22,6 @@ from .llm_call import call_llm
 from .persona import resolve_system_prompt
 from .render import render_text_or_image
 
-logger = logging.getLogger(__name__)
 GROUP_PATTERN = re.compile(r"^[^:\s]+:GroupMessage:[^\s]+$")
 _WATCH_SCOPE_INTERVAL_SEC = 30
 _HOURLY_CYCLE_DIVISOR = 6

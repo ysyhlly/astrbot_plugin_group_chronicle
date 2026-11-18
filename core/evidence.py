@@ -11,7 +11,6 @@
   不使用基于索引的 get_messages_range。
 """
 
-import logging
 import inspect
 import math
 import time
@@ -19,7 +18,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from astrbot.api import logger
 
 #: 记忆搜索查询词 (enable_memory_search 的搜索主题, 守卫调用)
 _MEMORY_SEARCH_QUERIES = ("大事", "冲突", "梗", "约定")

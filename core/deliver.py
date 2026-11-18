@@ -16,10 +16,9 @@
 
 import asyncio
 import inspect
-import logging
 from datetime import datetime
 
-logger = logging.getLogger(__name__)
+from astrbot.api import logger
 
 try:
     from astrbot.api.event import MessageChain

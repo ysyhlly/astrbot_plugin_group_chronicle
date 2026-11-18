@@ -15,9 +15,8 @@
 此时一律返回 None, 保证生成流程不崩。
 """
 
-import logging
+from astrbot.api import logger
 
-logger = logging.getLogger(__name__)
 
 PERSONA_MODE_OFF = "off"
 PERSONA_MODE_CORE = "core_persona"

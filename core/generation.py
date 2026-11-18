@@ -15,16 +15,15 @@
   可用假 context / monkeypatch 在无 astrbot 环境下运行。
 """
 
-import logging
 import re
 from datetime import datetime
+
+from astrbot.api import logger
 
 from .gallery import append_slang
 from .llm_call import call_llm
 from .quotes import extract_quotes
 from .structured import extract_structured, render_structured_markdown
-
-logger = logging.getLogger(__name__)
 
 NEUTRAL_HISTORIAN_PROMPT = """你是「群史记」的史官。请基于以下群聊历史记录与长期记忆，写一篇本周群史记。要求：
 1. 按时间线组织，涵盖重要事件、名场面、热点话题；

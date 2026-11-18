@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import hashlib
-import logging
 import math
 import time
 import weakref
 
+from astrbot.api import logger
+
 from . import lm_bridge
 from .archive_store import encode
-
-logger = logging.getLogger(__name__)
 
 #: 本模块唯一的可选框架依赖：旧版 AstrBot 的 astrbot.api.event.filter 可能没有
 #: CustomFilter 基类。这里**只包裹这一个导入**（而不是像 main.py 那样把整段
