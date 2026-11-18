@@ -7,7 +7,7 @@ let epoch=0,detailEpoch=0,page=1,reviewPage=1,selected=null,mergeTarget=null,bus
 const el=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=String(text);if(cls)n.className=cls;return n;};
 const date=t=>t?new Date(t*1000).toLocaleString('zh-CN'):'未知';
 function notice(text,error=false){$('notice').textContent=text;$('notice').dataset.error=String(error);}
-async function api(path,body){const bridge=window.AstrBotPluginPage;if(!bridge)throw Error('请从 AstrBot 插件详情打开此页面。');const r=await (body?bridge.apiPost(path,body):bridge.apiGet(path));if(r.status==='error'||r.ok===false)throw Error(r.message||'请求失败');return r.data??r;}
+async function api(path,body){const bridge=(window.DynamicsPanelBridge || window.AstrBotPluginPage);if(!bridge)throw Error('请从 AstrBot 插件详情打开此页面。');const r=await (body?bridge.apiPost(path,body):bridge.apiGet(path));if(r.status==='error'||r.ok===false)throw Error(r.message||'请求失败');return r.data??r;}
 const request=(op,fields={})=>api('culture',{op,scope:$('scope').value,...fields});
 function closeDetail(){selected=null;mergeTarget=null;$('merge-preview').hidden=true;++detailEpoch;$('detail').hidden=true;}
 function entryCard(e){const box=el('article',undefined,'card entry');box.append(el('span',states[e.status]||e.status,'badge'),el('h3',`#${e.id} ${e.name}`));box.append(el('p',e.unavailable?'来源不可用或条目已隐藏，解释暂停展示。':e.meaning));if(!e.unavailable){box.append(el('p',`最早留存：${date(e.first_seen)}`,'muted'));const b=el('button','查看沿革与证据');b.onclick=()=>showDetail(e.id).catch(err=>notice(err.message,true));box.append(b);}return box;}
@@ -94,7 +94,7 @@ $('merge').onclick=run(async()=>{const target=Number($('merge-id').value),item=s
 $('cancel-merge').onclick=()=>{mergeTarget=null;$('merge-preview').hidden=true;};
 $('confirm-merge').onclick=run(async()=>{if(!mergeTarget||mergeTarget.source!==selected)throw Error('词条已变化，请重新选择合并目标。');await moderate('merge',{target_id:mergeTarget.target_id,target_revision:mergeTarget.target_revision});});
 try{
- if(window.AstrBotPluginPage?.ready)await window.AstrBotPluginPage.ready();
+ if((window.DynamicsPanelBridge || window.AstrBotPluginPage)?.ready)await (window.DynamicsPanelBridge || window.AstrBotPluginPage).ready();
  const overview=await api('culture_overview');
  $('connection').textContent=`${overview.enabled?'文化整理已启用':'文化整理未启用'} · 记忆${overview.memory} · ${overview.learning?'学习线索已接入':'学习线索可选，未接入'} · 共用每日 ${overview.daily_limit} 次抽取额度`;
  const placeholder=el('option');
@@ -107,7 +107,7 @@ try{
   return option;
  }));
  if(!overview.groups.length)notice('尚无允许群。先配置长期群史范围，并等待群聊或首次发现。');
- const initial=window.AstrBotPluginPage?.getContext?.()?.scope;
+ const initial=(window.DynamicsPanelBridge || window.AstrBotPluginPage)?.getContext?.()?.scope;
  const supplied=new URLSearchParams(location.search).has('umo')||typeof initial==='string';
  applyScope(supplied?getSharedScope():overview.groups[0]?.scope);
  await refresh();

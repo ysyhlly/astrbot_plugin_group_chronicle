@@ -18,6 +18,8 @@ class CultureWeb:
         self.routes = []
 
     def register(self):
+        from ..series_workspace import register_panel_api
+
         register = getattr(self.plugin.context, "register_web_api", None)
         if callable(register):
             for endpoint, handler, methods in (
@@ -25,7 +27,7 @@ class CultureWeb:
                 ("culture", self.handle, ["POST"]),
             ):
                 path = "/astrbot_plugin_group_chronicle/" + endpoint
-                register(path, handler, methods, "群文化沿革")
+                register_panel_api(self.plugin, register, path, handler, methods, "群文化沿革")
                 self.routes.append((path, handler))
 
     def close(self):
