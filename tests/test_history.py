@@ -1131,9 +1131,10 @@ def test_manual_history_date_and_unknown_date_are_distinguished(plugin):
     )
     event = plugin.history.store.events(U)[0]
     assert event["date_basis"] == "declared"
-    assert (
-        datetime.fromtimestamp(event["event_at"]).strftime("%Y-%m-%d") == "2020-01-02"
-    )
+    declared = datetime(2020, 1, 2, tzinfo=timezone(timedelta(hours=8)))
+    assert event["event_at"] == declared.timestamp()
+    timeline = run(handle_command(plugin.history, Event("群大事 全部")))
+    assert "发生于（人工记载）2020-01-02" in timeline
     run(
         handle_command(plugin.history, Event("记一笔 新线索｜曾有重要经历", admin=True))
     )
