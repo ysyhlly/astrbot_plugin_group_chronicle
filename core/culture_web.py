@@ -18,10 +18,13 @@ class CultureWeb:
         self.routes = []
 
     def register(self):
-        from ..series_workspace import register_panel_api
-
         register = getattr(self.plugin.context, "register_web_api", None)
         if callable(register):
+            if __package__ == "core":
+                from series_workspace import register_panel_api
+            else:
+                from ..series_workspace import register_panel_api
+
             for endpoint, handler, methods in (
                 ("culture_overview", self.overview, ["GET"]),
                 ("culture", self.handle, ["POST"]),
