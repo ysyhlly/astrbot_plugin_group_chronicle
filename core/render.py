@@ -24,7 +24,6 @@ from datetime import datetime
 
 from astrbot.api import logger
 
-
 _PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _TEMPLATES_DIR = os.path.join(_PLUGIN_DIR, "templates")
 _TEMPLATE_PATH = os.path.join(_TEMPLATES_DIR, "chronicle.html")
@@ -57,7 +56,7 @@ def clear_render_cache() -> None:
 
 def _render_cache_key(markdown_text: str, group_name: str) -> str:
     """渲染缓存键: md5(group_name|markdown)。"""
-    return hashlib.md5(f"{group_name}|{markdown_text}".encode("utf-8")).hexdigest()
+    return hashlib.md5(f"{group_name}|{markdown_text}".encode()).hexdigest()
 
 
 # 极简 markdown 规则（与测试保持一致，勿轻易改动）
@@ -287,7 +286,7 @@ def render_html(
 def _render_html_fallback(content_html: str, group_name: str, generated_at: str) -> str:
     """jinja2 不可用时的兜底：读同一模板文件做占位符替换。"""
     try:
-        with open(_TEMPLATE_PATH, "r", encoding="utf-8") as f:
+        with open(_TEMPLATE_PATH, encoding="utf-8") as f:
             tmpl = f.read()
         return (
             tmpl.replace("{{ group_name }}", html.escape(group_name))

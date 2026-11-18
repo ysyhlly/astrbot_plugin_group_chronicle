@@ -125,16 +125,16 @@ def validate(raw, material, existing=()):
             if support not in {"independent", "repeat", "reported", "context"}:
                 raise ValueError("来源支持类型无效")
             sources.append(
-                dict(
-                    id=str(row["id"]),
-                    uid=row["uid"],
-                    name=row["name"],
-                    ts=row["ts"],
-                    hash=row.get("_source_hash", digest(row["content"])),
-                    quote=quote,
-                    support=support,
-                    quoted=bool(row.get("_quoted")),
-                )
+                {
+                    "id": str(row["id"]),
+                    "uid": row["uid"],
+                    "name": row["name"],
+                    "ts": row["ts"],
+                    "hash": row.get("_source_hash", digest(row["content"])),
+                    "quote": quote,
+                    "support": support,
+                    "quoted": bool(row.get("_quoted")),
+                }
             )
         sources = list({(s["id"], s["quote"]): s for s in sources}.values())
         source_ids = {s["id"] for s in sources}
@@ -163,14 +163,14 @@ def validate(raw, material, existing=()):
                     or not 0 < event_at <= time.time() + 30
                 ):
                     raise ValueError("事件发生时间无效")
-            return dict(
-                text=text,
-                source_ids=sorted({str(i) for i in ids}),
-                event_at=event_at,
-                recorded_at=min(
+            return {
+                "text": text,
+                "source_ids": sorted({str(i) for i in ids}),
+                "event_at": event_at,
+                "recorded_at": min(
                     s["ts"] for s in sources if s["id"] in {str(i) for i in ids}
                 ),
-            )
+            }
 
         timeline = item.get("timeline", [])
         aliases = item.get("aliases", [])
@@ -190,10 +190,10 @@ def validate(raw, material, existing=()):
         alias_results = []
         for alias in aliases:
             alias_name = bounded_text(alias.get("name"), 80, True)
-            proof = node(dict(text=alias_name, source_ids=alias.get("source_ids")))
+            proof = node({"text": alias_name, "source_ids": alias.get("source_ids")})
             if not any(alias_name in rows[i]["content"] for i in proof["source_ids"]):
                 raise ValueError("别称缺少原文依据")
-            alias_results.append(dict(name=alias_name, source_ids=proof["source_ids"]))
+            alias_results.append({"name": alias_name, "source_ids": proof["source_ids"]})
         origin = node(item["origin"]) if item.get("origin") is not None else None
         target = item.get("target_id")
         if target is not None and (type(target) is not int or target not in known):
@@ -218,22 +218,22 @@ def validate(raw, material, existing=()):
         if origin and not origin["confirmed"]:
             status = "pending"
         entries.append(
-            dict(
-                name=name,
-                meaning=meaning,
-                usage=usage,
-                kind=kind,
-                subjects=subjects,
-                aliases=alias_results,
-                origin=origin,
-                timeline=[node(n) for n in timeline],
-                sources=sources,
-                risk=risk,
-                conflict=conflict,
-                target_id=target,
-                admission=status,
-                first_seen=min(s["ts"] for s in sources),
-                fingerprint=digest(
+            {
+                "name": name,
+                "meaning": meaning,
+                "usage": usage,
+                "kind": kind,
+                "subjects": subjects,
+                "aliases": alias_results,
+                "origin": origin,
+                "timeline": [node(n) for n in timeline],
+                "sources": sources,
+                "risk": risk,
+                "conflict": conflict,
+                "target_id": target,
+                "admission": status,
+                "first_seen": min(s["ts"] for s in sources),
+                "fingerprint": digest(
                     encode(
                         [
                             name,
@@ -242,6 +242,6 @@ def validate(raw, material, existing=()):
                         ]
                     )
                 ),
-            )
+            }
         )
     return entries

@@ -17,7 +17,6 @@
 
 from astrbot.api import logger
 
-
 PERSONA_MODE_OFF = "off"
 PERSONA_MODE_CORE = "core_persona"
 PERSONA_MODE_CUSTOM = "custom_prompt"

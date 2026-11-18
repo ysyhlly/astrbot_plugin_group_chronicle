@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import difflib
+import hashlib
 import json
 import math
 import os

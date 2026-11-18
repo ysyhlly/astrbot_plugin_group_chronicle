@@ -76,7 +76,7 @@ def _minmax(values: dict[str, float]) -> dict[str, float] | None:
     vals = list(values.values())
     lo, hi = min(vals), max(vals)
     if hi == lo:
-        return {k: 1.0 for k in values}
+        return dict.fromkeys(values, 1.0)
     span = hi - lo
     return {k: (float(v) - lo) / span for k, v in values.items()}
 
@@ -515,7 +515,7 @@ def _fuse(
     total = sum(picked.values())
     if total <= 0:
         share = 1.0 / len(alive_names)
-        final_w = {k: share for k in alive_names}
+        final_w = dict.fromkeys(alive_names, share)
     else:
         final_w = {k: v / total for k, v in picked.items()}
 

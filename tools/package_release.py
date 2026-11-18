@@ -1,14 +1,15 @@
 """Build deterministic plugin install/source archives without local state."""
 
 from __future__ import annotations
+
 import argparse
 import ast
 import hashlib
 import json
 import os
 import re
-import zipfile
 import subprocess
+import zipfile
 from pathlib import Path
 
 SKIP_DIRS = {
@@ -143,7 +144,7 @@ def build(root: Path, output: Path):
                 }
             ):
                 continue
-            raw = metadata_raw if rel.as_posix() == 'metadata.yaml' else path.read_bytes()
+            raw = metadata_raw if rel.as_posix() == "metadata.yaml" else path.read_bytes()
             if path.suffix == ".py":
                 check_python(raw, rel.as_posix(), runtime=kind == "install")
             contents[rel.as_posix()] = raw

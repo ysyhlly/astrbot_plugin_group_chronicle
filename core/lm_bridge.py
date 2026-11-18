@@ -41,6 +41,8 @@ _LM_FACADE_MODULE = _LM_FACADE_MODULES[0]
 try:
     from astrbot_plugin_dynamics_memory.api.public import (
         ALIASES as _DM_PUBLIC_ALIASES,
+    )
+    from astrbot_plugin_dynamics_memory.api.public import (
         get_active_plugin as _dm_public_get_active_plugin,
     )
 except Exception:
@@ -50,6 +52,8 @@ except Exception:
 try:
     from astrbot_plugin_livingmemory.api.public import (
         ALIASES as _LM_PUBLIC_ALIASES,
+    )
+    from astrbot_plugin_livingmemory.api.public import (
         get_active_plugin as _lm_public_get_active_plugin,
     )
 except Exception:
@@ -423,15 +427,15 @@ async def history_sources(context, umo, ids):
             meta = json.loads(r[6]) if isinstance(r[6], str) else r[6]
         except (ValueError, TypeError):
             meta = {}
-        result[str(r[0])] = dict(
-            id=r[0],
-            role=r[1],
-            content=r[2] or "",
-            uid=str(r[3] or ""),
-            name=r[4] or "",
-            ts=r[5],
-            metadata=meta if isinstance(meta, dict) else {},
-        )
+        result[str(r[0])] = {
+            "id": r[0],
+            "role": r[1],
+            "content": r[2] or "",
+            "uid": str(r[3] or ""),
+            "name": r[4] or "",
+            "ts": r[5],
+            "metadata": meta if isinstance(meta, dict) else {},
+        }
     return result
 
 

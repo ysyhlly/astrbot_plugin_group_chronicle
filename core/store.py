@@ -46,7 +46,7 @@ class ChronicleStore:
         if not os.path.exists(self._file):
             return {}
         try:
-            with open(self._file, "r", encoding="utf-8-sig") as f:
+            with open(self._file, encoding="utf-8-sig") as f:
                 raw = json.load(f)
         except Exception as e:
             self._load_error = str(e)

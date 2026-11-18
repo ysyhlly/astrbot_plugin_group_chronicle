@@ -20,7 +20,6 @@ from astrbot.api import logger
 
 from .llm_call import call_llm
 
-
 #: 结构化提取的系统提示词: 只允许输出一个合法 JSON 对象
 _STRUCTURED_SYSTEM_PROMPT = """你是「群史记」的结构化史官。请基于提供的群聊材料，只输出一个严格合法的 JSON 对象（不要输出任何其他文字，不要使用 Markdown 代码块），格式如下：
 {
