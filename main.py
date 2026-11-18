@@ -147,7 +147,7 @@ class _SkipWeek(Exception):
     "GroupChronicle",
     "user",
     "群史记: 基于长期记忆与群聊历史生成群史记与人物传记",
-    "v0.3.0-rc.1",
+    "v0.3.0-rc.2",
     "",
 )
 class GroupChroniclePlugin(Star):

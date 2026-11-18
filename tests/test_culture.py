@@ -867,3 +867,32 @@ async def test_batch_valid_sources_reduces_queries_and_matches_web_detail(
         assert len(calls) == 2
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_mixed_page_commits_valid_candidate_and_retries_only_rejected_one(culture, monkeypatch):
+    material = rows() + [message(3, "绿雨伞表示临时改变计划。", uid="3")]
+    db = await source(culture.plugin, material)
+    good = proposal(material[:2])["entries"][0]
+    corrected = proposal(material[2:], name="绿雨伞", meaning="改变计划")["entries"][0]
+    bad = copy.deepcopy(corrected)
+    bad["sources"][0]["quote"] = "一段不存在的原话"
+    model = AsyncMock(side_effect=[json.dumps({"entries": [good, bad]}),
+                                   json.dumps({"entries": [corrected]})])
+    monkeypatch.setattr(culture_service, "call_llm", model)
+    try:
+        assert await culture.process_one(U)
+        assert culture.store.entries(U)[1] == 1
+        assert culture.store.job(U)["back_cursor"] == 0
+        assert culture.store.job(U)["back_pending_review"] == 1
+        culture.store = CultureStore(culture.history.store)
+        assert await culture.process_one(U)
+        retry_input = json.loads(model.await_args.args[2])
+        assert retry_input["review_candidate"] == "绿雨伞"
+        assert [str(m["id"]) for m in retry_input["messages"]] == ["3"]
+        assert culture.store.entries(U)[1] == 2
+        assert culture.store.job(U)["back_cursor"] == 3
+        assert culture.store.job(U)["processed"] == 3
+        assert culture.store.job(U)["back_pending_review"] == 0
+    finally:
+        await db.close()

@@ -1,4 +1,6 @@
-# astrbot_plugin_group_chronicle v0.3.0-rc.1
+# astrbot_plugin_group_chronicle v0.3.0-rc.2
+
+通过原文校验的文化候选可独立提交。未通过的候选随进度保存并单独复核。
 
 整合群史、人物传记、共同成果与群文化候选审核，并与群间学习、记忆和活动联动；包含可靠性和系列面板修复。
 

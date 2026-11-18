@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import re
 from datetime import datetime, timedelta, timezone
 
 from . import lm_bridge
 from .archive_store import encode, private_text
-from .culture_contract import PROMPT, digest, validate
+from .culture_contract import PROMPT, digest, validate_candidates
 from .culture_store import CultureStore
 from .lifetime import (
     fragment_checkpoint,
@@ -198,6 +199,9 @@ class CultureService:
                 self.store.init_job, umo, source, bounds["high"]
             )
             high = bounds["high"] if mode == "live" else job["frozen_high"]
+            retry = json.loads(job.get(f"{mode}_retry", "{}"))
+            if retry:
+                high = min(high, retry["high"])
             cursor, offset = job[f"{mode}_cursor"], job[f"{mode}_offset"]
             if cursor >= high and not offset:
                 return False
@@ -256,8 +260,17 @@ class CultureService:
                     )
                     or re.search(r"\[Reply:|\[Forward:|^>", original["content"])
                 )
+            page_signature = digest(encode([(m["id"], m["_source_hash"], m["content"], m["uid"]) for m in material]))
+            if retry.get("page") != page_signature:
+                retry = {}
+            queue = list(retry.get("targets", []))
+            target = queue.pop(0) if queue else None
+            rejected_count = retry.get("rejected", 0)
+            review_material = material
+            if target and target["ids"]:
+                review_material = [m for m in material if str(m["id"]) in target["ids"]]
             proposals = []
-            if material:
+            if review_material:
                 existing_raw, _ = await asyncio.to_thread(
                     self.store.entries, umo, limit=20
                 )
@@ -272,13 +285,15 @@ class CultureService:
                     for e in existing
                 ]
                 clues = await self.learning_clues(
-                    umo, "\n".join(m["content"] for m in material)
+                    umo, "\n".join(m["content"] for m in review_material)
                 )
                 data = {
                     "existing": targets,
                     "learning_clues": clues,
-                    "messages": material,
+                    "messages": review_material,
                 }
+                if target:
+                    data["review_candidate"] = target["name"] or "仅复核所附原文，证据不足返回空列表"
 
                 def _pre_llm_ok():
                     return (
@@ -314,7 +329,13 @@ class CultureService:
                     ),
                     timeout=float(self.plugin._cfg("generation_timeout_sec", 180)),
                 )
-                proposals = validate(raw, material, existing)
+                proposals, rejected = validate_candidates(
+                    raw, review_material, existing, target_name=target["name"] if target else ""
+                )
+                if target is None:
+                    queue.extend(rejected)
+                elif not proposals:
+                    rejected_count += 1
                 for p in proposals:
                     if p.get("target_id") is None:
                         matches = [
@@ -359,6 +380,11 @@ class CultureService:
                 raise ValueError("文化素材预算不足，未推进进度")
             if bounds.get("first") and not job["processed"]:
                 gap = "覆盖仅限仍留存的消息，留存前的起源未知"
+            if rejected_count and not queue:
+                review_gap = f"本批有 {rejected_count} 个候选经单独复核仍无充分依据"
+                gap = "；".join(v for v in (gap, review_gap) if v)
+            pending_review = {"page": page_signature, "high": high, "targets": queue,
+                              "rejected": rejected_count} if queue else None
             ok = await asyncio.to_thread(
                 self.store.commit,
                 umo,
@@ -372,7 +398,11 @@ class CultureService:
                 token[0],
                 gap="；".join(v for v in (resume_gap, gap) if v) or None,
                 fragment=fragment_checkpoint(filtered, end, next_offset),
+                pending_review=pending_review,
             )
+            if ok and pending_review:
+                self.errors[umo] = f"待单独复核 {len(queue)} 个文化候选"
+                return bool(proposals) or target is not None
             if ok:
                 self.errors.pop(umo, None)
             return ok

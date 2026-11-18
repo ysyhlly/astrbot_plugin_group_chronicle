@@ -60,7 +60,7 @@ def independent_sources(sources):
     return ids
 
 
-def validate(raw, material, existing=()):
+def _candidate_list(raw):
     if isinstance(raw, str):
         raw = raw.strip()
         if raw.startswith("```"):
@@ -72,13 +72,38 @@ def validate(raw, material, existing=()):
         or len(raw["entries"]) > 20
     ):
         raise ValueError("文化抽取结果不是有效词条列表")
+    return raw["entries"]
+
+
+def validate_candidates(raw, material, existing=(), *, target_name=""):
+    """Isolate malformed suggestions without weakening the strict single-candidate validator."""
+    accepted, rejected = [], []
+    for candidate in _candidate_list(raw):
+        candidate = candidate if isinstance(candidate, dict) else {}
+        name = candidate.get("name")
+        name = name.strip() if isinstance(name, str) and len(name) <= 80 else ""
+        if target_name and name != target_name:
+            continue
+        try:
+            accepted.extend(validate({"entries": [candidate]}, material, existing))
+        except (ValueError, KeyError, TypeError, AttributeError):
+            refs = candidate.get("sources")
+            cited = {str(ref.get("id")) for ref in refs if isinstance(ref, dict)} if isinstance(refs, list) else set()
+            named = [m for m in material if name and name in m["content"]]
+            focus = [str(m["id"]) for m in material if str(m["id"]) in cited or m in named]
+            rejected.append({"name": name if named else "", "ids": focus})
+    return accepted, rejected
+
+
+def validate(raw, material, existing=()):
+    candidates = _candidate_list(raw)
     rows = {str(m["id"]): m for m in material}
     known = {e["id"]: e for e in existing}
     members = {m["uid"] for m in material}
     for m in material:
         members.update(re.findall(r"\[At:([^\]\s]+)\]", m["content"]))
     entries = []
-    for item in raw["entries"]:
+    for item in candidates:
         if not isinstance(item, dict):
             raise ValueError("文化候选格式无效")
         name = bounded_text(item.get("name"), 80, True)

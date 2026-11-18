@@ -63,6 +63,7 @@ class CultureStore:
             columns = {row[1] for row in db.execute("PRAGMA table_info(culture_jobs)")}
             for mode in ("back", "live"):
                 for field, declaration in (
+                    ("retry", "TEXT NOT NULL DEFAULT '{}'"),
                     ("fragment_id", "INTEGER NOT NULL DEFAULT 0"),
                     ("fragment_hash", "TEXT NOT NULL DEFAULT ''"),
                 ):
@@ -115,7 +116,13 @@ class CultureStore:
             row = db.execute(
                 "SELECT * FROM culture_jobs WHERE umo=?", (umo,)
             ).fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            result = dict(row)
+            for mode in ("back", "live"):
+                retry = json.loads(result.pop(f"{mode}_retry", "{}"))
+                result[f"{mode}_pending_review"] = len(retry.get("targets", []))
+            return result
 
     def error(self, umo, message):
         with self.archive.connection(write=True) as db:
@@ -230,6 +237,7 @@ class CultureStore:
         revision,
         gap=None,
         fragment=None,
+        pending_review=None,
     ):
         if mode not in {"live", "back"}:
             raise ValueError("回溯模式无效")
@@ -353,6 +361,14 @@ class CultureStore:
                         now,
                     ),
                 )
+            if pending_review:
+                # Publish verified entries and checkpoint the remaining work atomically.
+                # The page is accounted for only once, after all candidates are settled.
+                message = f"待单独复核 {len(pending_review['targets'])} 个文化候选"
+                db.execute(f"UPDATE culture_jobs SET {mode}_retry=?,error=?,updated=? WHERE umo=?",
+                           (encode(pending_review), message, time.time(), umo))
+                self.bump(db, umo)
+                return True
             times = [m["ts"] for m in observed if m.get("ts") and m["ts"] > 0]
             low = min(times) if times else 0
             if job["coverage_min"]:
@@ -364,7 +380,7 @@ class CultureStore:
             db.execute(
                 f"""UPDATE culture_jobs SET {mode}_cursor=?,{mode}_offset=?,
                        {mode}_fragment_id=?,{mode}_fragment_hash=?,processed=processed+?,
-                       coverage_min=?,coverage_max=MAX(coverage_max,?),gaps=?,error='',updated=? WHERE umo=?""",
+                       coverage_min=?,coverage_max=MAX(coverage_max,?),gaps=?,{mode}_retry='{{}}',error='',updated=? WHERE umo=?""",
                 (
                     end,
                     offset,
