@@ -10,7 +10,11 @@ from datetime import datetime, timedelta, timezone
 
 from . import lm_bridge
 from .archive_store import encode, private_text
-from .culture_contract import PROMPT, digest, validate_candidates
+from .culture_contract import (
+    build_culture_system_prompt,
+    digest,
+    validate_candidates,
+)
 from .culture_store import CultureStore
 from .lifetime import (
     fragment_checkpoint,
@@ -18,7 +22,7 @@ from .lifetime import (
     resume_offset,
     tracked_operation,
 )
-from .llm_call import call_llm
+from .llm_call import call_llm, encode_compact
 
 _SOURCE_BATCH_SIZE = 500
 
@@ -271,22 +275,33 @@ class CultureService:
                 review_material = [m for m in material if str(m["id"]) in target["ids"]]
             proposals = []
             if review_material:
-                existing_raw, _ = await asyncio.to_thread(
-                    self.store.entries, umo, limit=20
-                )
+                def _load_culture_context():
+                    entries_list, _ = self.store.entries(umo, limit=20)
+                    group_row = self.history.store.group(umo) or {}
+                    return entries_list, str(group_row.get("name") or "")
+
+                existing_raw, group_name = await asyncio.to_thread(_load_culture_context)
                 # Disputed/hidden/rejected records never enter the model prompt.
                 existing_candidates = [
                     e for e in existing_raw if e["status"] in {"approved", "pending"}
                 ]
                 valid_flags = await self._batch_valid_sources(umo, existing_candidates)
                 existing = [e for e, ok in zip(existing_candidates, valid_flags) if ok]
-                targets = [
-                    {"id": e["id"], "name": e["name"], "meaning": e["meaning"][:200]}
-                    for e in existing
-                ]
-                clues = await self.learning_clues(
-                    umo, "\n".join(m["content"] for m in review_material)
+                # Deterministic ascending ID order keeps existing entries prefix-stable.
+                targets = sorted(
+                    (
+                        {"id": e["id"], "name": e["name"], "meaning": e["meaning"][:200]}
+                        for e in existing
+                    ),
+                    key=lambda item: item["id"],
                 )
+                clues = sorted(
+                    await self.learning_clues(
+                        umo, "\n".join(m["content"] for m in review_material)
+                    ),
+                    key=lambda item: (item["name"], item["meaning"]),
+                )
+                # Explicit slow-to-fast key order: existing -> learning_clues -> messages -> review_candidate.
                 data = {
                     "existing": targets,
                     "learning_clues": clues,
@@ -323,8 +338,8 @@ class CultureService:
                     call_llm(
                         self.plugin.context,
                         umo,
-                        encode(data),
-                        PROMPT,
+                        encode_compact(data),
+                        build_culture_system_prompt(umo, group_name),
                         provider_id=self.plugin._llm_provider_id(),
                     ),
                     timeout=float(self.plugin._cfg("generation_timeout_sec", 180)),

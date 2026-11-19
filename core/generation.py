@@ -284,8 +284,8 @@ async def generate_chronicle(
             ):
                 return markdown
             prompt = _append_topic(
-                f"时间窗: 最近 {window_days} 天\n以下是已经提取的事实要点:\n"
-                f"{markdown[:12000]}\n\n请据此按指定文风撰写群史记，勿增加未经证实的事实。",
+                "以下是已经提取的事实要点（请据此按指定文风撰写群史记，勿增加未经证实的事实）：\n"
+                f"{markdown[:12000]}\n\n时间窗: 最近 {window_days} 天",
                 topic,
             )
             return await call_llm(context, umo, prompt, sp, provider_id=provider_id)
@@ -293,14 +293,15 @@ async def generate_chronicle(
     if enable_two_phase:
         summary = await _summarize_days(context, umo, evidence, sp, provider_id)
         prompt = _append_topic(
-            f"时间窗: 最近 {window_days} 天\n"
-            f"以下是按天压缩的要点:\n{summary[:12000]}\n\n请基于要点生成群史记。",
+            "以下是按天压缩的要点：\n"
+            f"{summary[:12000]}\n\n时间窗: 最近 {window_days} 天\n请基于要点生成群史记。",
             topic,
         )
         return await call_llm(context, umo, prompt, sp, provider_id=provider_id)
 
     prompt = _append_topic(
-        f"时间窗: 最近 {window_days} 天\n{evidence_text}\n\n请生成群史记。",
+        "以下是群聊历史记录与长期记忆素材：\n"
+        f"{evidence_text}\n\n时间窗: 最近 {window_days} 天\n请生成群史记。",
         topic,
     )
     return await call_llm(context, umo, prompt, sp, provider_id=provider_id)
@@ -312,10 +313,10 @@ async def _summarize_days(
     """两阶段模式阶段 1: 把按天归类的群聊记录压缩为要点列表。"""
     buckets = _day_bucket_text(evidence)
     prompt = (
+        "任务：请按天压缩下方群聊记录为要点列表，每行一条，格式「日期 | 要点」，"
+        "只保留事实与重要细节，不展开写作、不评价。\n\n"
         "以下是按天归类的群聊记录(仅素材):\n"
-        f"{buckets}\n\n"
-        "请按天压缩为要点列表，每行一条，格式「日期 | 要点」，"
-        "只保留事实与重要细节，不展开写作、不评价。"
+        f"{buckets}"
     )
     return await call_llm(context, umo, prompt, system_prompt, provider_id=provider_id)
 
@@ -351,12 +352,12 @@ async def generate_continuation(
         compress_evidence(evidence), evidence, enable_golden_quotes
     )
     prompt = (
+        "任务：请撰写本期群史记的续篇，承接上一期内容，重点记录新进展、新事件与变化，"
+        "如无重大新事件请如实说明。\n\n"
         "以下是上一期群史记(已生成, 作为续写背景):\n"
         f"{previous_text[-6000:]}\n\n"
         f"以下是上一期生成之后的新群聊记录与记忆:\n{evidence_text}\n\n"
-        "请撰写本期群史记的续篇：承接上一期内容，"
-        f"重点记录最近 {window_days} 天内的新进展、新事件与变化，"
-        "如无重大新事件请如实说明。"
+        f"时间窗: 最近 {window_days} 天"
     )
     return await call_llm(context, umo, prompt, sp, provider_id=provider_id)
 

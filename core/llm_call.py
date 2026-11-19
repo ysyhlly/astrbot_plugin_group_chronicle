@@ -18,11 +18,17 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 
 from astrbot.api import logger
 
 _RETRY_ATTEMPTS = 2  # 首次 + 1 次重试
 _RETRY_SLEEP_SECONDS = 1.0
+
+
+def encode_compact(value) -> str:
+    """Compact UTF-8 JSON preserving explicit key order for cache-friendly payloads."""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 class LLMUnavailableError(Exception):
@@ -53,7 +59,12 @@ async def call_llm(
     """
     configured = (provider_id or "").strip() or None
     # Apply a final budget across every generation path, including custom prompts.
-    system_prompt = str(system_prompt)[:8000] if system_prompt else None
+    # Normalize CRLF -> LF on system_prompt so prefix hashes stay byte-identical.
+    system_prompt = (
+        str(system_prompt).replace("\r\n", "\n").replace("\r", "\n")[:8000]
+        if system_prompt
+        else None
+    )
     prompt = str(prompt)[: max(1, 24000 - len(system_prompt or ""))]
     last_exc: Exception | None = None
     for attempt in range(1, _RETRY_ATTEMPTS + 1):
