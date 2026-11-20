@@ -59,7 +59,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.event.filter import PermissionType
 from astrbot.api.message_components import At, File
-from astrbot.api.star import Context, Star, StarTools, register
+from astrbot.api.star import Context, Star, StarTools
 
 # AstrBot 以包方式加载插件，必须用相对导入 (.core.*)。
 # 本地 pytest 把插件根目录塞进 sys.path 后以顶层模块 import main，
@@ -143,13 +143,6 @@ class _SkipWeek(Exception):
     """内部控制流: 本周史记已生成且无新消息, 跳过本次生成 (不视为错误)。"""
 
 
-@register(
-    "GroupChronicle",
-    "user",
-    "群史记: 基于长期记忆与群聊历史生成群史记与人物传记",
-    "v0.3.0-rc.5",
-    "",
-)
 class GroupChroniclePlugin(Star):
     """
     群史记插件。
