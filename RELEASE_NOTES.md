@@ -1,4 +1,9 @@
-# astrbot_plugin_group_chronicle v0.3.0-rc.3
+# astrbot_plugin_group_chronicle v0.3.0-rc.5
+
+## v0.3.0-rc.5 — 2026-11-20
+
+- 稳定静态 `system_prompt` 前缀并按“由慢到快”组织精简用户载荷以提升前缀缓存命中率。
+- 收紧史料提取输出篇幅，并对低信号水聊批次直接短路以降低无效调用成本。
 
 ## v0.3.0-rc.4
 
