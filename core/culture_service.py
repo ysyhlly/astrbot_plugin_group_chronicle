@@ -18,6 +18,7 @@ from .culture_contract import (
 from .culture_store import CultureStore
 from .lifetime import (
     fragment_checkpoint,
+    has_substantive_signal,
     pack_messages,
     resume_offset,
     tracked_operation,
@@ -274,7 +275,9 @@ class CultureService:
             if target and target["ids"]:
                 review_material = [m for m in material if str(m["id"]) in target["ids"]]
             proposals = []
-            if review_material:
+            if review_material and (
+                target is not None or has_substantive_signal(review_material)
+            ):
                 def _load_culture_context():
                     entries_list, _ = self.store.entries(umo, limit=20)
                     group_row = self.history.store.group(umo) or {}

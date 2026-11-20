@@ -68,7 +68,8 @@ SHARED_ARCHIVE_EXTRACTION_PREAMBLE = """你是「群史记」长期群史与群�
 3. 时间语义边界：每条消息的 ts 仅代表来源记载/观察时间（recorded_at），不能自动推定为事件的真实发生日期（event_at）；没有明确时间佐证时不得虚构具体发生日期，也不得将最早留存记录当成唯一历史起源。
 4. 事实与假设区分：严禁把未落实的口头计划、玩笑起哄、单方面猜测、转述传闻或主观评价升级为已完成事实或群内共识；不同发言者独立、非复读、非附和的核实才构成独立佐证。
 5. 隐私与风险红线：涉及指控、争执冲突、处分/封禁/踢出、举报辱骂、现实身份（真实姓名、住址、电话号码等）、恋爱/性取向、宗教/政治立场、心理诊断、身份存疑或证据不足的条目，必须保守标记 risk=true，禁止贬损、定性或外推现实隐私。
-6. 严格结构化输出：只输出一个合法 JSON 对象，不附带额外解释、前缀或 Markdown 散文；当前批次没有满足收录门槛的事项时，直接返回空数组，绝不为了凑数而收录普通闲聊、刷屏或临时玩笑。"""
+6. 严格结构化输出：只输出单行紧凑 JSON 对象（无额外解释、前缀、代码块围栏或多余换行）；当前批次没有满足收录门槛的事项时，立即输出最小空 JSON，绝不为了凑数而收录普通闲聊、刷屏或临时玩笑。
+7. 简洁直出原则：直接基于材料快速判定，禁止逐条复述聊天原文、禁止冗长分步推演或对明显闲聊反复权衡；每个提取出的文本字段仅用一句简短客观陈述概括，不做铺陈扩写。"""
 
 EXTRACT_PROMPT = (
     SHARED_ARCHIVE_EXTRACTION_PREAMBLE
@@ -89,8 +90,62 @@ EXTRACT_PROMPT = (
 5. corroborated：仅当不同成员独立确认同一事实时标 true；回复起哄、复读和重复转述不算确认。
 6. risk 与 positive：指控、处分、冲突、隐私、身份不明及证据不足时必须 risk=true、positive=false。
 7. ongoing 与 merge_into：持续进行中的事件标 ongoing=true；只有明确属于 existing_events 中同一事件的后续进展时，才将 merge_into 设为该事件整数 id，否则填 null。
-8. 只输出严格 JSON 对象：{"events":[{"kind":"project","title":"标题","detail":"客观经过和结果","importance":1,"positive":true,"risk":false,"corroborated":false,"ongoing":false,"participants":[{"uid":"123","role":1}],"source_ids":[1,2],"merge_into":null}]}；没有大事时输出 {"events":[]}。"""
+8. 简洁约束：title 精炼概括（<=24字），detail 用一句短句客观说明经过与结果（<=80字，不复述聊天原话）；若本批无明确大事，立即直接输出单行 {"events":[]}，不要过度分析。
+9. 只输出单行紧凑 JSON 对象：{"events":[{"kind":"project","title":"简洁标题","detail":"一句客观经过与结果","importance":1,"positive":true,"risk":false,"corroborated":false,"ongoing":false,"participants":[{"uid":"123","role":1}],"source_ids":[1,2],"merge_into":null}]}；没有大事时立即输出 {"events":[]}。"""
 )
+
+_MEDIA_PLACEHOLDER_RE = re.compile(
+    r"\[(?:图片|表情|动画表情|语音|视频|文件|转发|回复|合并转发|戳一戳|"
+    r"Image|Sticker|Emoji|Audio|Voice|Video|File|"
+    r"At:[^\]]*|Face:[^\]]*|Reply:[^\]]*|Forward:[^\]]*)\]",
+    re.IGNORECASE,
+)
+_MEANINGFUL_CHAR_RE = re.compile(r"[A-Za-z0-9\u4e00-\u9fff]")
+_TRIVIAL_FILLER_RE = re.compile(
+    r"^(?:"
+    r"哈+|呵+|嘿+|嘻+|呜+|啊+|哦+|噢+|嗯+|额+|呃+|诶+|唉+|哇+|呀+|哟+|嘛+|啦+|咯+|"
+    r"h+|ha+|he+|hh+|233+|666+|www+|lol+|lmao+|xd+|ok+|okk+|k+|"
+    r"嗯嗯+|好好+|行行+|对对+|是的+|好的+|收到+|谢谢+|感谢+|"
+    r"早安|晚安|早|晚|拜拜|再见|加油|确实|可以|行|好|是|对|不|没|有|"
+    r"牛|强|赞|顶|草|典|绷|急|寄|赢|麻|乐|润|溜|"
+    r"\+1|[0-9]{1,2}"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def has_substantive_signal(material: list[dict]) -> bool:
+    """Conservatively detect whether a packed batch carries enough real conversation signal.
+
+    Pure filler/laughter/emoji/placeholder/single-char pings return False so background
+    history and culture extraction can advance the cursor with 0 LLM calls while never
+    skipping real milestones, slang, or multi-person banter.
+    """
+    if not material:
+        return False
+    non_filler_speakers: set[str] = set()
+    non_filler_chars = 0
+    for item in material:
+        raw = str(item.get("content") or "")
+        stripped = _MEDIA_PLACEHOLDER_RE.sub("", raw).strip()
+        if not stripped:
+            continue
+        meaningful = "".join(_MEANINGFUL_CHAR_RE.findall(stripped))
+        if not meaningful:
+            continue
+        if _TRIVIAL_FILLER_RE.fullmatch(stripped) or _TRIVIAL_FILLER_RE.fullmatch(
+            meaningful
+        ):
+            continue
+        if len(meaningful) >= 2:
+            return True
+        non_filler_chars += len(meaningful)
+        uid = str(item.get("uid") or "")
+        if uid:
+            non_filler_speakers.add(uid)
+        if len(non_filler_speakers) >= 2 and non_filler_chars >= 2:
+            return True
+    return False
 
 _REPORT_WRITING_RULES = (
     "写作规则：据给定本群正式入史事实编写群史，按时间顺序客观叙述经过、结果与后续，"
@@ -1077,7 +1132,7 @@ class HistoryService:
                 if end == cursor and next_offset == offset and not material:
                     raise RuntimeError("素材预算无法容纳消息标识")
                 facts = []
-                if material:
+                if material and has_substantive_signal(material):
 
                     def _prepare_extraction_inputs():
                         group_row = self.store.group(umo) or {}

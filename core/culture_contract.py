@@ -33,8 +33,9 @@ PROMPT = (
 4. kind 分类：slang（黑话）、meme（梗）、nickname（外号）、scene（名场面）。外号 kind=nickname，涉及成员的 subjects 仅填材料中的真实 uid 或明确 [At:uid] 中的 uid；无法确认身份标 risk=true。
 5. 合并与建新：不同含义分别建词条；明确同一含义的新证据/后续用 target_id 指向 existing 中对应整数 id，不要凭相似字形合并。
 6. aliases 与 timeline：aliases 仅填写来源中明确建立同义关系的称呼并附本批 source_ids；每段解释、时间线与起源都必须引用本批材料，event_at 无充分证据填 null。
-7. 学习线索不是证据；未出现在本批 messages 中的历史来源 ID 不能引用。没有符合条件的候选返回 {"entries":[]}。
-8. 只输出严格 JSON 对象：{"entries":[{"name":"词","meaning":"含义","usage":"场景","kind":"slang|meme|nickname|scene","target_id":null,"subjects":[],"risk":false,"conflict":false,"sources":[{"id":1,"quote":"材料内逐字原文，最多400字","support":"independent|repeat|reported|context"}],"aliases":[{"name":"别称","source_ids":[1]}],"origin":null,"timeline":[{"text":"变化或代表事件","source_ids":[1],"event_at":null}]}]}；origin 非空时格式为 {"text":"起源","source_ids":[1,2],"event_at":null}。"""
+7. 学习线索不是证据；未出现在本批 messages 中的历史来源 ID 不能引用。没有符合条件的候选立即直接输出单行 {"entries":[]}，不要过度分析。
+8. 简洁约束：meaning（<=40字）、usage（<=30字）、timeline.text（<=40字）、origin.text（<=50字）均用一句短句精炼表述；quote 仅摘取最短必要逐字片段（<=80字，不复述无关长文）。
+9. 只输出单行紧凑 JSON 对象：{"entries":[{"name":"词","meaning":"一句含义","usage":"一句场景","kind":"slang|meme|nickname|scene","target_id":null,"subjects":[],"risk":false,"conflict":false,"sources":[{"id":1,"quote":"最短必要逐字原文","support":"independent|repeat|reported|context"}],"aliases":[{"name":"别称","source_ids":[1]}],"origin":null,"timeline":[{"text":"一句变化或代表事件","source_ids":[1],"event_at":null}]}]}；origin 非空时格式为 {"text":"一句起源说明","source_ids":[1,2],"event_at":null}。"""
 )
 
 

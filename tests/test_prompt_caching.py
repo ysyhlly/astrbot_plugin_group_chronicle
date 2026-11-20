@@ -14,6 +14,7 @@ from core.lifetime import (
     EXTRACT_PROMPT,
     SHARED_ARCHIVE_EXTRACTION_PREAMBLE,
     build_extract_system_prompt,
+    has_substantive_signal,
 )
 from tests.test_culture import culture, proposal  # noqa: F401
 from tests.test_generation import FakeEvidence, FakeMsg
@@ -283,3 +284,99 @@ def test_call_llm_normalizes_system_prompt_crlf_for_prefix_stability():
     asyncio.run(llm_call.call_llm(ctx, U, "batch1", "line1\r\nline2"))
     asyncio.run(llm_call.call_llm(ctx, U, "batch2", "line1\nline2"))
     assert seen[0] == seen[1] == "line1\nline2"
+
+
+def test_concise_output_rules_present_and_static_across_prompts():
+    """Phase 3: concise single-line JSON and anti-deliberation rules stay static per group."""
+    assert "简洁直出原则" in SHARED_ARCHIVE_EXTRACTION_PREAMBLE
+    assert "单行紧凑 JSON" in SHARED_ARCHIVE_EXTRACTION_PREAMBLE
+    assert "立即直接输出单行 {\"events\":[]}" in EXTRACT_PROMPT
+    assert "立即直接输出单行 {\"entries\":[]}" in CULTURE_PROMPT
+    assert "<=24字" in EXTRACT_PROMPT and "<=80字" in EXTRACT_PROMPT
+    assert "<=40字" in CULTURE_PROMPT and "<=80字" in CULTURE_PROMPT
+    assert build_extract_system_prompt(U, "技术交流群") == build_extract_system_prompt(
+        U, "技术交流群"
+    )
+    assert build_culture_system_prompt(U, "技术交流群") == build_culture_system_prompt(
+        U, "技术交流群"
+    )
+
+
+@pytest.mark.parametrize(
+    ("contents", "expected"),
+    [
+        ([], False),
+        (["哈哈哈哈哈", "666", "ok", "收到", "好的", "嗯嗯"], False),
+        (["[图片]", "[表情] 👍🔥", "[At:12345] [动画表情]", "？？？", "+1"], False),
+        (["早安", "晚安", "草", "确实"], False),
+        (["a"], False),
+        (["今晚八点项目正式发布上线！"], True),
+        (["群里说蓝蘑菇就是项目延期"], True),
+        (["哈哈", "[图片]", "我们周末去爬山吧"], True),
+        (["开黑"], True),
+    ],
+)
+def test_has_substantive_signal_conservative_classification(contents, expected):
+    batch = [
+        {"id": idx + 1, "uid": str((idx % 2) + 1), "content": text}
+        for idx, text in enumerate(contents)
+    ]
+    assert has_substantive_signal(batch) is expected
+
+
+@pytest.mark.asyncio
+async def test_history_low_signal_batch_short_circuits_zero_llm_and_advances_cursor(
+    plugin, monkeypatch  # noqa: F811
+):
+    plugin.config["history_batch_size"] = 3
+    plugin.history.store.group(U, "闲聊群")
+    rows = [
+        message(1, "哈哈哈哈", uid="1", ts=1_700_200_000.0),
+        message(2, "[图片] 🔥", uid="2", ts=1_700_200_010.0),
+        message(3, "666", uid="1", ts=1_700_200_020.0),
+        message(4, "本周五项目重构完成并顺利上线", uid="1", ts=1_700_200_100.0),
+    ]
+    db = await source(plugin, rows)
+    mock_llm = AsyncMock(return_value='{"events":[]}')
+    monkeypatch.setattr(lifetime, "call_llm", mock_llm)
+    try:
+        # Batch 1 (ids 1..3): pure filler/placeholder -> 0 LLM calls, 0 quota, cursor advances to 3
+        assert await plugin.history.process_one(U, "back")
+        assert mock_llm.await_count == 0
+        assert plugin.history.store.job(U)["back_cursor"] == 3
+
+        # Batch 2 (id 4): real milestone -> invokes LLM normally and advances cursor to 4
+        assert await plugin.history.process_one(U, "back")
+        assert mock_llm.await_count == 1
+        assert plugin.history.store.job(U)["back_cursor"] == 4
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_culture_low_signal_batch_short_circuits_zero_llm_and_advances_cursor(
+    culture, monkeypatch  # noqa: F811
+):
+    culture.plugin.config["history_batch_size"] = 3
+    culture.history.store.group(U, "闲聊群")
+    rows = [
+        message(1, "嗯嗯", uid="1", ts=1_700_200_000.0),
+        message(2, "[At:1] [表情]", uid="2", ts=1_700_200_010.0),
+        message(3, "+1", uid="1", ts=1_700_200_020.0),
+        message(4, "群里说蓝蘑菇就是项目延期的意思", uid="1", ts=1_700_200_100.0),
+    ]
+    db = await source(culture.plugin, rows)
+    mock_llm = AsyncMock(return_value='{"entries":[]}')
+    monkeypatch.setattr(culture_service, "call_llm", mock_llm)
+    try:
+        # Batch 1 (ids 1..3): trivial filler -> 0 LLM calls, cursor advances cleanly to 3
+        assert await culture.process_one(U, "back")
+        assert mock_llm.await_count == 0
+        assert culture.store.job(U)["back_cursor"] == 3
+
+        # Batch 2 (id 4): real culture discussion -> invokes LLM and advances cursor to 4
+        assert await culture.process_one(U, "back")
+        assert mock_llm.await_count == 1
+        assert culture.store.job(U)["back_cursor"] == 4
+    finally:
+        await db.close()
