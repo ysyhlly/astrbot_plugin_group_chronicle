@@ -1,4 +1,9 @@
-# astrbot_plugin_group_chronicle v0.3.0-rc.5
+# astrbot_plugin_group_chronicle v0.3.0-rc.6
+
+## v0.3.0-rc.6 — 2026-11-20
+
+- 移除 `main.py` 中已弃用的 `@register(...)` 装饰器，迁移至纯 `Star` 子类自动注册。
+- 统一 `metadata.yaml` 中的 `author` 字段为 `ysyhlly`。
 
 ## v0.3.0-rc.5 — 2026-11-20
 
