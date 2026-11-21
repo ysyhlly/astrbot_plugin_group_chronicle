@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 
@@ -29,6 +30,50 @@ _RETRY_SLEEP_SECONDS = 1.0
 def encode_compact(value) -> str:
     """Compact UTF-8 JSON preserving explicit key order for cache-friendly payloads."""
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def build_cache_anchor_contexts(
+    system_prompt: str | None,
+    *,
+    task: str = "group_chronicle",
+    as_messages: bool = False,
+) -> list:
+    """Build a tiny deterministic 2-message static anchor keyed only on system_prompt hash.
+
+    Enables implicit prefix caching on Gemini 3.8 Flash (which misses when contexts=[]
+    and contents[0] changes every call) while remaining compatible with DeepSeek, OpenAI,
+    and stock AstrBot providers. When ``as_messages=True``, returns real AstrBot
+    ``Message`` instances if available (matching ``Context.llm_generate`` typing).
+    """
+    text = str(system_prompt or "")
+    if not text.strip():
+        return []
+    sha12 = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    anchor = f"[cache_anchor task={task} prefix={sha12}]"
+    if as_messages:
+        try:
+            from astrbot.core.agent.message import Message
+
+            return [
+                Message(role="user", content=anchor),
+                Message(role="assistant", content="OK"),
+            ]
+        except Exception:
+            pass
+    return [
+        {"role": "user", "content": anchor},
+        {"role": "assistant", "content": "OK"},
+    ]
+
+
+def _accepts_kwarg(fn, name: str) -> bool:
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (ValueError, TypeError):
+        return False
+    return name in parameters or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+    )
 
 
 class LLMUnavailableError(Exception):
@@ -162,11 +207,17 @@ async def _try_llm_generate(
     if not callable(llm_generate):
         return None
     try:
-        resp = await llm_generate(
-            chat_provider_id=provider_id,
-            prompt=prompt,
-            system_prompt=system_prompt,
+        gen_kwargs = {
+            "chat_provider_id": provider_id,
+            "prompt": prompt,
+            "system_prompt": system_prompt,
+        }
+        anchor_contexts = build_cache_anchor_contexts(
+            system_prompt, task="group_chronicle", as_messages=True
         )
+        if anchor_contexts and _accepts_kwarg(llm_generate, "contexts"):
+            gen_kwargs["contexts"] = anchor_contexts
+        resp = await llm_generate(**gen_kwargs)
         if resp is None:
             return None
         text = getattr(resp, "completion_text", None)
@@ -220,7 +271,13 @@ async def _try_provider_text_chat(
     if not callable(text_chat):
         return None
     try:
-        resp = await text_chat(prompt=prompt, system_prompt=system_prompt)
+        chat_kwargs = {"prompt": prompt, "system_prompt": system_prompt}
+        anchor_contexts = build_cache_anchor_contexts(
+            system_prompt, task="group_chronicle", as_messages=False
+        )
+        if anchor_contexts and _accepts_kwarg(text_chat, "contexts"):
+            chat_kwargs["contexts"] = anchor_contexts
+        resp = await text_chat(**chat_kwargs)
         if resp is None:
             return None
         text = resp if isinstance(resp, str) else getattr(resp, "completion_text", None)

@@ -1,7 +1,7 @@
 name: astrbot_plugin_group_chronicle
-display_name: 群史记
-desc: 长期群史、人物传记与可追溯的群文化沿革，支持梗溯源及审查面板
-version: v0.3.0-rc.6
+display_name: 群间史记 · Dynamics Chronicle
+desc: 群间系列长期群史与文化档案插件（原名「群史记」）：以原文证据为依据编撰群史卷册、小记/小传/列传人物档案与群梗文化沿革，支持多方互证审核与即时隐私隐藏。
+version: v0.3.0-rc.7
 author: ysyhlly
 repo: https://github.com/ysyhlly/astrbot_plugin_group_chronicle
 astrbot_version: ">=4.29.4,<5"

@@ -6,13 +6,14 @@ import inspect
 import re
 import subprocess
 import sys
+import time
 from importlib import import_module
 from pathlib import Path
 
 from astrbot.api.web import json_response, request
 
 CATALOG = (
-    ("astrbot_plugin_chat_dynamics", "Chat Dynamics", "app", "对话调度与回复"),
+    ("astrbot_plugin_chat_dynamics", "对话主控", "app", "对话调度与回复"),
     ("astrbot_plugin_dynamics_learning", "群间学习", "review", "学习与审查"),
     ("astrbot_plugin_dynamics_world", "群间世界", "world", "角色与生活状态"),
     ("astrbot_plugin_dynamics_memory", "群间记忆", "dashboard", "记忆与证据"),
@@ -26,7 +27,7 @@ CATALOG = (
     ("astrbot_plugin_visual_media", "视觉工坊", "workshop", "表情、图片与视觉表达"),
     (
         "astrbot_plugin_group_chronicle",
-        "群史记",
+        "群文化沿革",
         "culture",
         "收录有价值的结果与群史传记",
     ),
@@ -38,6 +39,12 @@ CATALOG = (
         "兼容检查；已由群间学习接管",
     ),
 )
+
+_SUMMARY_CACHE_TTL = 10.0
+_SUMMARY_TONES = frozenset({"accent", "warm", "info", "danger", "muted"})
+_SUMMARY_CACHE: dict[
+    tuple[str, int], tuple[float, tuple[dict | None, dict | None]]
+] = {}
 
 # These four IDs and titles mirror Dynamics Games' runtime.LEGACY_PLUGINS.
 LEGACY_CONFLICTS = (
@@ -317,6 +324,68 @@ def inherit_provider(explicit, context, role: str = "reply") -> str:
     return str(defaults.get("reply_provider") or "")
 
 
+def invalidate_summary_cache(identity: str | None = None) -> None:
+    """Clear cached sibling summary entries (all or for a specific plugin ID)."""
+    if identity is None:
+        _SUMMARY_CACHE.clear()
+        return
+    for key in [k for k in _SUMMARY_CACHE if k[0] == identity]:
+        _SUMMARY_CACHE.pop(key, None)
+
+
+def _sanitize_summary(raw) -> tuple[dict | None, dict | None]:
+    if not isinstance(raw, dict):
+        return None, None
+    badge_raw = raw.get("badge")
+    badge = None
+    if isinstance(badge_raw, dict):
+        count_raw = badge_raw.get("count")
+        count = count_raw if type(count_raw) is int and count_raw >= 0 else 0
+        tone_raw = badge_raw.get("tone")
+        tone = (
+            tone_raw
+            if isinstance(tone_raw, str) and tone_raw in _SUMMARY_TONES
+            else "muted"
+        )
+        label_raw = badge_raw.get("label")
+        label = label_raw.strip()[:64] if isinstance(label_raw, str) else ""
+        badge = {"count": count, "tone": tone, "label": label}
+    pulse_raw = raw.get("pulse")
+    pulse = None
+    if isinstance(pulse_raw, dict):
+        headline_raw = pulse_raw.get("headline")
+        updated_raw = pulse_raw.get("updated_at")
+        headline = headline_raw.strip()[:160] if isinstance(headline_raw, str) else ""
+        updated_at = updated_raw.strip()[:64] if isinstance(updated_raw, str) else ""
+        if headline or updated_at:
+            pulse = {"headline": headline, "updated_at": updated_at}
+    return badge, pulse
+
+
+def _read_plugin_summary(identity: str, owner) -> tuple[dict | None, dict | None]:
+    if owner is None:
+        return None, None
+    getter = getattr(owner, "get_series_summary", None)
+    if not callable(getter) or inspect.iscoroutinefunction(getter):
+        return None, None
+    key = (identity, id(owner))
+    now = time.monotonic()
+    cached = _SUMMARY_CACHE.get(key)
+    if cached is not None and (now - cached[0]) < _SUMMARY_CACHE_TTL:
+        return cached[1]
+    try:
+        raw = getter()
+    except Exception:
+        return None, None
+    if inspect.isawaitable(raw):
+        if inspect.iscoroutine(raw):
+            raw.close()
+        return None, None
+    result = _sanitize_summary(raw)
+    _SUMMARY_CACHE[key] = (now, result)
+    return result
+
+
 def presence(context, current, root=None):
     root = Path(root) if root else Path(__file__).resolve().parent.parent
     registered_entries = _iter_registered_entries(context)
@@ -341,6 +410,8 @@ def presence(context, current, root=None):
             "runtime_enabled": None,
             "version": "",
             "can_open": False,
+            "badge": None,
+            "pulse": None,
         }
         if not matches:
             data["state"] = "unloaded" if installed else "missing"
@@ -415,6 +486,10 @@ def presence(context, current, root=None):
                             )
                     except Exception as exc:
                         data.update(state="error", error=type(exc).__name__)
+                if data["state"] != "error":
+                    badge, pulse = _read_plugin_summary(identity, owner)
+                    data["badge"] = badge
+                    data["pulse"] = pulse
         output.append(data)
 
     active_ids = {

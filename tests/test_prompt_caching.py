@@ -380,3 +380,91 @@ async def test_culture_low_signal_batch_short_circuits_zero_llm_and_advances_cur
         assert culture.store.job(U)["back_cursor"] == 4
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_llm_call_cache_anchor_contexts_for_generate_and_text_chat():
+    """Online cache-anchor fix passes deterministic anchor contexts when supported."""
+    assert llm_call.build_cache_anchor_contexts("") == []
+    assert llm_call.build_cache_anchor_contexts(None) == []
+
+    anchor_a = llm_call.build_cache_anchor_contexts(
+        "Static system prompt", task="group_chronicle", as_messages=False
+    )
+    anchor_b = llm_call.build_cache_anchor_contexts(
+        "Static system prompt", task="group_chronicle", as_messages=False
+    )
+    assert anchor_a == anchor_b
+    assert len(anchor_a) == 2
+    assert anchor_a[0]["role"] == "user"
+    assert anchor_a[0]["content"].startswith("[cache_anchor task=group_chronicle prefix=")
+    assert anchor_a[1] == {"role": "assistant", "content": "OK"}
+
+    gen_calls: list[dict] = []
+
+    class CtxWithGenerate:
+        async def llm_generate(
+            self, *, chat_provider_id, prompt, system_prompt=None, contexts=None
+        ):
+            gen_calls.append(
+                {
+                    "chat_provider_id": chat_provider_id,
+                    "prompt": prompt,
+                    "system_prompt": system_prompt,
+                    "contexts": contexts,
+                }
+            )
+            return type("Resp", (), {"completion_text": "ok-gen"})()
+
+    out1 = await llm_call.call_llm(
+        CtxWithGenerate(),
+        U,
+        prompt="user payload",
+        system_prompt="Static system prompt",
+        provider_id="p1",
+    )
+    assert out1 == "ok-gen"
+    assert len(gen_calls) == 1
+    assert gen_calls[0]["contexts"] is not None
+    assert len(gen_calls[0]["contexts"]) == 2
+
+    chat_calls: list[dict] = []
+
+    class ProviderWithContexts:
+        async def text_chat(self, *, prompt, system_prompt=None, contexts=None):
+            chat_calls.append(
+                {"prompt": prompt, "system_prompt": system_prompt, "contexts": contexts}
+            )
+            return type("Resp", (), {"completion_text": "ok-chat"})()
+
+    class ProviderWithoutContexts:
+        async def text_chat(self, *, prompt, system_prompt=None):
+            chat_calls.append({"prompt": prompt, "system_prompt": system_prompt})
+            return type("Resp", (), {"completion_text": "ok-chat-legacy"})()
+
+    class CtxTextChat:
+        def __init__(self, provider):
+            self._provider = provider
+
+        def get_provider_by_id(self, pid):
+            return self._provider
+
+    out2 = await llm_call.call_llm(
+        CtxTextChat(ProviderWithContexts()),
+        U,
+        prompt="user payload",
+        system_prompt="Static system prompt",
+        provider_id="p2",
+    )
+    assert out2 == "ok-chat"
+    assert chat_calls[-1]["contexts"] == anchor_a
+
+    out3 = await llm_call.call_llm(
+        CtxTextChat(ProviderWithoutContexts()),
+        U,
+        prompt="user payload",
+        system_prompt="Static system prompt",
+        provider_id="p3",
+    )
+    assert out3 == "ok-chat-legacy"
+    assert "contexts" not in chat_calls[-1]

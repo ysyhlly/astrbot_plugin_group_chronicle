@@ -49,7 +49,7 @@ import re
 import time
 import types
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from importlib import import_module, reload
 from typing import Any
 
@@ -193,6 +193,543 @@ class GroupChroniclePlugin(Star):
             "capabilities": {"chronicle": 1, "outcomes": 1, "culture": 1},
             "api_version": 1,
         }
+
+    def _group_name_readonly(self, umo: str) -> str:
+        """Read stored group name without creating a row or opening a write txn."""
+        try:
+            with self.history.store.connection() as db:
+                row = db.execute(
+                    "SELECT name FROM groups WHERE umo=?", (umo,)
+                ).fetchone()
+            if row and row["name"]:
+                return str(row["name"])
+        except Exception:
+            pass
+        return umo
+
+    def get_series_summary(self) -> dict[str, Any]:
+        """Strictly synchronous, read-only summary for the v2 series status matrix."""
+        tz = timezone(timedelta(hours=8))
+        try:
+            if (
+                self._terminating
+                or getattr(self, "history", None) is None
+                or getattr(self, "culture", None) is None
+            ):
+                return {
+                    "badge": {"count": 0, "tone": "muted", "label": "未就绪"},
+                    "pulse": {"headline": "群文化沿革未就绪", "updated_at": ""},
+                }
+            culture_enabled = bool(self._cfg("culture_enabled", False))
+            raw_groups = self.history.store.groups()
+            allowed_umos = [
+                umo for umo in raw_groups if self.history.enabled_for(umo)
+            ]
+            pending_count = 0
+            approved_count = 0
+            latest_ts = 0.0
+            if allowed_umos:
+                placeholders = ",".join("?" for _ in allowed_umos)
+                with self.history.store.connection() as db:
+                    rows = db.execute(
+                        f"SELECT * FROM culture_entries WHERE umo IN ({placeholders}) "
+                        "AND status IN ('pending', 'disputed', 'approved')",
+                        tuple(allowed_umos),
+                    ).fetchall()
+                by_umo: dict[str, list[dict[str, Any]]] = {}
+                for row in rows:
+                    item = self.culture.store.unpack(row)
+                    by_umo.setdefault(item["umo"], []).append(item)
+                for umo, items in by_umo.items():
+                    snapshot = self.culture._privacy_snapshot(
+                        umo, {i.get("source") for i in items}
+                    )
+                    for item in items:
+                        if self.culture._is_item_blocked(item, snapshot):
+                            continue
+                        updated = float(item.get("updated") or 0)
+                        if updated > latest_ts:
+                            latest_ts = updated
+                        if item["status"] in ("pending", "disputed"):
+                            pending_count += 1
+                        elif item["status"] == "approved":
+                            approved_count += 1
+            updated_at = (
+                datetime.fromtimestamp(latest_ts, tz).isoformat(timespec="seconds")
+                if latest_ts > 0
+                else ""
+            )
+            if pending_count > 0:
+                badge = {
+                    "count": pending_count,
+                    "tone": "warm",
+                    "label": f"{pending_count} 条待核",
+                }
+                headline = (
+                    f"{pending_count} 条待审核/纠正 · 已公开 {approved_count} 条"
+                )
+            else:
+                badge = {
+                    "count": 0,
+                    "tone": "accent",
+                    "label": (
+                        f"已收录 {approved_count} 条"
+                        if approved_count > 0
+                        else "无待核"
+                    ),
+                }
+                if approved_count > 0:
+                    headline = f"已公开 {approved_count} 条文化词条 · 覆盖 {len(allowed_umos)} 个群"
+                elif not culture_enabled:
+                    headline = "群文化整理未开启 · 可在插件配置中启用"
+                else:
+                    headline = f"已就绪 · 监听 {len(allowed_umos)} 个群聊"
+            return {
+                "badge": badge,
+                "pulse": {"headline": headline, "updated_at": updated_at},
+            }
+        except Exception:
+            return {
+                "badge": {"count": 0, "tone": "muted", "label": "暂不可用"},
+                "pulse": {"headline": "群文化状态暂不可用", "updated_at": ""},
+            }
+
+    async def get_series_scope_status(self, umo: str) -> dict[str, Any]:
+        """Read-only per-group status for the Chat Dynamics control matrix."""
+        tz = timezone(timedelta(hours=8))
+        try:
+            clean_umo = str(umo or "").strip()
+            persona_id = str(self._cfg("persona_id", "") or "")
+            if (
+                not clean_umo
+                or self._terminating
+                or getattr(self, "history", None) is None
+                or getattr(self, "culture", None) is None
+            ):
+                return {
+                    "enabled": False,
+                    "supported": False,
+                    "persona_id": persona_id,
+                    "activity_today": 0,
+                    "summary": "群文化服务未就绪",
+                    "version": 0,
+                }
+            history_allowed = await self.history.allowed(clean_umo)
+            culture_global = bool(self._cfg("culture_enabled", False))
+            today = datetime.now(tz).date()
+            day_start = datetime(
+                today.year, today.month, today.day, tzinfo=tz
+            ).timestamp()
+
+            def _read_scope():
+                state = self.culture.store.state(clean_umo)
+                entries, _ = self.culture.store.entries(clean_umo, limit=1000)
+                snapshot = (
+                    self.culture._privacy_snapshot(
+                        clean_umo, {i.get("source") for i in entries}
+                    )
+                    if entries
+                    else None
+                )
+                approved = 0
+                pending = 0
+                activity_today = 0
+                for item in entries:
+                    if item["status"] not in ("approved", "pending", "disputed"):
+                        continue
+                    if snapshot is not None and self.culture._is_item_blocked(
+                        item, snapshot
+                    ):
+                        continue
+                    if item["status"] == "approved":
+                        approved += 1
+                    else:
+                        pending += 1
+                    if float(item.get("updated") or 0) >= day_start:
+                        activity_today += 1
+                with self.history.store.connection() as db:
+                    row = db.execute(
+                        "SELECT COUNT(*) FROM reports WHERE umo=? AND invalid=0 AND created>=?",
+                        (clean_umo, day_start),
+                    ).fetchone()
+                    if row:
+                        activity_today += int(row[0] or 0)
+                return state, approved, pending, activity_today
+
+            state, approved, pending, activity_today = await asyncio.to_thread(
+                _read_scope
+            )
+            paused = bool(state.get("paused", 0))
+            version = int(state.get("revision", 0))
+            if not history_allowed:
+                return {
+                    "enabled": False,
+                    "supported": False,
+                    "persona_id": persona_id,
+                    "activity_today": activity_today,
+                    "summary": "不在允许群范围",
+                    "version": version,
+                }
+            if not culture_global:
+                return {
+                    "enabled": False,
+                    "supported": False,
+                    "persona_id": persona_id,
+                    "activity_today": activity_today,
+                    "summary": "全局群文化整理未开启",
+                    "version": version,
+                }
+            enabled = not paused
+            summary = (
+                f"已暂停整理 · 已公开 {approved} / 待核 {pending}"
+                if paused
+                else f"运行中 · 已公开 {approved} / 待核 {pending}"
+            )
+            return {
+                "enabled": enabled,
+                "supported": True,
+                "persona_id": persona_id,
+                "activity_today": activity_today,
+                "summary": summary,
+                "version": version,
+            }
+        except Exception:
+            return {
+                "enabled": None,
+                "supported": False,
+                "persona_id": "",
+                "activity_today": None,
+                "summary": "状态读取失败",
+                "version": 0,
+            }
+
+    async def set_series_scope_enabled(
+        self, umo: str, enabled: bool, expected_version: Any = None
+    ) -> dict[str, Any]:
+        """Safely toggle per-group culture pause/resume without bypassing allowlist."""
+        try:
+            clean_umo = str(umo or "").strip()
+            if (
+                not clean_umo
+                or self._terminating
+                or getattr(self, "history", None) is None
+                or getattr(self, "culture", None) is None
+            ):
+                return {
+                    "ok": False,
+                    "enabled": False,
+                    "version": 0,
+                    "summary": "群文化服务未就绪",
+                }
+            if not await self.history.allowed(clean_umo) or not bool(
+                self._cfg("culture_enabled", False)
+            ):
+                state = await asyncio.to_thread(self.culture.store.state, clean_umo)
+                return {
+                    "ok": False,
+                    "enabled": False,
+                    "version": int(state.get("revision", 0)),
+                    "summary": "当前群不在允许范围或全局群文化未启用",
+                }
+            target_paused = 0 if bool(enabled) else 1
+
+            def _toggle():
+                with self.history.store.connection(write=True) as db:
+                    row = db.execute(
+                        "SELECT revision, paused FROM culture_groups WHERE umo=?",
+                        (clean_umo,),
+                    ).fetchone()
+                    cur_rev = int(row["revision"]) if row else 0
+                    cur_paused = bool(row["paused"]) if row else False
+                    if expected_version is not None and str(cur_rev) != str(
+                        expected_version
+                    ):
+                        return False, True, not cur_paused, cur_rev
+                    self.culture.store.bump(db, clean_umo)
+                    db.execute(
+                        "UPDATE culture_groups SET paused=? WHERE umo=?",
+                        (target_paused, clean_umo),
+                    )
+                    after = db.execute(
+                        "SELECT revision, paused FROM culture_groups WHERE umo=?",
+                        (clean_umo,),
+                    ).fetchone()
+                    return (
+                        True,
+                        False,
+                        not bool(after["paused"]),
+                        int(after["revision"]),
+                    )
+
+            ok, conflict, now_enabled, new_rev = await asyncio.to_thread(_toggle)
+            if conflict:
+                return {
+                    "ok": False,
+                    "conflict": True,
+                    "enabled": now_enabled,
+                    "version": new_rev,
+                    "summary": "状态已变更，请刷新重试",
+                }
+            self.history.cancel_operations(clean_umo)
+            try:
+                mod_name = (
+                    f"{__package__}.series_panels" if __package__ else "series_panels"
+                )
+                import_module(mod_name).invalidate_summary_cache(
+                    "astrbot_plugin_group_chronicle"
+                )
+            except Exception:
+                pass
+            return {
+                "ok": ok,
+                "enabled": now_enabled,
+                "version": new_rev,
+                "summary": "运行中" if now_enabled else "已暂停整理",
+            }
+        except Exception:
+            return {
+                "ok": False,
+                "enabled": False,
+                "version": 0,
+                "summary": "切换群文化状态失败",
+            }
+
+    async def series_search_items(
+        self, query: str, scope: str = "", limit: int = 8
+    ) -> list[dict[str, Any]]:
+        """Read-only search over non-hidden/non-blocked culture entries for Ctrl+K."""
+        try:
+            if (
+                self._terminating
+                or getattr(self, "history", None) is None
+                or getattr(self, "culture", None) is None
+            ):
+                return []
+            q = str(query or "").strip()[:160]
+            if not q:
+                return []
+            bound = max(1, min(int(limit or 8), 20))
+            clean_scope = str(scope or "").strip()
+            if clean_scope:
+                umos = [clean_scope] if await self.history.allowed(clean_scope) else []
+            else:
+                raw_groups = await asyncio.to_thread(self.history.store.groups)
+                umos = [u for u in raw_groups if await self.history.allowed(u)]
+            if not umos:
+                return []
+            status_labels = {
+                "approved": "已公开",
+                "pending": "待审核",
+                "disputed": "待纠正",
+            }
+
+            def _load_scope_candidates(umo: str):
+                token = self.culture.token(umo)
+                items, _ = self.culture.store.entries(umo, query=q, limit=bound * 2)
+                if not items:
+                    return token, "", []
+                group_name = self._group_name_readonly(umo)
+                snapshot = self.culture._privacy_snapshot(
+                    umo, {i.get("source") for i in items}
+                )
+                candidates = [
+                    item
+                    for item in items
+                    if item["status"] in ("approved", "pending", "disputed")
+                    and not self.culture._is_item_blocked(item, snapshot)
+                ]
+                return token, group_name, candidates
+
+            hits: list[tuple[float, dict[str, Any]]] = []
+            for umo in umos:
+                token, group_name, candidates = await asyncio.to_thread(
+                    _load_scope_candidates, umo
+                )
+                if not candidates:
+                    continue
+                flags = await self.culture._batch_valid_sources(umo, candidates)
+                if (
+                    not await self.history.allowed(umo)
+                    or await asyncio.to_thread(self.culture.token, umo) != token
+                ):
+                    continue
+                for item, is_valid in zip(candidates, flags):
+                    if not is_valid:
+                        continue
+                    status_label = status_labels.get(item["status"], item["status"])
+                    meaning = str(item.get("meaning") or "").strip()[:80]
+                    hits.append(
+                        (
+                            float(item.get("updated") or 0),
+                            {
+                                "kind": "culture_entry",
+                                "title": f"#{item['id']} {item['name']}",
+                                "subtitle": f"{group_name} · {status_label} · {meaning}",
+                                "plugin_id": "astrbot_plugin_group_chronicle",
+                                "page": "culture",
+                                "deep_link": {
+                                    "scope": umo,
+                                    "tab": (
+                                        "review"
+                                        if item["status"] in ("pending", "disputed")
+                                        else "library"
+                                    ),
+                                    "entry_id": item["id"],
+                                },
+                            },
+                        )
+                    )
+            hits.sort(key=lambda pair: pair[0], reverse=True)
+            return [entry for _, entry in hits[:bound]]
+        except Exception:
+            return []
+
+    async def get_journal_events(
+        self,
+        persona: str = "",
+        scope: str = "",
+        date: str = "today",
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Read-only daily culture & chronicle edition events for World's Living Journal."""
+        tz = timezone(timedelta(hours=8))
+        try:
+            if (
+                self._terminating
+                or getattr(self, "history", None) is None
+                or getattr(self, "culture", None) is None
+            ):
+                return []
+            bound = max(1, min(int(limit or 20), 50))
+            raw_date = str(date or "today").strip()
+            if not raw_date or raw_date == "today":
+                target_day = datetime.now(tz).date()
+            else:
+                try:
+                    target_day = datetime.strptime(raw_date[:10], "%Y-%m-%d").date()
+                except ValueError:
+                    target_day = datetime.now(tz).date()
+            day_start = datetime(
+                target_day.year, target_day.month, target_day.day, tzinfo=tz
+            ).timestamp()
+            day_end = day_start + 86400.0
+            clean_scope = str(scope or "").strip()
+            if clean_scope:
+                umos = [clean_scope] if await self.history.allowed(clean_scope) else []
+            else:
+                raw_groups = await asyncio.to_thread(self.history.store.groups)
+                umos = [u for u in raw_groups if await self.history.allowed(u)]
+            if not umos:
+                return []
+
+            def _load_scope_journal_inputs(umo: str):
+                token = self.culture.token(umo)
+                group_name = self._group_name_readonly(umo)
+                items, _ = self.culture.store.entries(umo, limit=200)
+                candidates: list[dict[str, Any]] = []
+                if items:
+                    snapshot = self.culture._privacy_snapshot(
+                        umo, {i.get("source") for i in items}
+                    )
+                    for item in items:
+                        if item["status"] not in (
+                            "approved",
+                            "pending",
+                            "disputed",
+                        ):
+                            continue
+                        ts = float(item.get("updated") or 0)
+                        if not (day_start <= ts < day_end):
+                            continue
+                        if self.culture._is_item_blocked(item, snapshot):
+                            continue
+                        candidates.append(item)
+                try:
+                    editions = self.history.editions.list(umo)
+                except Exception:
+                    editions = []
+                return token, group_name, candidates, editions
+
+            events: list[tuple[float, dict[str, Any]]] = []
+            for umo in umos:
+                token, group_name, candidates, editions = await asyncio.to_thread(
+                    _load_scope_journal_inputs, umo
+                )
+                if candidates:
+                    flags = await self.culture._batch_valid_sources(umo, candidates)
+                    if (
+                        await self.history.allowed(umo)
+                        and await asyncio.to_thread(self.culture.token, umo) == token
+                    ):
+                        for item, is_valid in zip(candidates, flags):
+                            if not is_valid:
+                                continue
+                            ts = float(item.get("updated") or 0)
+                            is_pending = item["status"] in ("pending", "disputed")
+                            events.append(
+                                (
+                                    ts,
+                                    {
+                                        "id": f"culture:{umo}:{item['id']}:r{item['revision']}",
+                                        "category": "group_chronicle",
+                                        "source_label": "群文化沿革",
+                                        "tone": "warm" if is_pending else "accent",
+                                        "occurred_at": datetime.fromtimestamp(
+                                            ts, tz
+                                        ).isoformat(timespec="seconds"),
+                                        "title": (
+                                            f"待核群文化「{item['name']}」"
+                                            if is_pending
+                                            else f"收录群文化「{item['name']}」"
+                                        ),
+                                        "subtitle": f"{group_name} · {str(item.get('meaning') or '')[:90]}",
+                                        "target_plugin": "astrbot_plugin_group_chronicle",
+                                        "target_route": "culture",
+                                        "target_id": str(item["id"]),
+                                    },
+                                )
+                            )
+                if not await self.history.allowed(umo):
+                    continue
+                for ed in editions:
+                    ts = float(ed.get("created_at") or 0)
+                    if not (day_start <= ts < day_end):
+                        continue
+                    ed_id = str(
+                        ed.get("report_id") or ed.get("cache_key") or int(ts)
+                    )
+                    ed_title = str(ed.get("title") or "").strip()
+                    raw_text = str(
+                        ed.get("summary") or ed.get("text") or ""
+                    ).strip()
+                    preview = " ".join(raw_text.split())[:90]
+                    events.append(
+                        (
+                            ts,
+                            {
+                                "id": f"edition:{umo}:{ed_id}",
+                                "category": "group_chronicle",
+                                "source_label": "群文化沿革",
+                                "tone": "info",
+                                "occurred_at": datetime.fromtimestamp(
+                                    ts, tz
+                                ).isoformat(timespec="seconds"),
+                                "title": (
+                                    f"群史记 · {ed_title}"
+                                    if ed_title
+                                    else f"生成群史记 · {group_name}"
+                                ),
+                                "subtitle": preview or f"{group_name} 群史记已归档",
+                                "target_plugin": "astrbot_plugin_group_chronicle",
+                                "target_route": "culture",
+                                "target_id": ed_id,
+                            },
+                        )
+                    )
+            events.sort(key=lambda pair: pair[0], reverse=True)
+            return [ev for _, ev in events[:bound]]
+        except Exception:
+            return []
 
     async def record_valuable_outcome(
         self, umo: str, outcome: dict[str, Any]
