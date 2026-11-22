@@ -18,6 +18,22 @@ from .lifetime import GROUP_PATTERN, KINDS, RISK_WORDS, scope_lists
 
 HISTORY_TIMEZONE = timezone(timedelta(hours=8))
 
+try:
+    from ..series_panels import resolve_series_timezone
+except ImportError:
+    try:
+        from series_panels import resolve_series_timezone
+    except Exception:  # pragma: no cover - standalone fallback
+        def resolve_series_timezone(
+            _context, explicit_tz: str = "", default_tz: str = "Asia/Shanghai"
+        ):
+            _ = explicit_tz, default_tz
+            return HISTORY_TIMEZONE
+
+
+def _history_tz(plugin):
+    return resolve_series_timezone(getattr(plugin, "context", None))
+
 COMMANDS = (
     "群大事",
     "人物等级",
@@ -222,6 +238,7 @@ async def handle_command(service, event, supplied=None):
                 return "暂无已入史的大事。" + await asyncio.to_thread(
                     service.coverage, umo
                 )
+            tz = _history_tz(plugin)
             lines = ["本群大事记："]
             for fact in facts:
                 names = "、".join(p["name"] for p in fact["participants"])
@@ -231,11 +248,11 @@ async def handle_command(service, event, supplied=None):
                     "declared": "发生于（人工记载）",
                 }.get(fact.get("date_basis"), "见载于")
                 lines.append(
-                    f"#{fact['id']} {date_label}{datetime.fromtimestamp(fact['event_at'], HISTORY_TIMEZONE):%Y-%m-%d} {fact['title']}（{names}）\n{fact['detail']}"
+                    f"#{fact['id']} {date_label}{datetime.fromtimestamp(fact['event_at'], tz):%Y-%m-%d} {fact['title']}（{names}）\n{fact['detail']}"
                 )
                 for update in fact.get("followups", []):
                     lines.append(
-                        f"  续记 {datetime.fromtimestamp(update['event_at'], HISTORY_TIMEZONE):%Y-%m-%d}：{update['detail']}"
+                        f"  续记 {datetime.fromtimestamp(update['event_at'], tz):%Y-%m-%d}：{update['detail']}"
                     )
             lines.append(await asyncio.to_thread(service.coverage, umo))
             return "\n".join(lines)
@@ -276,7 +293,7 @@ async def handle_command(service, event, supplied=None):
                 )
             )
         if command == "史记进度":
-            day = datetime.now(HISTORY_TIMEZONE).date().isoformat()
+            day = datetime.now(_history_tz(plugin)).date().isoformat()
 
             def _load_progress_info():
                 return (
@@ -367,16 +384,17 @@ async def handle_command(service, event, supplied=None):
                 event_at, date_basis = time.time(), "recorded"
                 if len(fields) > 1 and re.match(r"^\s*日期[=＝]", fields[-1]):
                     date_text = re.split(r"[=＝]", fields.pop(), maxsplit=1)[1].strip()
+                    tz = _history_tz(plugin)
                     try:
                         date = datetime.strptime(date_text, "%Y-%m-%d").replace(
-                            tzinfo=HISTORY_TIMEZONE
+                            tzinfo=tz
                         )
                     except ValueError:
                         return "日期格式应为 YYYY-MM-DD。"
                     if (
                         date.year < 1970
                         or date.date()
-                        > datetime.now(HISTORY_TIMEZONE).date()
+                        > datetime.now(tz).date()
                     ):
                         return "日期必须是1970年之后且不能晚于今天。"
                     event_at, date_basis = date.timestamp(), "declared"

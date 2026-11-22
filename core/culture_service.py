@@ -6,7 +6,7 @@ import asyncio
 import inspect
 import json
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from . import lm_bridge
 from .archive_store import encode, private_text
@@ -324,7 +324,7 @@ class CultureService:
                     or not await asyncio.to_thread(_pre_llm_ok)
                 ):
                     return False
-                day = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
+                day = datetime.now(self.history._series_tz()).date().isoformat()
                 raw_limit = self.plugin._cfg("history_daily_limit", 20)
                 daily_limit = max(0, int(20 if raw_limit is None else raw_limit))
                 reserved = daily_limit // 2 if daily_limit >= 2 else 0

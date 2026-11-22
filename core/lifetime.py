@@ -10,6 +10,22 @@ import math
 import re
 import time
 from datetime import datetime, timedelta, timezone
+
+try:
+    from ..series_panels import is_series_group_excluded, resolve_series_timezone
+except ImportError:
+    try:
+        from series_panels import is_series_group_excluded, resolve_series_timezone
+    except Exception:  # pragma: no cover - standalone fallback
+        def is_series_group_excluded(_context, umo: str = "", group_id: str = "") -> bool:
+            _ = umo, group_id
+            return False
+
+        def resolve_series_timezone(
+            _context, explicit_tz: str = "", default_tz: str = "Asia/Shanghai"
+        ):
+            _ = explicit_tz, default_tz
+            return timezone(timedelta(hours=8))
 from functools import wraps
 from pathlib import Path
 
@@ -572,6 +588,9 @@ class HistoryService:
         self.bot_ids = {}
         self.operations = {}
 
+    def _series_tz(self):
+        return resolve_series_timezone(getattr(self.plugin, "context", None))
+
     def enabled_for(self, umo):
         """Apply the validated group scope without treating invalid lists as empty.
 
@@ -585,6 +604,7 @@ class HistoryService:
             not self.plugin._cfg("history_enabled", True)
             or not isinstance(umo, str)
             or not GROUP_PATTERN.fullmatch(umo)
+            or is_series_group_excluded(getattr(self.plugin, "context", None), umo=umo)
         ):
             return False
         try:
@@ -954,7 +974,7 @@ class HistoryService:
 
                 sort_keys = await asyncio.to_thread(_group_sort_keys)
                 groups.sort(key=lambda umo: sort_keys.get(umo, 0))
-                day = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
+                day = datetime.now(self._series_tz()).date().isoformat()
                 raw_limit = self.plugin._cfg("history_daily_limit", 20)
                 daily_limit = max(0, int(20 if raw_limit is None else raw_limit))
                 cycle_budget = (
@@ -1203,7 +1223,7 @@ class HistoryService:
                         or await asyncio.to_thread(self.privacy_key, umo) != privacy
                     ):
                         return False
-                    day = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
+                    day = datetime.now(self._series_tz()).date().isoformat()
                     if not await asyncio.to_thread(
                         self.store.consume_quota,
                         day,

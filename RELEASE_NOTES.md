@@ -1,4 +1,10 @@
-# astrbot_plugin_group_chronicle v0.3.0-rc.7
+# astrbot_plugin_group_chronicle v0.3.0-rc.8
+
+## v0.3.0-rc.8 — 2026-11-22
+
+- 接入全系列共享 `ProviderBudget` 并发池与遥测上报（`core/llm_call.py` 走 `series_llm_call`，队列繁忙时平滑降级不阻塞主控群聊）。
+- 下沉主控共享配置（SSOT）：史记日界与手账统一解析共享时区；默认模型支持主控 `reply_provider` 兜底；全面联动 `exclude_groups` 排除护栏及 `quiet_hours` 定时群报抑制。
+- 同步按语言拆包的 `series-messages.js` 轻加载器（`series-messages-{en,ja,ru}.js` 按需懒加载）及统一 `series_panels.py`。
 
 ## v0.3.0-rc.7 — 2026-11-21
 

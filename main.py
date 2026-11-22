@@ -207,9 +207,39 @@ class GroupChroniclePlugin(Star):
             pass
         return umo
 
+    def _series_panels_mod(self):
+        name = f"{__package__}.series_panels" if __package__ else "series_panels"
+        try:
+            return import_module(name)
+        except Exception:
+            return None
+
+    def _series_tz(self):
+        mod = self._series_panels_mod()
+        if mod is not None and callable(getattr(mod, "resolve_series_timezone", None)):
+            return mod.resolve_series_timezone(getattr(self, "context", None))
+        return timezone(timedelta(hours=8))
+
+    def _is_excluded_by_core(self, umo: str) -> bool:
+        clean = str(umo or "").strip()
+        if not clean:
+            return False
+        mod = self._series_panels_mod()
+        if mod is not None and callable(getattr(mod, "is_series_group_excluded", None)):
+            return bool(
+                mod.is_series_group_excluded(getattr(self, "context", None), umo=clean)
+            )
+        return False
+
+    def _in_series_quiet_hours(self) -> bool:
+        mod = self._series_panels_mod()
+        if mod is not None and callable(getattr(mod, "is_series_in_quiet_hours", None)):
+            return bool(mod.is_series_in_quiet_hours(getattr(self, "context", None)))
+        return False
+
     def get_series_summary(self) -> dict[str, Any]:
         """Strictly synchronous, read-only summary for the v2 series status matrix."""
-        tz = timezone(timedelta(hours=8))
+        tz = self._series_tz()
         try:
             if (
                 self._terminating
@@ -296,7 +326,7 @@ class GroupChroniclePlugin(Star):
 
     async def get_series_scope_status(self, umo: str) -> dict[str, Any]:
         """Read-only per-group status for the Chat Dynamics control matrix."""
-        tz = timezone(timedelta(hours=8))
+        tz = self._series_tz()
         try:
             clean_umo = str(umo or "").strip()
             persona_id = str(self._cfg("persona_id", "") or "")
@@ -361,10 +391,21 @@ class GroupChroniclePlugin(Star):
             )
             paused = bool(state.get("paused", 0))
             version = int(state.get("revision", 0))
+            if self._is_excluded_by_core(clean_umo):
+                return {
+                    "enabled": False,
+                    "supported": False,
+                    "excluded_by_core": True,
+                    "persona_id": persona_id,
+                    "activity_today": activity_today,
+                    "summary": "主控排除（群文化与史记采集已静默跳过）",
+                    "version": version,
+                }
             if not history_allowed:
                 return {
                     "enabled": False,
                     "supported": False,
+                    "excluded_by_core": False,
                     "persona_id": persona_id,
                     "activity_today": activity_today,
                     "summary": "不在允许群范围",
@@ -420,6 +461,15 @@ class GroupChroniclePlugin(Star):
                     "enabled": False,
                     "version": 0,
                     "summary": "群文化服务未就绪",
+                }
+            if self._is_excluded_by_core(clean_umo):
+                state = await asyncio.to_thread(self.culture.store.state, clean_umo)
+                return {
+                    "ok": False,
+                    "enabled": False,
+                    "excluded_by_core": True,
+                    "version": int(state.get("revision", 0)),
+                    "summary": "主控排除（当前群已被主控排除）",
                 }
             if not await self.history.allowed(clean_umo) or not bool(
                 self._cfg("culture_enabled", False)
@@ -592,7 +642,7 @@ class GroupChroniclePlugin(Star):
         limit: int = 20,
     ) -> list[dict[str, Any]]:
         """Read-only daily culture & chronicle edition events for World's Living Journal."""
-        tz = timezone(timedelta(hours=8))
+        tz = self._series_tz()
         try:
             if (
                 self._terminating
@@ -790,7 +840,12 @@ class GroupChroniclePlugin(Star):
             logger.warning("cron_manager 未暴露 scheduler, 无法注册每周定时推送")
             return
 
-        trigger = CronTrigger(day_of_week=str(weekday), hour=hour, minute=minute)
+        trigger = CronTrigger(
+            day_of_week=str(weekday),
+            hour=hour,
+            minute=minute,
+            timezone=self._series_tz(),
+        )
         add_kwargs = {
             "trigger": trigger,
             "id": self._weekly_job_id,
@@ -1680,14 +1735,11 @@ class GroupChroniclePlugin(Star):
         """插件配置的 LLM Provider ID; 空字符串时只读继承 Chat Dynamics 默认回复模型。"""
         pid = str(self._cfg("llm_provider_id", "") or "").strip()
         if not pid:
-            try:
-                if __package__:
-                    from .series_panels import inherit_provider
-                else:
-                    from series_panels import inherit_provider
-                pid = inherit_provider("", getattr(self, "context", None), role="reply")
-            except ImportError:
-                pid = ""
+            mod = self._series_panels_mod()
+            if mod is not None and callable(getattr(mod, "resolve_series_provider", None)):
+                pid = mod.resolve_series_provider(
+                    getattr(self, "context", None), "", role="reply"
+                )
         return pid or None
 
     async def _lm_and_gather(
@@ -2828,11 +2880,17 @@ class GroupChroniclePlugin(Star):
                 logger.warning(f"每周推送配置热加载失败 (忽略): {e}")
         if not self._cfg("enable_weekly_push", False):
             return
+        if self._in_series_quiet_hours():
+            logger.info("当前处于群间系列静默时段，跳过本次每周史记定时推送")
+            return
         groups = self._cfg("push_groups", []) or []
         logger.info(f"每周史记推送开始, 目标群数: {len(groups)}")
         for umo in groups:
             if self._terminating:
                 break
+            if self._is_excluded_by_core(str(umo)):
+                logger.info(f"该群已被主控排除，跳过每周史记推送: {umo}")
+                continue
             try:
                 await self._weekly_push_one(str(umo))
             except NoActivityError as e:

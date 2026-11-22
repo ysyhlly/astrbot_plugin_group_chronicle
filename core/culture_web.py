@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
 from . import lm_bridge
 from .archive_store import encode
@@ -235,7 +235,7 @@ class CultureWeb:
                 raise ValueError("后台正在整理，请稍后再验证")
             async with lock:
                 key = "history_daily_limit"
-                day = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
+                day = datetime.now(self.service.history._series_tz()).date().isoformat()
                 before = await asyncio.to_thread(self.service.history.store.quota, day)
                 steps = []
                 try:

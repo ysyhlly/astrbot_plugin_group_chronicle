@@ -23,6 +23,48 @@ import json
 
 from astrbot.api import logger
 
+try:
+    from ..series_panels import (
+        is_provider_budget_busy_error,
+        resolve_series_provider,
+        series_llm_call,
+    )
+except ImportError:
+    try:
+        from series_panels import (
+            is_provider_budget_busy_error,
+            resolve_series_provider,
+            series_llm_call,
+        )
+    except Exception:  # pragma: no cover - standalone fallback
+        def is_provider_budget_busy_error(_exc: BaseException | None) -> bool:
+            return False
+
+        def resolve_series_provider(
+            _context,
+            explicit_provider: str = "",
+            fallback_provider: str = "",
+            *,
+            role: str = "reply",
+        ) -> str:
+            _ = role
+            return (
+                str(explicit_provider or "").strip()
+                or str(fallback_provider or "").strip()
+            )
+
+        async def series_llm_call(
+            _context,
+            _provider_id: str,
+            _plugin_id: str,
+            _purpose: str,
+            invoke,
+            *,
+            acquire_timeout: float | None = 15.0,
+        ):
+            _ = acquire_timeout
+            return await invoke()
+
 _RETRY_ATTEMPTS = 2  # 首次 + 1 次重试
 _RETRY_SLEEP_SECONDS = 1.0
 
@@ -102,7 +144,7 @@ async def call_llm(
     Raises:
         LLMUnavailableError: 所有路径均失败且重试后仍失败。
     """
-    configured = (provider_id or "").strip() or None
+    configured = resolve_series_provider(context, provider_id or "", role="reply") or None
     # Apply a final budget across every generation path, including custom prompts.
     # Normalize CRLF -> LF on system_prompt so prefix hashes stay byte-identical.
     system_prompt = (
@@ -116,6 +158,9 @@ async def call_llm(
         try:
             text = await _try_call_once(context, umo, prompt, system_prompt, configured)
         except Exception as e:  # noqa: BLE001
+            if is_provider_budget_busy_error(e):
+                logger.warning(f"[llm_call] 共享模型队列繁忙，放弃重试并延后: {e}")
+                raise LLMUnavailableError("共享模型队列繁忙，已延后本次生成") from e
             last_exc = e
             logger.warning(
                 f"[llm_call] LLM 调用失败 (第 {attempt}/{_RETRY_ATTEMPTS} 次), "
@@ -217,7 +262,13 @@ async def _try_llm_generate(
         )
         if anchor_contexts and _accepts_kwarg(llm_generate, "contexts"):
             gen_kwargs["contexts"] = anchor_contexts
-        resp = await llm_generate(**gen_kwargs)
+        resp = await series_llm_call(
+            context,
+            provider_id,
+            "astrbot_plugin_group_chronicle",
+            "group_chronicle",
+            lambda: llm_generate(**gen_kwargs),
+        )
         if resp is None:
             return None
         text = getattr(resp, "completion_text", None)
@@ -225,6 +276,8 @@ async def _try_llm_generate(
             return None
         return text
     except Exception as e:  # noqa: BLE001
+        if is_provider_budget_busy_error(e):
+            raise
         logger.warning(f"[llm_call] llm_generate 调用失败, 将尝试旧接口回退: {e}")
         return None
 
@@ -277,11 +330,29 @@ async def _try_provider_text_chat(
         )
         if anchor_contexts and _accepts_kwarg(text_chat, "contexts"):
             chat_kwargs["contexts"] = anchor_contexts
-        resp = await text_chat(**chat_kwargs)
+        label = (
+            str(key or "").strip()
+            if by_id
+            else str(
+                getattr(getattr(provider, "meta", None), "id", None)
+                or getattr(provider, "provider_id", None)
+                or getattr(provider, "id", None)
+                or "default"
+            ).strip()
+        )
+        resp = await series_llm_call(
+            context,
+            label or "default",
+            "astrbot_plugin_group_chronicle",
+            "group_chronicle",
+            lambda: text_chat(**chat_kwargs),
+        )
         if resp is None:
             return None
         text = resp if isinstance(resp, str) else getattr(resp, "completion_text", None)
         return text if isinstance(text, str) and text.strip() else None
     except Exception as e:  # noqa: BLE001
+        if is_provider_budget_busy_error(e):
+            raise
         logger.warning(f"[llm_call] text_chat 失败: {e}")
         return None
