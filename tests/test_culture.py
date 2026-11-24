@@ -174,7 +174,12 @@ async def test_failed_extraction_and_quota_never_advance(culture, monkeypatch):
         assert not await culture.step(U, "back")
         assert culture.store.job(U)["back_cursor"] == 0
         assert culture.store.job(U)["error"]
+        # Failed call_llm refunds daily quota so transient errors do not drain quota.
+        day_str = __import__("datetime").datetime.now(culture.history._series_tz()).date().isoformat()
+        assert culture.history.store.quota(day_str) == 0
+        # When daily quota is exhausted, process_one does not invoke LLM or advance.
         culture.plugin.config["history_daily_limit"] = 1
+        assert culture.history.store.consume_quota(day_str, 1, kind="history")
         assert not await culture.process_one(U)
         assert model.await_count == 1
         assert culture.store.entries(U)[1] == 0

@@ -25,6 +25,7 @@ from astrbot.api import logger
 
 try:
     from ..series_panels import (
+        find_provider_silently,
         is_provider_budget_busy_error,
         resolve_series_provider,
         series_llm_call,
@@ -32,11 +33,17 @@ try:
 except ImportError:
     try:
         from series_panels import (
+            find_provider_silently,
             is_provider_budget_busy_error,
             resolve_series_provider,
             series_llm_call,
         )
     except Exception:  # pragma: no cover - standalone fallback
+        def find_provider_silently(context, provider_id: str, *, allow_fallback: bool = False):
+            _ = allow_fallback
+            getter = getattr(context, "get_provider_by_id", None)
+            return getter(provider_id) if callable(getter) else None
+
         def is_provider_budget_busy_error(_exc: BaseException | None) -> bool:
             return False
 
@@ -122,6 +129,120 @@ class LLMUnavailableError(Exception):
     """未配置可用的 LLM: 所有调用路径均不可用。"""
 
 
+class _ProviderExecutionError(Exception):
+    """显式配置的 Provider 存在但执行失败（超时/5xx/429/策略拒绝/空响应），禁止静默回退主聊模型。"""
+
+    def __init__(self, message: str, *, retryable: bool = True) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def _is_missing_error(exc: BaseException) -> bool:
+    """Distinguish missing provider/API errors from runtime execution failures."""
+    if isinstance(exc, (AttributeError, TypeError, NotImplementedError, LookupError)):
+        return True
+    name = type(exc).__name__.lower()
+    msg = str(exc).lower()
+    if "notfound" in name or "not_found" in name:
+        return True
+    return any(
+        token in msg
+        for token in (
+            "provider not found",
+            "unknown provider",
+            "invalid provider",
+            "未找到 provider",
+            "未找到提供商",
+            "provider 不存在",
+            "提供商不存在",
+        )
+    )
+
+
+def _is_non_retryable_text(text: str) -> bool:
+    msg = str(text or "").lower()
+    return any(
+        token in msg
+        for token in (
+            "content_filter",
+            "content filter",
+            "safety",
+            "policy",
+            "moderation",
+            "refused",
+            "blocked",
+            "unauthorized",
+            "forbidden",
+            "401",
+            "403",
+            "timed out",
+            "timeout",
+        )
+    )
+
+
+def _is_non_retryable_error(exc: BaseException) -> bool:
+    """Identify execution failures that should not be amplified via retries."""
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    name = type(exc).__name__.lower()
+    if any(k in name for k in ("timeout", "policy", "safety", "moderation")):
+        return True
+    return _is_non_retryable_text(str(exc))
+
+
+def is_budget_busy_error(exc: BaseException | None) -> bool:
+    """Return True if *exc* or its direct cause is a ProviderBudgetBusyError."""
+    cur = exc
+    seen: set[int] = set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if is_provider_budget_busy_error(cur):
+            return True
+        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+    return False
+
+
+def budget_busy_retry_after(exc: BaseException | None) -> float:
+    """Extract structured retry_after seconds from a busy error chain."""
+    cur = exc
+    seen: set[int] = set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        val = float(getattr(cur, "retry_after", 0.0) or 0.0)
+        if val > 0:
+            return val
+        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+    return 0.0
+
+
+def _is_error_response(resp) -> bool:
+    return str(getattr(resp, "role", "") or "").strip().lower() == "err"
+
+
+async def _lookup_provider_by_id(context, provider_id: str) -> tuple[bool | None, object | None]:
+    """Return ``(exists_or_unknown, provider_obj)`` without cold-start WARN spam."""
+    if not provider_id or context is None:
+        return None, None
+    pm = getattr(context, "provider_manager", None)
+    if pm is not None:
+        prov = find_provider_silently(context, provider_id, allow_fallback=False)
+        return (True, prov) if prov is not None else (False, None)
+    getter = getattr(context, "get_provider_by_id", None)
+    if not callable(getter):
+        return None, None
+    try:
+        prov = getter(provider_id)
+        if inspect.isawaitable(prov):
+            prov = await prov
+    except Exception as exc:  # noqa: BLE001
+        if _is_missing_error(exc):
+            return False, None
+        logger.warning(f"[llm_call] get_provider_by_id('{provider_id}') 失败: {exc}")
+        return None, None
+    return (True, prov) if prov is not None else (False, None)
+
+
 async def call_llm(
     context,
     umo: str,
@@ -144,6 +265,7 @@ async def call_llm(
     Raises:
         LLMUnavailableError: 所有路径均失败且重试后仍失败。
     """
+    explicit_configured = bool(str(provider_id or "").strip())
     configured = resolve_series_provider(context, provider_id or "", role="reply") or None
     # Apply a final budget across every generation path, including custom prompts.
     # Normalize CRLF -> LF on system_prompt so prefix hashes stay byte-identical.
@@ -156,11 +278,32 @@ async def call_llm(
     last_exc: Exception | None = None
     for attempt in range(1, _RETRY_ATTEMPTS + 1):
         try:
-            text = await _try_call_once(context, umo, prompt, system_prompt, configured)
+            text = await _try_call_once(
+                context,
+                umo,
+                prompt,
+                system_prompt,
+                configured,
+                explicit_configured=explicit_configured,
+            )
+        except _ProviderExecutionError as e:
+            last_exc = e
+            logger.warning(
+                f"[llm_call] 指定 Provider 执行失败 (第 {attempt}/{_RETRY_ATTEMPTS} 次, "
+                f"retryable={e.retryable}): {e}"
+            )
+            if not e.retryable or attempt >= _RETRY_ATTEMPTS:
+                break
+            await asyncio.sleep(_RETRY_SLEEP_SECONDS)
+            continue
         except Exception as e:  # noqa: BLE001
             if is_provider_budget_busy_error(e):
                 logger.warning(f"[llm_call] 共享模型队列繁忙，放弃重试并延后: {e}")
-                raise LLMUnavailableError("共享模型队列繁忙，已延后本次生成") from e
+                err = LLMUnavailableError("共享模型队列繁忙，已延后本次生成")
+                err.is_provider_budget_busy = True
+                err.retry_after = float(getattr(e, "retry_after", 0.0) or 0.0)
+                err.reason = str(getattr(e, "reason", "busy") or "busy")
+                raise err from e
             last_exc = e
             logger.warning(
                 f"[llm_call] LLM 调用失败 (第 {attempt}/{_RETRY_ATTEMPTS} 次), "
@@ -176,6 +319,8 @@ async def call_llm(
 
     assert last_exc is not None
     logger.error(f"[llm_call] LLM 调用全部失败: {last_exc}")
+    if isinstance(last_exc, _ProviderExecutionError):
+        raise LLMUnavailableError("指定的 LLM 服务暂不可用，请稍后重试") from last_exc
     raise LLMUnavailableError("未配置可用的 LLM")
 
 
@@ -185,28 +330,72 @@ async def _try_call_once(
     prompt: str,
     system_prompt: str | None,
     configured_id: str | None,
+    *,
+    explicit_configured: bool = False,
 ) -> str:
-    """单次尝试: 配置 Provider → 会话 Provider → 默认 Provider。"""
+    """单次尝试: 配置 Provider → 会话 Provider → 默认 Provider。
+
+    当用户显式配置了 ``llm_provider_id`` 且该 Provider 存在时，执行失败
+    （超时/5xx/429/策略拒绝/空响应）禁止静默回退到会话默认主聊模型。
+    """
     # 1. 插件配置的 Provider (若有)
     if configured_id:
         logger.info(f"[llm_call] 使用配置的 Provider: {configured_id}")
-        text = await _try_llm_generate(context, configured_id, prompt, system_prompt)
-        if text is not None:
-            return text
-        text = await _try_provider_text_chat(
-            context, configured_id, prompt, system_prompt, by_id=True
-        )
-        if text is not None:
-            return text
-        logger.warning(
-            f"[llm_call] 配置的 Provider '{configured_id}' 不可用, 回退会话默认"
-        )
+        exists, provider_obj = await _lookup_provider_by_id(context, configured_id)
+        if exists is True and getattr(provider_obj, "is_systemone_provider", False) is True:
+            logger.warning("Decision providers cannot generate chronicles")
+            if explicit_configured:
+                raise _ProviderExecutionError(
+                    f"configured provider '{configured_id}' is a decision provider",
+                    retryable=False,
+                )
+        elif exists is False:
+            logger.warning(
+                f"[llm_call] 配置的 Provider '{configured_id}' 不存在, 回退会话默认"
+            )
+        else:
+            # Both explicitly configured and series-inherited providers must fail
+            # fast on non-retryable execution errors (TimeoutError, 401/403,
+            # policy/safety refusals) instead of amplifying into 4-8x fallback retries.
+            text, invoked = await _try_llm_generate(
+                context,
+                configured_id,
+                prompt,
+                system_prompt,
+                raise_on_execution_error=explicit_configured,
+                raise_on_non_retryable=True,
+                provider_obj=provider_obj,
+                return_invoked=True,
+            )
+            if text is not None:
+                return text
+            text = await _try_provider_text_chat(
+                context,
+                configured_id,
+                prompt,
+                system_prompt,
+                by_id=True,
+                raise_on_execution_error=explicit_configured,
+                raise_on_non_retryable=True,
+                provider_obj=provider_obj,
+            )
+            if text is not None:
+                return text
+            if explicit_configured and (exists is True or invoked):
+                raise _ProviderExecutionError(
+                    f"configured provider '{configured_id}' failed to produce a valid response",
+                    retryable=True,
+                )
+            logger.warning(
+                f"[llm_call] 配置的 Provider '{configured_id}' 不可用, 回退会话默认"
+            )
 
     # 2. 当前会话 Provider (新接口)
     session_id = await _resolve_session_provider_id(context, umo)
-    text = await _try_llm_generate(context, session_id, prompt, system_prompt)
-    if text is not None:
-        return text
+    if session_id and session_id != configured_id:
+        text = await _try_llm_generate(context, session_id, prompt, system_prompt)
+        if text is not None:
+            return text
 
     # 3. 旧接口: 当前正在使用的 Provider
     text = await _try_provider_text_chat(
@@ -232,25 +421,41 @@ async def _resolve_session_provider_id(context, umo: str) -> str | None:
 
 
 async def _try_llm_generate(
-    context, provider_id: str | None, prompt: str, system_prompt: str | None
-) -> str | None:
+    context,
+    provider_id: str | None,
+    prompt: str,
+    system_prompt: str | None,
+    *,
+    raise_on_execution_error: bool = False,
+    raise_on_non_retryable: bool = False,
+    provider_obj=None,
+    return_invoked: bool = False,
+):
     """新版统一接口调用。"""
+    def _ret(val: str | None, invoked: bool):
+        return (val, invoked) if return_invoked else val
+
     if not provider_id:
-        return None
-    getter = getattr(context, "get_provider_by_id", None)
-    if callable(getter):
-        try:
-            provider = getter(provider_id)
-            if inspect.isawaitable(provider):
-                provider = await provider
-            if getattr(provider, "is_systemone_provider", False) is True:
-                logger.warning("Decision providers cannot generate chronicles")
-                return None
-        except Exception:
-            return None
+        return _ret(None, False)
+    if provider_obj is not None:
+        if getattr(provider_obj, "is_systemone_provider", False) is True:
+            logger.warning("Decision providers cannot generate chronicles")
+            return _ret(None, False)
+    else:
+        getter = getattr(context, "get_provider_by_id", None)
+        if callable(getter):
+            try:
+                provider = getter(provider_id)
+                if inspect.isawaitable(provider):
+                    provider = await provider
+                if getattr(provider, "is_systemone_provider", False) is True:
+                    logger.warning("Decision providers cannot generate chronicles")
+                    return _ret(None, False)
+            except Exception:
+                return _ret(None, False)
     llm_generate = getattr(context, "llm_generate", None)
     if not callable(llm_generate):
-        return None
+        return _ret(None, False)
     try:
         gen_kwargs = {
             "chat_provider_id": provider_id,
@@ -270,16 +475,40 @@ async def _try_llm_generate(
             lambda: llm_generate(**gen_kwargs),
         )
         if resp is None:
-            return None
+            return _ret(None, True)
+        if _is_error_response(resp):
+            err_text = str(getattr(resp, "completion_text", "") or "")
+            non_retryable = _is_non_retryable_text(err_text)
+            if raise_on_execution_error or (raise_on_non_retryable and non_retryable):
+                raise _ProviderExecutionError(
+                    f"llm_generate returned error response for '{provider_id}'",
+                    retryable=not non_retryable,
+                )
+            return _ret(None, True)
         text = getattr(resp, "completion_text", None)
         if not isinstance(text, str) or not text.strip():
-            return None
-        return text
+            if raise_on_execution_error:
+                raise _ProviderExecutionError(
+                    f"llm_generate returned empty completion for '{provider_id}'",
+                    retryable=True,
+                )
+            return _ret(None, True)
+        return _ret(text, True)
+    except _ProviderExecutionError:
+        raise
     except Exception as e:  # noqa: BLE001
         if is_provider_budget_busy_error(e):
             raise
+        if not _is_missing_error(e) and (
+            raise_on_execution_error
+            or (raise_on_non_retryable and _is_non_retryable_error(e))
+        ):
+            raise _ProviderExecutionError(
+                f"llm_generate failed for '{provider_id}': {type(e).__name__}: {e}",
+                retryable=not _is_non_retryable_error(e),
+            ) from e
         logger.warning(f"[llm_call] llm_generate 调用失败, 将尝试旧接口回退: {e}")
-        return None
+        return _ret(None, False)
 
 
 async def _try_provider_text_chat(
@@ -289,6 +518,9 @@ async def _try_provider_text_chat(
     system_prompt: str | None,
     *,
     by_id: bool,
+    raise_on_execution_error: bool = False,
+    raise_on_non_retryable: bool = False,
+    provider_obj=None,
 ) -> str | None:
     """旧接口 text_chat。
 
@@ -298,16 +530,19 @@ async def _try_provider_text_chat(
     if by_id:
         if not key:
             return None
-        getter = getattr(context, "get_provider_by_id", None)
-        if not callable(getter):
-            return None
-        try:
-            provider = getter(key)
-            if inspect.isawaitable(provider):
-                provider = await provider
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"[llm_call] get_provider_by_id('{key}') 失败: {e}")
-            return None
+        if provider_obj is not None:
+            provider = provider_obj
+        else:
+            getter = getattr(context, "get_provider_by_id", None)
+            if not callable(getter):
+                return None
+            try:
+                provider = getter(key)
+                if inspect.isawaitable(provider):
+                    provider = await provider
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[llm_call] get_provider_by_id('{key}') 失败: {e}")
+                return None
     else:
         getter = getattr(context, "get_using_provider", None)
         if not callable(getter):
@@ -347,12 +582,36 @@ async def _try_provider_text_chat(
             "group_chronicle",
             lambda: text_chat(**chat_kwargs),
         )
-        if resp is None:
+        if resp is None or _is_error_response(resp):
+            err_text = str(getattr(resp, "completion_text", "") or "") if resp is not None else ""
+            non_retryable = bool(resp is not None and _is_error_response(resp) and _is_non_retryable_text(err_text))
+            if raise_on_execution_error or (raise_on_non_retryable and non_retryable):
+                raise _ProviderExecutionError(
+                    f"text_chat returned empty/error response for '{key}'",
+                    retryable=not non_retryable,
+                )
             return None
         text = resp if isinstance(resp, str) else getattr(resp, "completion_text", None)
-        return text if isinstance(text, str) and text.strip() else None
+        if isinstance(text, str) and text.strip():
+            return text
+        if raise_on_execution_error:
+            raise _ProviderExecutionError(
+                f"text_chat returned empty completion for '{key}'",
+                retryable=True,
+            )
+        return None
+    except _ProviderExecutionError:
+        raise
     except Exception as e:  # noqa: BLE001
         if is_provider_budget_busy_error(e):
             raise
+        if not _is_missing_error(e) and (
+            raise_on_execution_error
+            or (raise_on_non_retryable and _is_non_retryable_error(e))
+        ):
+            raise _ProviderExecutionError(
+                f"text_chat failed for '{key}': {type(e).__name__}: {e}",
+                retryable=not _is_non_retryable_error(e),
+            ) from e
         logger.warning(f"[llm_call] text_chat 失败: {e}")
         return None

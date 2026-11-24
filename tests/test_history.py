@@ -606,9 +606,12 @@ def test_successful_batch_freezes_snapshot_and_commits_idempotently(
     run(case())
 
 
-@pytest.mark.parametrize("error", [RuntimeError("model down"), '{"events":42}'])
+@pytest.mark.parametrize(
+    "error,expected_quota",
+    [(RuntimeError("model down"), 0), ('{"events":42}', 1)],
+)
 def test_failed_model_or_parse_retains_cursor_and_charges_quota(
-    plugin, monkeypatch, error
+    plugin, monkeypatch, error, expected_quota
 ):
     mock = (
         AsyncMock(side_effect=error)
@@ -623,7 +626,7 @@ def test_failed_model_or_parse_retains_cursor_and_charges_quota(
             await plugin.history.process_one(U)
         assert plugin.history.store.job(U)["back_cursor"] == 0
         day = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
-        assert plugin.history.store.quota(day) == 1
+        assert plugin.history.store.quota(day) == expected_quota
         await db.close()
 
     run(case())

@@ -12,11 +12,15 @@ import time
 from datetime import datetime, timedelta, timezone
 
 try:
+    from .. import series_panels as _series_panels_mod
     from ..series_panels import is_series_group_excluded, resolve_series_timezone
 except ImportError:
     try:
+        import series_panels as _series_panels_mod
         from series_panels import is_series_group_excluded, resolve_series_timezone
     except Exception:  # pragma: no cover - standalone fallback
+        _series_panels_mod = None
+
         def is_series_group_excluded(_context, umo: str = "", group_id: str = "") -> bool:
             _ = umo, group_id
             return False
@@ -34,9 +38,22 @@ from astrbot.api import logger
 from . import lm_bridge
 from .archive_store import ArchiveStore, EditionStore, encode, private_text
 from .generation import CHRONICLE_STYLE_INSTRUCTIONS
-from .llm_call import call_llm, encode_compact
+from .llm_call import (
+    budget_busy_retry_after,
+    call_llm,
+    encode_compact,
+    is_budget_busy_error,
+)
 from .persona import resolve_system_prompt
 from .render import render_text_or_image
+
+
+def _provider_circuit_remaining(context, provider_id: str) -> float:
+    fn = getattr(_series_panels_mod, "provider_circuit_remaining", lambda _c, _p: 0.0)
+    try:
+        return float(fn(context, provider_id) or 0.0)
+    except Exception:
+        return 0.0
 
 GROUP_PATTERN = re.compile(r"^[^:\s]+:GroupMessage:[^\s]+$")
 _WATCH_SCOPE_INTERVAL_SEC = 30
@@ -951,6 +968,18 @@ class HistoryService:
                         "Lifetime history cycle deferred until LivingMemory is ready"
                     )
                     return
+                provider_id = self.plugin._llm_provider_id()
+                if provider_id:
+                    circuit_rem = _provider_circuit_remaining(
+                        self.plugin.context, provider_id
+                    )
+                    if circuit_rem > 0:
+                        logger.info(
+                            "Lifetime history cycle deferred: provider '%s' circuit open (%.1fs remaining)",
+                            provider_id,
+                            circuit_rem,
+                        )
+                        return
                 await self.refresh_scope()
                 groups = await self.discover()
                 culture = getattr(self.plugin, "culture", None)
@@ -986,6 +1015,15 @@ class HistoryService:
                 if start_quota >= daily_limit or cycle_budget <= 0:
                     return
                 max_empty_passes = max(4, cycle_budget + 2)
+                # Batch consecutive pages of the same group to boost prompt prefix caching.
+                per_group_batch = (
+                    min(
+                        cycle_budget,
+                        max(2, min(4, math.ceil(cycle_budget / max(1, len(groups))))),
+                    )
+                    if cycle_budget >= 2
+                    else 1
+                )
 
                 async def _budget_exhausted():
                     used_now = await asyncio.to_thread(self.store.quota, day)
@@ -1007,45 +1045,21 @@ class HistoryService:
                         for umo in groups:
                             if self.plugin._terminating or not await self.allowed(umo):
                                 continue
-                            if await _budget_exhausted():
-                                return
-                            try:
-                                operation = asyncio.create_task(
-                                    self.process_one(umo, mode)
-                                )
-                                progressed |= await operation
-                            except asyncio.CancelledError:
-                                if (
-                                    self.plugin._terminating
-                                    or getattr(
-                                        asyncio.current_task(), "cancelling", lambda: 0
-                                    )()
-                                ):
-                                    raise
-                                continue
-                            except Exception as exc:
-                                await asyncio.to_thread(
-                                    self.store.job_error,
-                                    umo,
-                                    f"整理失败：{type(exc).__name__}；进度已保留",
-                                )
-                                logger.warning(
-                                    "Lifetime batch failed without advancing its checkpoint",
-                                    exc_info=True,
-                                )
-                        if culture is not None:
-                            for umo in groups:
-                                if self.plugin._terminating or not await self.allowed(
-                                    umo
-                                ):
-                                    continue
+                            group_pages = 0
+                            group_empty = 0
+                            while (
+                                not self.plugin._terminating
+                                and group_pages < per_group_batch
+                                and group_empty < max_empty_passes
+                            ):
                                 if await _budget_exhausted():
                                     return
+                                q_before = await asyncio.to_thread(self.store.quota, day)
                                 try:
                                     operation = asyncio.create_task(
-                                        culture.step(umo, mode)
+                                        self.process_one(umo, mode)
                                     )
-                                    progressed |= await operation
+                                    step_ok = await operation
                                 except asyncio.CancelledError:
                                     if (
                                         self.plugin._terminating
@@ -1056,12 +1070,94 @@ class HistoryService:
                                         )()
                                     ):
                                         raise
-                                    continue
-                                except Exception:
+                                    break
+                                except Exception as exc:
+                                    if is_budget_busy_error(exc):
+                                        retry_after = budget_busy_retry_after(exc)
+                                        logger.warning(
+                                            "Lifetime cycle paused immediately due to busy/open provider budget (retry_after=%.1fs)",
+                                            retry_after,
+                                        )
+                                        return
+                                    await asyncio.to_thread(
+                                        self.store.job_error,
+                                        umo,
+                                        f"整理失败：{type(exc).__name__}；进度已保留",
+                                    )
                                     logger.warning(
-                                        "Culture step failed inside lifetime cycle",
+                                        "Lifetime batch failed without advancing its checkpoint",
                                         exc_info=True,
                                     )
+                                    break
+                                if not step_ok:
+                                    break
+                                progressed = True
+                                q_after = await asyncio.to_thread(self.store.quota, day)
+                                if q_after > q_before:
+                                    group_pages += 1
+                                    group_empty = 0
+                                else:
+                                    group_empty += 1
+                        if culture is not None:
+                            for umo in groups:
+                                if self.plugin._terminating or not await self.allowed(
+                                    umo
+                                ):
+                                    continue
+                                group_pages = 0
+                                group_empty = 0
+                                while (
+                                    not self.plugin._terminating
+                                    and group_pages < per_group_batch
+                                    and group_empty < max_empty_passes
+                                ):
+                                    if await _budget_exhausted():
+                                        return
+                                    q_before = await asyncio.to_thread(
+                                        self.store.quota, day
+                                    )
+                                    try:
+                                        operation = asyncio.create_task(
+                                            culture.step(
+                                                umo, mode, raise_on_budget_busy=True
+                                            )
+                                        )
+                                        step_ok = await operation
+                                    except asyncio.CancelledError:
+                                        if (
+                                            self.plugin._terminating
+                                            or getattr(
+                                                asyncio.current_task(),
+                                                "cancelling",
+                                                lambda: 0,
+                                            )()
+                                        ):
+                                            raise
+                                        break
+                                    except Exception as exc:
+                                        if is_budget_busy_error(exc):
+                                            retry_after = budget_busy_retry_after(exc)
+                                            logger.warning(
+                                                "Culture cycle paused immediately due to busy/open provider budget (retry_after=%.1fs)",
+                                                retry_after,
+                                            )
+                                            return
+                                        logger.warning(
+                                            "Culture step failed inside lifetime cycle",
+                                            exc_info=True,
+                                        )
+                                        break
+                                    if not step_ok:
+                                        break
+                                    progressed = True
+                                    q_after = await asyncio.to_thread(
+                                        self.store.quota, day
+                                    )
+                                    if q_after > q_before:
+                                        group_pages += 1
+                                        group_empty = 0
+                                    else:
+                                        group_empty += 1
                         if not progressed:
                             break
                         after_quota = await asyncio.to_thread(self.store.quota, day)
@@ -1076,6 +1172,15 @@ class HistoryService:
                                 break
                         else:
                             empty_passes = 0
+                if (
+                    hasattr(self.store, "prune_retention")
+                    and (time.monotonic() - getattr(self.store, "_last_prune_ts", 0.0))
+                    >= 86400.0
+                ):
+                    try:
+                        await asyncio.to_thread(self.store.prune_retention)
+                    except Exception:
+                        logger.debug("ArchiveStore retention prune skipped", exc_info=True)
         finally:
             self.plugin._bg_tasks.discard(task)
 
@@ -1231,16 +1336,24 @@ class HistoryService:
                         kind="history",
                     ):
                         return False
-                    raw = await asyncio.wait_for(
-                        call_llm(
-                            self.plugin.context,
-                            umo,
-                            prompt,
-                            system_prompt,
-                            provider_id=self.plugin._llm_provider_id(),
-                        ),
-                        timeout=float(self.plugin._cfg("generation_timeout_sec", 180)),
-                    )
+                    try:
+                        raw = await asyncio.wait_for(
+                            call_llm(
+                                self.plugin.context,
+                                umo,
+                                prompt,
+                                system_prompt,
+                                provider_id=self.plugin._llm_provider_id(),
+                            ),
+                            timeout=float(
+                                self.plugin._cfg("generation_timeout_sec", 180)
+                            ),
+                        )
+                    except BaseException:
+                        await asyncio.to_thread(
+                            self.store.refund_quota, day, kind="history"
+                        )
+                        raise
                     facts = validate_extraction(
                         raw, material, previous, known_members=known
                     )
@@ -1332,10 +1445,10 @@ class HistoryService:
             return "尚未找到该成员档案；名册或历史整理就绪后即可建档。"
         if member["hidden"]:
             return "该成员档案已隐藏。"
-        grade, facts, revision = (
+        grade, facts, privacy_rev = (
             snapshot["grade"],
             snapshot["facts"],
-            snapshot["revision"],
+            snapshot["privacy_revision"],
         )
         limit = {"小记": 300, "小传": 1000, "列传": 3000}[grade["grade"]]
         style = style or self.plugin._cfg("chronicle_style", "official")
@@ -1439,7 +1552,7 @@ class HistoryService:
                 self.privacy_key(umo) != privacy
                 or not member_now
                 or member_now["hidden"]
-                or self.store.revision(umo) != revision
+                or self.store.privacy_revision(umo) != privacy_rev
             ):
                 raise ValueError("档案事实或隐私设置已更新，请重新查询")
             self.store.save_report(
@@ -1452,7 +1565,7 @@ class HistoryService:
                     "created_at": time.time(),
                     "delivery_complete": False,
                 },
-                expected_revision=revision,
+                expected_privacy_revision=privacy_rev,
             )
 
         await asyncio.to_thread(_commit_bio_report)
@@ -1491,7 +1604,7 @@ class HistoryService:
         days = int(days or self.plugin._cfg("chronicle_days", 7))
         since = time.time() - days * 86400
         snapshot = await asyncio.to_thread(self.store.snapshot, umo, since=since)
-        facts, revision = snapshot["facts"], snapshot["revision"]
+        facts, privacy_rev = snapshot["facts"], snapshot["privacy_revision"]
         if not facts:
             return (
                 "此时间范围尚无已入史的大事。"
@@ -1548,6 +1661,7 @@ class HistoryService:
                 ).encode()
             ).hexdigest()
         )
+        facts_key = key
         cached = await asyncio.to_thread(self.store.cache, umo, key)
         if cached and not force:
             return (
@@ -1560,25 +1674,106 @@ class HistoryService:
         )[:60]
         chosen.sort(key=lambda e: (e["event_at"], e["id"]))
         material = bounded_facts(chosen, 14000)
-        report_payload: dict = {
-            "facts": material,
-            "window_days": days,
-        }
-        if topic:
-            report_payload["topic"] = str(topic)[:300]
-        prompt = encode_compact(report_payload)
-        text = await call_llm(
-            self.plugin.context,
-            umo,
-            prompt,
-            build_report_system_prompt(sp, style, umo=umo, group_name=group_name),
-            provider_id=self.plugin._llm_provider_id(),
+
+        # Resume from persisted prose_ready draft when facts_key & privacy boundary match.
+        draft = (
+            None
+            if force
+            else await asyncio.to_thread(
+                self.store.load_report_draft,
+                umo,
+                facts_key,
+                expected_privacy_revision=privacy_rev,
+            )
         )
+        cached_bios: dict[str, str] = {}
+        if (
+            draft is not None
+            and draft.get("stage") == "prose_ready"
+            and draft.get("privacy_key") == privacy
+            and isinstance(draft.get("prose_text"), str)
+            and draft["prose_text"].strip()
+        ):
+            prose_text = draft["prose_text"]
+            raw_bios = draft.get("bios")
+            if isinstance(raw_bios, dict):
+                cached_bios = {
+                    str(k): str(v)
+                    for k, v in raw_bios.items()
+                    if isinstance(v, str) and v.strip()
+                }
+        else:
+            report_payload: dict = {
+                "facts": material,
+                "window_days": days,
+            }
+            if topic:
+                report_payload["topic"] = str(topic)[:300]
+            prompt = encode_compact(report_payload)
+            prose_text = await call_llm(
+                self.plugin.context,
+                umo,
+                prompt,
+                build_report_system_prompt(sp, style, umo=umo, group_name=group_name),
+                provider_id=self.plugin._llm_provider_id(),
+            )
+            await asyncio.to_thread(
+                self.store.save_report_draft,
+                umo,
+                facts_key,
+                stage="prose_ready",
+                privacy_revision=privacy_rev,
+                payload={
+                    "privacy_key": privacy,
+                    "prose_text": prose_text,
+                    "bios": {},
+                },
+            )
+
+        text = prose_text
         biographies = []
         if top:
-            bios = []
-            for uid in top:
-                bios.append(await self.biography(umo, uid, style=style))
+            bio_sem = asyncio.Semaphore(2)
+            completed_bios: dict[str, str] = dict(cached_bios)
+
+            async def _gen_one_bio(target_uid: str) -> str:
+                if target_uid in completed_bios:
+                    return completed_bios[target_uid]
+                async with bio_sem:
+                    bio_text = await self.biography(umo, target_uid, style=style)
+                completed_bios[target_uid] = bio_text
+                return bio_text
+
+            results = await asyncio.gather(
+                *(_gen_one_bio(uid) for uid in top), return_exceptions=True
+            )
+            first_error: BaseException | None = None
+            for res in results:
+                if isinstance(res, BaseException):
+                    if isinstance(res, asyncio.CancelledError):
+                        raise res
+                    if first_error is None:
+                        first_error = res
+            if first_error is not None:
+                # Persist completed biographies alongside prose so retries resume cleanly.
+                try:
+                    await asyncio.to_thread(
+                        self.store.save_report_draft,
+                        umo,
+                        facts_key,
+                        stage="prose_ready",
+                        privacy_revision=privacy_rev,
+                        payload={
+                            "privacy_key": privacy,
+                            "prose_text": prose_text,
+                            "bios": completed_bios,
+                        },
+                    )
+                except Exception:
+                    pass
+                raise first_error
+
+            bios = [str(r) for r in results]
             bio_members = await asyncio.to_thread(self.store.members_by_uids, umo, top)
             for uid, bio in zip(top, bios):
                 text += "\n\n" + bio
@@ -1594,7 +1789,8 @@ class HistoryService:
 
         def _pre_render_mismatch():
             return (
-                self.privacy_key(umo) != privacy or self.store.revision(umo) != revision
+                self.privacy_key(umo) != privacy
+                or self.store.privacy_revision(umo) != privacy_rev
             )
 
         if not await self.allowed(umo) or await asyncio.to_thread(_pre_render_mismatch):
@@ -1623,7 +1819,10 @@ class HistoryService:
             key += ":forced:" + str(time.time_ns())
 
         def _save_final_report():
-            if self.privacy_key(umo) != privacy or self.store.revision(umo) != revision:
+            if (
+                self.privacy_key(umo) != privacy
+                or self.store.privacy_revision(umo) != privacy_rev
+            ):
                 raise ValueError("群范围或隐私设置已变化，本次结果未发布")
             self.store.save_report(
                 umo,
@@ -1645,11 +1844,12 @@ class HistoryService:
                     "msg_count": 0,
                     "event_versions": [[e["id"], e["revision"]] for e in facts],
                     "delivery_complete": False,
-                    "facts_key": key,
+                    "facts_key": facts_key,
                     "version": 1,
                 },
-                expected_revision=revision,
+                expected_privacy_revision=privacy_rev,
             )
+            self.store.delete_report_draft(umo, facts_key)
 
         await asyncio.to_thread(_save_final_report)
         return text, image_path, False

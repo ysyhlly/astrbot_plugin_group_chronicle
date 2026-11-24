@@ -23,7 +23,7 @@ from .lifetime import (
     resume_offset,
     tracked_operation,
 )
-from .llm_call import call_llm, encode_compact
+from .llm_call import call_llm, encode_compact, is_budget_busy_error
 
 _SOURCE_BATCH_SIZE = 500
 
@@ -337,16 +337,22 @@ class CultureService:
                     extra=verification_extra_quota,
                 ):
                     return False
-                raw = await asyncio.wait_for(
-                    call_llm(
-                        self.plugin.context,
-                        umo,
-                        encode_compact(data),
-                        build_culture_system_prompt(umo, group_name),
-                        provider_id=self.plugin._llm_provider_id(),
-                    ),
-                    timeout=float(self.plugin._cfg("generation_timeout_sec", 180)),
-                )
+                try:
+                    raw = await asyncio.wait_for(
+                        call_llm(
+                            self.plugin.context,
+                            umo,
+                            encode_compact(data),
+                            build_culture_system_prompt(umo, group_name),
+                            provider_id=self.plugin._llm_provider_id(),
+                        ),
+                        timeout=float(self.plugin._cfg("generation_timeout_sec", 180)),
+                    )
+                except BaseException:
+                    await asyncio.to_thread(
+                        self.history.store.refund_quota, day, kind="culture"
+                    )
+                    raise
                 proposals, rejected = validate_candidates(
                     raw, review_material, existing, target_name=target["name"] if target else ""
                 )
@@ -425,7 +431,9 @@ class CultureService:
                 self.errors.pop(umo, None)
             return ok
 
-    async def step(self, umo, mode, *, verification_extra_quota=0):
+    async def step(
+        self, umo, mode, *, verification_extra_quota=0, raise_on_budget_busy=False
+    ):
         try:
             return await self.process_one(
                 umo, mode, verification_extra_quota=verification_extra_quota
@@ -433,6 +441,8 @@ class CultureService:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            if raise_on_budget_busy and is_budget_busy_error(exc):
+                raise
             # Semantic validation errors are safe; provider errors can contain credentials.
             message = (
                 str(exc)

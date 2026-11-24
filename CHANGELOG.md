@@ -1,5 +1,10 @@
 # 更新日志
 
+## v0.3.0-rc.9 — 2026-11-24
+
+- 继承主控 Provider 时对超时/401/403/策略拒绝快速失败并正确透传 `ProviderBudgetBusyError`；LLM 失败或遇熔断自动退还日配额（`refund_quota`）；`run_cycle()` 预检熔断器并按同群连续批处理。
+- `detect_lm(context)` 增加 8s TTL 缓存与重载失效；`ArchiveStore` 启用 `PRAGMA auto_vacuum=INCREMENTAL`、WAL 读写分离、定期/关闭 checkpoint 与增量收缩及 `prune_retention()`（保留 `entity='coverage'`）；同步最新 `series_panels.py`。
+
 ## v0.3.0-rc.8 — 2026-11-22
 
 - 接入全系列共享 `ProviderBudget` 并发池与遥测上报（`core/llm_call.py` 走 `series_llm_call`，队列繁忙时平滑降级不阻塞主控群聊）。

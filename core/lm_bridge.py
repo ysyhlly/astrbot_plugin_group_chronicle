@@ -29,43 +29,51 @@ from __future__ import annotations
 
 import importlib
 import sys
+import threading
+import time
+import weakref
 from typing import Any
 
-#: 门面模块列表（优先群间记忆 Dynamics Memory，兼容旧版 LivingMemory）。
+#: 公开门面模块列表（优先群间记忆 Dynamics Memory 公开门面，兼容旧版 LivingMemory 门面）。
+_PRIMARY_FACADE_MODULE = "astrbot_plugin_dynamics_memory.api.public"
+_LEGACY_FACADE_MODULE = "astrbot_plugin_livingmemory.api.public"
 _LM_FACADE_MODULES: tuple[str, ...] = (
-    "astrbot_plugin_dynamics_memory.api.public",
-    "astrbot_plugin_livingmemory.api.public",
+    _PRIMARY_FACADE_MODULE,
+    _LEGACY_FACADE_MODULE,
 )
-_LM_FACADE_MODULE = _LM_FACADE_MODULES[0]
+_LM_FACADE_MODULE = _PRIMARY_FACADE_MODULE
 
-try:
-    from astrbot_plugin_dynamics_memory.api.public import (
-        ALIASES as _DM_PUBLIC_ALIASES,
-    )
-    from astrbot_plugin_dynamics_memory.api.public import (
-        get_active_plugin as _dm_public_get_active_plugin,
-    )
-except Exception:
-    _DM_PUBLIC_ALIASES = None
-    _dm_public_get_active_plugin = None
 
-try:
-    from astrbot_plugin_livingmemory.api.public import (
-        ALIASES as _LM_PUBLIC_ALIASES,
-    )
-    from astrbot_plugin_livingmemory.api.public import (
-        get_active_plugin as _lm_public_get_active_plugin,
-    )
-except Exception:
-    _LM_PUBLIC_ALIASES = None
-    _lm_public_get_active_plugin = None
+def _load_public_facade_contract(mod_name: str):
+    """Safely load (ALIASES, get_active_plugin) from a public facade module."""
+    try:
+        mod = importlib.import_module(mod_name)
+    except Exception:
+        return None, None
+    aliases = getattr(mod, "ALIASES", None)
+    getter = getattr(mod, "get_active_plugin", None)
+    return aliases, (getter if callable(getter) else None)
 
-try:
-    from astrbot_plugin_livingmemory.core.passive_group_capture import (
-        get_active_plugin as _lm_legacy_get_active,
-    )
-except Exception:
-    _lm_legacy_get_active = None
+
+def _load_legacy_lm_active_getter():
+    """Isolated fallback for pre-facade LivingMemory private module; degrades silently."""
+    try:
+        mod = importlib.import_module(
+            "astrbot_plugin_livingmemory.core.passive_group_capture"
+        )
+        getter = getattr(mod, "get_active_plugin", None)
+        return getter if callable(getter) else None
+    except Exception:
+        return None
+
+
+_DM_PUBLIC_ALIASES, _dm_public_get_active_plugin = _load_public_facade_contract(
+    _PRIMARY_FACADE_MODULE
+)
+_LM_PUBLIC_ALIASES, _lm_public_get_active_plugin = _load_public_facade_contract(
+    _LEGACY_FACADE_MODULE
+)
+_lm_legacy_get_active = _load_legacy_lm_active_getter()
 
 
 def _combined_get_active():
@@ -111,15 +119,26 @@ _LM_ALIASES: tuple[str, ...] = tuple(_merged_aliases)
 
 _FACADE_CACHE: dict[tuple[str, str], tuple[Any, Any]] = {}
 _FACADE_MISSING: set[str] = set()
+_DETECT_LM_TTL_SECONDS = 8.0
+_DETECT_LM_CACHE_LOCK = threading.Lock()
+# context_id -> (expires_at, ctx_ref, primary_mod, legacy_mod, get_active_fn, owner_or_none, disabled_rivals)
+_DETECT_LM_CACHE: dict[int, tuple[float, Any, Any, Any, Any, Any, tuple[Any, ...]]] = {}
 _REQUIRED_HISTORY_COLUMNS = frozenset(
     {"id", "role", "content", "sender_id", "sender_name", "timestamp", "metadata"}
 )
 
 
+def invalidate_lm_cache() -> None:
+    """Clear the short-lived detect_lm() TTL cache (e.g. on plugin reload/terminate)."""
+    with _DETECT_LM_CACHE_LOCK:
+        _DETECT_LM_CACHE.clear()
+
+
 def _clear_facade_cache() -> None:
-    """Clear cached facade module/function references."""
+    """Clear cached facade module/function references and detect_lm TTL cache."""
     _FACADE_CACHE.clear()
     _FACADE_MISSING.clear()
+    invalidate_lm_cache()
 
 
 def _import_facade_module(mod_name: str) -> Any | None:
@@ -228,7 +247,7 @@ def _is_enabled_owner(owner: Any, *, strict_caps: bool = False) -> bool:
     return True
 
 
-def _detect_legacy_lm(context: Any) -> Any | None:
+def _detect_legacy_lm(context: Any, *, prefetched_stars: Any = None) -> Any | None:
     """Return the LivingMemory plugin instance (``star.star_cls``), or None.
 
     FIXED resolution order:
@@ -272,13 +291,16 @@ def _detect_legacy_lm(context: Any) -> Any | None:
                 if _is_enabled_owner(owner):
                     return owner
 
-    all_stars_getter = getattr(context, "get_all_stars", None)
-    if not callable(all_stars_getter):
-        return None
-    try:
-        stars = all_stars_getter() or []
-    except Exception:
-        return None
+    if prefetched_stars is not None:
+        stars = prefetched_stars
+    else:
+        all_stars_getter = getattr(context, "get_all_stars", None)
+        if not callable(all_stars_getter):
+            return None
+        try:
+            stars = all_stars_getter() or []
+        except Exception:
+            return None
 
     wanted = {alias.lower() for alias in _LM_ALIASES}
     for star in stars:
@@ -302,9 +324,69 @@ def _detect_legacy_lm(context: Any) -> Any | None:
     return None
 
 
+def _ctx_matches_ref(ctx_ref: Any, context: Any) -> bool:
+    if isinstance(ctx_ref, weakref.ReferenceType):
+        return ctx_ref() is context
+    return ctx_ref is context
+
+
 def detect_lm(context: Any) -> Any | None:
-    """Resolve one active, enabled memory owner; never silently combine two stores."""
-    owners = []
+    """Resolve one active, enabled memory owner; prefer Dynamics Memory public facade.
+
+    Uses a short TTL cache (invalidated on reload, owner state change, or rival
+    activation) so per-message filters like ``HistoryCaptureFilter`` avoid scanning
+    ``get_all_stars()`` on every group message.
+
+    Never silently combines two active memory stores (raises RuntimeError on conflict).
+    """
+    ctx_id = id(context)
+    now = time.monotonic()
+    primary_mod_now = sys.modules.get(_PRIMARY_FACADE_MODULE)
+    legacy_mod_now = sys.modules.get(_LEGACY_FACADE_MODULE)
+    active_fn_now = _lm_get_active
+    with _DETECT_LM_CACHE_LOCK:
+        cached = _DETECT_LM_CACHE.get(ctx_id)
+    if cached is not None:
+        exp, ctx_ref, p_mod, l_mod, a_fn, cached_owner, disabled_rivals = cached
+        if (
+            now < exp
+            and _ctx_matches_ref(ctx_ref, context)
+            and p_mod is primary_mod_now
+            and l_mod is legacy_mod_now
+            and a_fn is active_fn_now
+        ):
+            owner_ok = (
+                cached_owner is None or _is_enabled_owner(cached_owner)
+            )
+            rivals_ok = not any(
+                _is_enabled_owner(rival) for rival in disabled_rivals
+            )
+            if owner_ok and rivals_ok:
+                return cached_owner
+        with _DETECT_LM_CACHE_LOCK:
+            _DETECT_LM_CACHE.pop(ctx_id, None)
+
+    owners: list[Any] = []
+    disabled_rivals_list: list[Any] = []
+
+    def _record_disabled(candidate: Any) -> None:
+        if candidate is not None and all(candidate is not r for r in disabled_rivals_list):
+            disabled_rivals_list.append(candidate)
+
+    # 1. Prefer Dynamics Memory public facade directly when available
+    primary_mod = _import_facade_module(_PRIMARY_FACADE_MODULE)
+    primary_find = getattr(primary_mod, "find_plugin", None) if primary_mod is not None else None
+    if callable(primary_find):
+        try:
+            dm_owner = primary_find(context)
+        except Exception:
+            dm_owner = None
+        if dm_owner is not None:
+            if _is_enabled_owner(dm_owner):
+                owners.append(dm_owner)
+            else:
+                _record_disabled(dm_owner)
+
     getter = getattr(context, "get_registered_star", None)
     if callable(getter):
         for alias in (
@@ -318,13 +400,18 @@ def detect_lm(context: Any) -> Any | None:
                 continue
             if _is_active_star(star):
                 owner = star.star_cls
-                if _is_enabled_owner(owner) and all(owner is not p for p in owners):
-                    owners.append(owner)
+                if _is_enabled_owner(owner):
+                    if all(owner is not p for p in owners):
+                        owners.append(owner)
+                else:
+                    _record_disabled(owner)
+    scanned_stars: Any = None
     scanner = getattr(context, "get_all_stars", None)
     if callable(scanner):
         try:
             stars = scanner() or []
-            stars = stars.values() if isinstance(stars, dict) else stars
+            stars = list(stars.values()) if isinstance(stars, dict) else list(stars)
+            scanned_stars = stars
             for star in stars:
                 if not _is_active_star(star):
                     continue
@@ -339,14 +426,15 @@ def detect_lm(context: Any) -> Any | None:
                         isinstance(capabilities, dict)
                         and capabilities.get("memory") == 1
                     ):
-                        if _is_enabled_owner(owner, strict_caps=True) and all(
-                            owner is not p for p in owners
-                        ):
-                            owners.append(owner)
+                        if _is_enabled_owner(owner, strict_caps=True):
+                            if all(owner is not p for p in owners):
+                                owners.append(owner)
+                        else:
+                            _record_disabled(owner)
         except Exception:
             # A broken registry cannot safely establish unique ownership.
             raise RuntimeError("记忆能力发现失败，已暂停读取") from None
-    legacy = _detect_legacy_lm(context)
+    legacy = _detect_legacy_lm(context, prefetched_stars=scanned_stars)
     if (
         legacy is not None
         and _is_enabled_owner(legacy)
@@ -355,7 +443,24 @@ def detect_lm(context: Any) -> Any | None:
         owners.append(legacy)
     if len(owners) > 1:
         raise RuntimeError("新旧记忆来源冲突，请仅启用一个记忆提供者")
-    return owners[0] if owners else None
+    resolved = owners[0] if owners else None
+    try:
+        ctx_ref: Any = weakref.ref(context)
+    except TypeError:
+        ctx_ref = context
+    with _DETECT_LM_CACHE_LOCK:
+        if len(_DETECT_LM_CACHE) >= 16:
+            _DETECT_LM_CACHE.clear()
+        _DETECT_LM_CACHE[ctx_id] = (
+            now + _DETECT_LM_TTL_SECONDS,
+            ctx_ref,
+            sys.modules.get(_PRIMARY_FACADE_MODULE),
+            sys.modules.get(_LEGACY_FACADE_MODULE),
+            _lm_get_active,
+            resolved,
+            tuple(disabled_rivals_list),
+        )
+    return resolved
 
 
 def source_identity(context):
@@ -439,193 +544,64 @@ async def history_sources(context, umo, ids):
     return result
 
 
-async def ensure_ready(plugin: Any) -> bool:
-    """Ensure the LivingMemory plugin instance is initialized and usable.
-
-    Prefers the facade ``api.public.ensure_ready(plugin, timeout=30.0,
-    require=("memory_engine", "conversation_manager"))``, which implements the
-    same policy inside LivingMemory; falls back to the local implementation for
-    versions without the facade. Both paths pull ``initializer`` off the plugin
-    instance, wait for ``ensure_initialized(timeout=30.0)`` when not yet
-    initialized, then check that both ``memory_engine`` and
-    ``conversation_manager`` are present. Every attribute access is guarded.
-
-    Behaviour is unchanged: chronicle needs the conversation manager, so the
-    ``require`` set stays explicit.
-    """
-    facade_ensure_ready = _facade_fn("ensure_ready")
-    if facade_ensure_ready is not None:
-        try:
-            return bool(
-                await facade_ensure_ready(
-                    plugin,
-                    timeout=30.0,
-                    require=("memory_engine", "conversation_manager"),
-                )
-            )
-        except Exception:
-            return False
-
-    initializer = getattr(plugin, "initializer", None)
-    if initializer is None:
-        return False
-    if not getattr(initializer, "is_initialized", False):
-        ensure = getattr(initializer, "ensure_initialized", None)
-        if not callable(ensure):
-            return False
-        try:
-            ok = await ensure(timeout=30.0)
-        except Exception:
-            ok = False
-        if not ok:
-            return False
-    return (
-        getattr(initializer, "memory_engine", None) is not None
-        and getattr(initializer, "conversation_manager", None) is not None
-    )
+# ------------------------------------------------------------------
+# Isolated legacy LivingMemory private-attribute fallbacks (silent degradation)
+# ------------------------------------------------------------------
 
 
-def get_engine(plugin: Any) -> Any | None:
-    """Return the LivingMemory memory engine, or None if unavailable.
-
-    Prefers the facade accessor ``api.public.get_memory_engine(plugin)`` so the
-    private ``initializer.memory_engine`` chain is no longer duplicated here.
-    """
-    facade_get_memory_engine = _facade_fn("get_memory_engine")
-    if facade_get_memory_engine is not None:
-        try:
-            return facade_get_memory_engine(plugin)
-        except Exception:
-            return None
-
-    initializer = getattr(plugin, "initializer", None)
-    if initializer is None:
-        return None
-    return getattr(initializer, "memory_engine", None)
-
-
-def get_conversation_manager(plugin: Any) -> Any | None:
-    """Return the LivingMemory conversation manager, or None.
-
-    Prefers the facade accessor ``api.public.get_conversation_manager(plugin)``.
-    """
-    facade_get_conversation_manager = _facade_fn("get_conversation_manager")
-    if facade_get_conversation_manager is not None:
-        try:
-            return facade_get_conversation_manager(plugin)
-        except Exception:
-            return None
-
-    initializer = getattr(plugin, "initializer", None)
-    if initializer is None:
-        return None
-    return getattr(initializer, "conversation_manager", None)
-
-
-def lm_unavailable_reason(context: Any = None, stage: str | None = None) -> str:
-    """Most specific reason LivingMemory is unavailable.
-
-    ``stage`` may be one of ``"not_loaded"`` / ``"not_detected"`` /
-    ``"not_ready"`` to report a known failure stage. When omitted, the reason
-    is derived from the current state:
-
-    - module-level import failed        -> "LivingMemory 插件未加载"
-    - no plugin instance found          -> "未检测到 LivingMemory"
-    - plugin found but not initialized  -> "LivingMemory 尚未初始化"
-
-    Priority: 插件未加载 > 尚未初始化 > 未检测到 (module-level absence wins).
-    """
-    if _lm_get_active is None or stage == "not_loaded":
-        return "LivingMemory 插件未加载"
-    if stage == "not_ready":
-        return "LivingMemory 尚未初始化"
-    if stage == "not_detected":
-        return "未检测到 LivingMemory"
-    plugin = None
+async def _legacy_ensure_ready(plugin: Any) -> bool:
+    """Private ``initializer`` fallback for pre-facade LivingMemory; never raises."""
     try:
-        plugin = _lm_get_active()
-    except Exception:
-        plugin = None
-    if plugin is None and context is not None:
-        plugin = detect_lm(context)
-    if plugin is None:
-        return "未检测到 LivingMemory"
-    return "LivingMemory 尚未初始化"
-
-
-def history_connection(context):
-    """Resolve the active read-only history query surface.
-
-    Prefers the facade ``api.public.get_history_reader(context)`` when the facade
-    resolves the same owner as :func:`detect_lm`. Falls back to the legacy store
-    chain only when no public reader matches (older LivingMemory / minimal fakes).
-
-    Args:
-        context: AstrBot context.
-
-    Returns:
-        The active SQLite connection, or None when unavailable.
-    """
-    plugin = detect_lm(context)
-    if plugin is None:
-        return None
-    capability = getattr(plugin, "get_dynamics_capabilities", None)
-    if callable(capability):
-        manifest = capability()
-        if (
-            not isinstance(manifest, dict)
-            or manifest.get("ready") is not True
-            or manifest.get("enabled") is False
-        ):
-            return None
-
-    direct_reader = getattr(plugin, "get_history_reader", None)
-    if callable(direct_reader):
-        try:
-            reader = direct_reader()
-            if callable(getattr(reader, "execute", None)):
-                return reader
-        except Exception:
-            pass
-
-    facade_get_history_reader = _facade_fn("get_history_reader")
-    if callable(facade_get_history_reader) and _facade_find_plugin(context) is plugin:
-        try:
-            reader = facade_get_history_reader(context)
-            if callable(getattr(reader, "execute", None)):
-                return reader
-        except Exception:
-            pass
-
-    manager = get_conversation_manager(plugin)
-    store = getattr(manager, "store", None)
-    connection = getattr(store, "connection", None)
-    return connection if callable(getattr(connection, "execute", None)) else None
-
-
-def is_dm_capturing_group(context: Any, event: Any) -> bool:
-    """Return True when active, ready Dynamics Memory already captures this group message."""
-    try:
-        plugin = detect_lm(context)
+        initializer = getattr(plugin, "initializer", None)
+        if initializer is None:
+            return False
+        if not getattr(initializer, "is_initialized", False):
+            ensure = getattr(initializer, "ensure_initialized", None)
+            if not callable(ensure):
+                return False
+            if not await ensure(timeout=30.0):
+                return False
+        return (
+            getattr(initializer, "memory_engine", None) is not None
+            and getattr(initializer, "conversation_manager", None) is not None
+        )
     except Exception:
         return False
-    if plugin is None:
-        return False
-    capability = getattr(plugin, "get_dynamics_capabilities", None)
-    if not callable(capability):
-        return False
-    try:
-        manifest = capability()
-    except Exception:
-        return False
-    if (
-        not isinstance(manifest, dict)
-        or manifest.get("provider_id") != "astrbot_plugin_dynamics_memory"
-        or manifest.get("enabled") is not True
-        or manifest.get("ready") is not True
-    ):
-        return False
 
+
+def _legacy_get_engine(plugin: Any) -> Any | None:
+    try:
+        initializer = getattr(plugin, "initializer", None)
+        return getattr(initializer, "memory_engine", None) if initializer is not None else None
+    except Exception:
+        return None
+
+
+def _legacy_get_conversation_manager(plugin: Any) -> Any | None:
+    try:
+        initializer = getattr(plugin, "initializer", None)
+        return (
+            getattr(initializer, "conversation_manager", None)
+            if initializer is not None
+            else None
+        )
+    except Exception:
+        return None
+
+
+def _legacy_history_connection(plugin: Any) -> Any | None:
+    """Private ``conversation_manager.store.connection`` fallback for older LivingMemory."""
+    try:
+        manager = get_conversation_manager(plugin)
+        store = getattr(manager, "store", None)
+        connection = getattr(store, "connection", None)
+        return connection if callable(getattr(connection, "execute", None)) else None
+    except Exception:
+        return None
+
+
+def _legacy_check_dm_capture_config(plugin: Any, event: Any) -> bool:
+    """Private ``config_manager`` fallback when Dynamics Memory lacks a public capture probe."""
     cfg = getattr(plugin, "config_manager", None)
     getter = getattr(cfg, "get", None)
     if not callable(getter):
@@ -670,6 +646,166 @@ def is_dm_capturing_group(context: Any, event: Any) -> bool:
     except Exception:
         return False
     return True
+
+
+async def ensure_ready(plugin: Any) -> bool:
+    """Ensure the Dynamics Memory / LivingMemory plugin instance is initialized and usable.
+
+    Prefers the public facade ``api.public.ensure_ready(plugin, timeout=30.0,
+    require=("memory_engine", "conversation_manager"))``; falls back to isolated
+    legacy probing with silent degradation.
+    """
+    facade_ensure_ready = _facade_fn("ensure_ready")
+    if facade_ensure_ready is not None:
+        try:
+            return bool(
+                await facade_ensure_ready(
+                    plugin,
+                    timeout=30.0,
+                    require=("memory_engine", "conversation_manager"),
+                )
+            )
+        except Exception:
+            return False
+    return await _legacy_ensure_ready(plugin)
+
+
+def get_engine(plugin: Any) -> Any | None:
+    """Return the memory engine via public facade, or isolated legacy fallback."""
+    facade_get_memory_engine = _facade_fn("get_memory_engine")
+    if facade_get_memory_engine is not None:
+        try:
+            return facade_get_memory_engine(plugin)
+        except Exception:
+            return None
+    return _legacy_get_engine(plugin)
+
+
+def get_conversation_manager(plugin: Any) -> Any | None:
+    """Return the conversation manager via public facade, or isolated legacy fallback."""
+    facade_get_conversation_manager = _facade_fn("get_conversation_manager")
+    if facade_get_conversation_manager is not None:
+        try:
+            return facade_get_conversation_manager(plugin)
+        except Exception:
+            return None
+    return _legacy_get_conversation_manager(plugin)
+
+
+def lm_unavailable_reason(context: Any = None, stage: str | None = None) -> str:
+    """Most specific reason LivingMemory is unavailable.
+
+    ``stage`` may be one of ``"not_loaded"`` / ``"not_detected"`` /
+    ``"not_ready"`` to report a known failure stage. When omitted, the reason
+    is derived from the current state:
+
+    - module-level import failed        -> "LivingMemory 插件未加载"
+    - no plugin instance found          -> "未检测到 LivingMemory"
+    - plugin found but not initialized  -> "LivingMemory 尚未初始化"
+
+    Priority: 插件未加载 > 尚未初始化 > 未检测到 (module-level absence wins).
+    """
+    if _lm_get_active is None or stage == "not_loaded":
+        return "LivingMemory 插件未加载"
+    if stage == "not_ready":
+        return "LivingMemory 尚未初始化"
+    if stage == "not_detected":
+        return "未检测到 LivingMemory"
+    plugin = None
+    try:
+        plugin = _lm_get_active()
+    except Exception:
+        plugin = None
+    if plugin is None and context is not None:
+        try:
+            plugin = detect_lm(context)
+        except Exception:
+            plugin = None
+    if plugin is None:
+        return "未检测到 LivingMemory"
+    return "LivingMemory 尚未初始化"
+
+
+def history_connection(context):
+    """Resolve the active read-only history query surface.
+
+    Prefers public ``plugin.get_history_reader()`` and facade
+    ``api.public.get_history_reader(context)`` when the facade resolves the same
+    owner as :func:`detect_lm`. Falls back to the isolated legacy store helper
+    only when no public reader matches.
+    """
+    plugin = detect_lm(context)
+    if plugin is None:
+        return None
+    capability = getattr(plugin, "get_dynamics_capabilities", None)
+    if callable(capability):
+        manifest = capability()
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("ready") is not True
+            or manifest.get("enabled") is False
+        ):
+            return None
+
+    direct_reader = getattr(plugin, "get_history_reader", None)
+    if callable(direct_reader):
+        try:
+            reader = direct_reader()
+            if callable(getattr(reader, "execute", None)):
+                return reader
+        except Exception:
+            pass
+
+    facade_get_history_reader = _facade_fn("get_history_reader")
+    if callable(facade_get_history_reader) and _facade_find_plugin(context) is plugin:
+        try:
+            reader = facade_get_history_reader(context)
+            if callable(getattr(reader, "execute", None)):
+                return reader
+        except Exception:
+            pass
+
+    return _legacy_history_connection(plugin)
+
+
+def is_dm_capturing_group(context: Any, event: Any) -> bool:
+    """Return True when active, ready Dynamics Memory already captures this group message."""
+    try:
+        plugin = detect_lm(context)
+    except Exception:
+        return False
+    if plugin is None:
+        return False
+    capability = getattr(plugin, "get_dynamics_capabilities", None)
+    if not callable(capability):
+        return False
+    try:
+        manifest = capability()
+    except Exception:
+        return False
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("provider_id") != "astrbot_plugin_dynamics_memory"
+        or manifest.get("enabled") is not True
+        or manifest.get("ready") is not True
+    ):
+        return False
+
+    # Prefer public capture probe on plugin or Dynamics Memory public facade
+    public_probe = getattr(plugin, "is_capturing_group", None)
+    if callable(public_probe):
+        try:
+            return bool(public_probe(event))
+        except Exception:
+            return False
+    facade_probe = _facade_fn("is_capturing_group")
+    if callable(facade_probe):
+        try:
+            return bool(facade_probe(plugin, event))
+        except Exception:
+            pass
+
+    return _legacy_check_dm_capture_config(plugin, event)
 
 
 async def history_sessions(context):

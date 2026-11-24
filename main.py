@@ -95,6 +95,7 @@ if __package__:
         ensure_ready,
         get_conversation_manager,
         get_engine,
+        invalidate_lm_cache,
         lm_unavailable_reason,
     )
     from .core.persona import resolve_system_prompt
@@ -128,6 +129,7 @@ else:  # Top-level import is reserved for the test harness.
         ensure_ready,
         get_conversation_manager,
         get_engine,
+        invalidate_lm_cache,
         lm_unavailable_reason,
     )
     from core.persona import resolve_system_prompt
@@ -323,6 +325,100 @@ class GroupChroniclePlugin(Star):
                 "badge": {"count": 0, "tone": "muted", "label": "暂不可用"},
                 "pulse": {"headline": "群文化状态暂不可用", "updated_at": ""},
             }
+
+    def get_series_health(self) -> dict[str, Any]:
+        """Strictly synchronous, read-only health diagnostics for series control panel."""
+        providers: list[dict[str, Any]] = []
+        issues: list[str] = []
+        metrics: dict[str, Any] = {}
+        history = getattr(self, "history", None)
+        culture = getattr(self, "culture", None)
+        ready = bool(not self._terminating and history is not None)
+        if self._terminating:
+            issues.append("群史记正在停止或已关闭")
+        elif history is None:
+            issues.append("长期历史服务尚未就绪")
+
+        ctx = getattr(self, "context", None)
+        mod = self._series_panels_mod()
+        own_provider = str(self._cfg("llm_provider_id", "") or "").strip()
+        resolved_provider = self._llm_provider_id()
+        if not resolved_provider:
+            providers.append(
+                {
+                    "role": "chronicle_llm",
+                    "provider_id": "",
+                    "status": "session_default",
+                    "detail": "跟随会话默认模型",
+                }
+            )
+        else:
+            finder = (
+                getattr(mod, "find_provider_silently", None)
+                if mod is not None
+                else None
+            )
+            prov = finder(ctx, resolved_provider) if callable(finder) else None
+            if prov is not None:
+                providers.append(
+                    {
+                        "role": "chronicle_llm",
+                        "provider_id": resolved_provider,
+                        "status": "ok",
+                        "detail": (
+                            "显式配置可用" if own_provider else "继承主控回复模型可用"
+                        ),
+                    }
+                )
+            else:
+                providers.append(
+                    {
+                        "role": "chronicle_llm",
+                        "provider_id": resolved_provider,
+                        "status": "missing",
+                        "detail": "未在已加载 Provider 中找到（可能冷启动或已移除）",
+                    }
+                )
+                issues.append(f"chronicle_llm 配置的 Provider 不可用: {resolved_provider}")
+
+        memory_detected = False
+        memory_ready = False
+        try:
+            lm_inst = detect_lm(ctx)
+            if lm_inst is not None:
+                memory_detected = True
+                caps_fn = getattr(lm_inst, "get_dynamics_capabilities", None)
+                if callable(caps_fn):
+                    caps = caps_fn()
+                    memory_ready = bool(
+                        isinstance(caps, dict) and caps.get("ready") is True
+                    )
+                else:
+                    init = getattr(lm_inst, "initializer", None)
+                    memory_ready = bool(getattr(init, "is_initialized", False))
+        except RuntimeError as exc:
+            issues.append(str(exc)[:160])
+        except Exception:
+            pass
+        metrics["memory_detected"] = memory_detected
+        metrics["memory_ready"] = memory_ready
+        metrics["history_enabled"] = bool(self._cfg("history_enabled", True))
+        metrics["culture_enabled"] = bool(self._cfg("culture_enabled", False))
+        try:
+            if history is not None and not self._terminating:
+                metrics["tracked_groups"] = len(history.store.groups())
+            if culture is not None and not self._terminating:
+                metrics["culture_ready"] = True
+        except Exception:
+            pass
+
+        return {
+            "ready": ready,
+            "degraded": bool(issues) or not ready,
+            "providers": providers,
+            "issues": issues,
+            "metrics": metrics,
+        }
 
     async def get_series_scope_status(self, umo: str) -> dict[str, Any]:
         """Read-only per-group status for the Chat Dynamics control matrix."""
@@ -796,6 +892,7 @@ class GroupChroniclePlugin(Star):
 
     async def initialize(self):
         """插件初始化入口: 注册每周定时推送 (失败只记录日志, 绝不崩溃)。"""
+        invalidate_lm_cache()
         self.culture_web.register()
         if callable(getattr(self.context, "register_web_api", None)):
             name = f"{__package__}.series_panels" if __package__ else "series_panels"
@@ -903,6 +1000,7 @@ class GroupChroniclePlugin(Star):
         """插件卸载入口: 移除每周定时任务 / 清理投票状态与渲染缓存
         (任何异常只记录, 不抛出)。"""
         self._terminating = True
+        invalidate_lm_cache()
         self.culture_web.close()
         panel = getattr(self, "_series_panels", None)
         if panel is not None:
@@ -2528,14 +2626,24 @@ class GroupChroniclePlugin(Star):
                         self._cfg("top_n_bios", 3),
                     )
                 )
-                return tgts, history.privacy_key(umo), history.store.revision(umo)
+                return (
+                    tgts,
+                    history.privacy_key(umo),
+                    history.store.privacy_revision(umo),
+                )
 
-            targets, privacy, revision = await asyncio.to_thread(_load_bio_inputs)
-            text = (
-                "\n\n".join([await history.biography(umo, uid) for uid in targets])
-                if targets
-                else "本期暂无已入史的贡献事件；可以 @成员 查看其基础小记。"
-            )
+            targets, privacy, privacy_rev = await asyncio.to_thread(_load_bio_inputs)
+            if targets:
+                bio_sem = asyncio.Semaphore(2)
+
+                async def _run_history_bio(uid: str) -> str:
+                    async with bio_sem:
+                        return await history.biography(umo, uid)
+
+                bios = await asyncio.gather(*(_run_history_bio(uid) for uid in targets))
+                text = "\n\n".join(bios)
+            else:
+                text = "本期暂无已入史的贡献事件；可以 @成员 查看其基础小记。"
 
             async def still_public():
                 if not await history.allowed(umo):
@@ -2544,7 +2652,7 @@ class GroupChroniclePlugin(Star):
                 def _check_bio_state():
                     return (
                         history.privacy_key(umo) == privacy
-                        and history.store.revision(umo) == revision
+                        and history.store.privacy_revision(umo) == privacy_rev
                     )
 
                 return await asyncio.to_thread(_check_bio_state)
@@ -2615,10 +2723,11 @@ class GroupChroniclePlugin(Star):
         provider_id = self._llm_provider_id()
         style = str(self._cfg("chronicle_style", "official"))
         timeout = float(self._cfg("generation_timeout_sec", 180))
-        parts: list[str] = []
-        for member in members:
+        bio_sem = asyncio.Semaphore(2)
+
+        async def _run_legacy_bio(member: dict) -> tuple[str, str]:
             name = member.get("sender_name") or member.get("sender_id") or "未知成员"
-            try:
+            async with bio_sem:
                 bio = await asyncio.wait_for(
                     generate_biography(
                         self.context,
@@ -2633,7 +2742,18 @@ class GroupChroniclePlugin(Star):
                     ),
                     timeout=timeout,
                 )
-            except asyncio.TimeoutError:
+            return name, bio
+
+        results = await asyncio.gather(
+            *(_run_legacy_bio(member) for member in members),
+            return_exceptions=True,
+        )
+        parts: list[str] = []
+        for member, res in zip(members, results):
+            name = member.get("sender_name") or member.get("sender_id") or "未知成员"
+            if isinstance(res, asyncio.CancelledError):
+                raise res
+            if isinstance(res, asyncio.TimeoutError):
                 logger.warning(f"[群史记] 传记生成超时 (>{timeout:.0f}s) umo={umo}")
                 await self._reply(
                     event,
@@ -2642,7 +2762,7 @@ class GroupChroniclePlugin(Star):
                     prefer_context=prefer_context,
                 )
                 return
-            except LLMUnavailableError:
+            if isinstance(res, LLMUnavailableError):
                 await self._reply(
                     event,
                     "未配置可用的 LLM，无法生成人物传记",
@@ -2650,9 +2770,11 @@ class GroupChroniclePlugin(Star):
                     prefer_context=prefer_context,
                 )
                 return
-            except Exception as e:  # noqa: BLE001
-                logger.warning(f"生成成员 {name} 传记失败: {e}")
+            if isinstance(res, Exception):
+                logger.warning(f"生成成员 {name} 传记失败: {res}")
                 bio = "（传记生成失败）"
+            else:
+                name, bio = res
             parts.append(f"## 人物传记：{name}\n{bio}")
         await deliver_text(
             self.context,

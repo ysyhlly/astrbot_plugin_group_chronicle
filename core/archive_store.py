@@ -202,9 +202,18 @@ class ArchiveStore:
         self._lock = self._locks.setdefault(str(self.path.resolve()), threading.RLock())
         self._local = threading.local()
         self._generation = 0
+        self._write_ops = 0
+        self._last_checkpoint_ts = time.monotonic()
+        self._last_prune_ts = 0.0
         self._journal_mode = _resolve_journal_mode(self.path)
         with self._lock:
             db = self._ensure_conn()
+            try:
+                av_row = db.execute("PRAGMA auto_vacuum").fetchone()
+                if av_row is None or int(av_row[0]) != 2:
+                    db.execute("PRAGMA auto_vacuum=INCREMENTAL").fetchall()
+            except sqlite3.Error:
+                pass
             try:
                 row = db.execute(f"PRAGMA journal_mode={self._journal_mode}").fetchone()
                 if self._journal_mode == "WAL" and (
@@ -239,7 +248,9 @@ class ArchiveStore:
                     observed REAL NOT NULL, joined REAL, departed REAL,
                     closed INTEGER NOT NULL DEFAULT 0, reason TEXT DEFAULT '');
                 CREATE INDEX IF NOT EXISTS periods_member ON periods(umo,uid,observed);
-                CREATE TABLE IF NOT EXISTS notices (key TEXT PRIMARY KEY);
+                CREATE TABLE IF NOT EXISTS notices (
+                    key TEXT PRIMARY KEY,
+                    created REAL NOT NULL DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS events (
                     id INTEGER PRIMARY KEY, umo TEXT NOT NULL, fingerprint TEXT NOT NULL,
                     status TEXT NOT NULL, payload TEXT NOT NULL, event_at REAL NOT NULL,
@@ -274,8 +285,22 @@ class ArchiveStore:
                     entry TEXT NOT NULL, created REAL NOT NULL, invalid INTEGER DEFAULT 0,
                     UNIQUE(umo,cache_key));
                 CREATE INDEX IF NOT EXISTS reports_umo_created ON reports(umo,invalid,created DESC,id DESC);
+                CREATE TABLE IF NOT EXISTS report_drafts (
+                    umo TEXT NOT NULL, facts_key TEXT NOT NULL, stage TEXT NOT NULL,
+                    privacy_revision INTEGER NOT NULL DEFAULT 0,
+                    payload TEXT NOT NULL, updated REAL NOT NULL,
+                    PRIMARY KEY(umo,facts_key));
                 PRAGMA user_version=1;
             """)
+            group_columns = {r[1] for r in db.execute("PRAGMA table_info(groups)")}
+            if "privacy_revision" not in group_columns:
+                db.execute(
+                    "ALTER TABLE groups ADD COLUMN privacy_revision INTEGER NOT NULL DEFAULT 0"
+                )
+            if "content_revision" not in group_columns:
+                db.execute(
+                    "ALTER TABLE groups ADD COLUMN content_revision INTEGER NOT NULL DEFAULT 0"
+                )
             if "last_event_at" not in {
                 r[1] for r in db.execute("PRAGMA table_info(events)")
             }:
@@ -295,6 +320,15 @@ class ArchiveStore:
                 )
             db.execute(
                 "CREATE INDEX IF NOT EXISTS events_end ON events(umo,status,last_event_at)"
+            )
+            if "created" not in {
+                r[1] for r in db.execute("PRAGMA table_info(notices)")
+            }:
+                db.execute(
+                    "ALTER TABLE notices ADD COLUMN created REAL NOT NULL DEFAULT 0"
+                )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS revisions_created ON revisions(umo,entity,created)"
             )
             columns = {r[1] for r in db.execute("PRAGMA table_info(jobs)")}
             for mode in ("back", "live"):
@@ -346,7 +380,7 @@ class ArchiveStore:
         return conn
 
     def close(self):
-        """Invalidate cached connections and close the calling thread's handle."""
+        """Checkpoint WAL, invalidate cached connections, and close the calling thread's handle."""
         with self._lock:
             self._generation += 1
             conn = getattr(self._local, "conn", None)
@@ -354,24 +388,94 @@ class ArchiveStore:
                 try:
                     if conn.in_transaction:
                         conn.rollback()
+                    if self._journal_mode == "WAL":
+                        try:
+                            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+                        except sqlite3.Error:
+                            pass
                     conn.close()
                 except sqlite3.Error:
                     pass
                 self._local.conn = None
                 self._local.depth = 0
                 self._local.in_write = False
+            elif self._journal_mode == "WAL" and self.path.exists():
+                tmp_conn = None
+                try:
+                    tmp_conn = self._open_conn()
+                    tmp_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+                except sqlite3.Error:
+                    pass
+                finally:
+                    if tmp_conn is not None:
+                        try:
+                            tmp_conn.close()
+                        except sqlite3.Error:
+                            pass
+
+    def checkpoint(self, *, mode: str = "PASSIVE", vacuum_pages: int = 128) -> dict:
+        """Run bounded WAL checkpoint and incremental vacuum."""
+        safe_mode = mode.upper() if str(mode).upper() in ("PASSIVE", "FULL", "RESTART", "TRUNCATE") else "PASSIVE"
+        result = {"journal_mode": self._journal_mode, "checkpoint": None, "vacuum_pages": 0}
+        with self._lock:
+            if getattr(self._local, "depth", 0) > 0:
+                return result
+            db = self._ensure_conn()
+            if db.in_transaction:
+                db.rollback()
+            if self._journal_mode == "WAL":
+                try:
+                    row = db.execute(f"PRAGMA wal_checkpoint({safe_mode})").fetchone()
+                    if row is not None:
+                        result["checkpoint"] = tuple(row)
+                except sqlite3.Error:
+                    pass
+            if vacuum_pages > 0:
+                try:
+                    db.execute(f"PRAGMA incremental_vacuum({int(vacuum_pages)})").fetchall()
+                    result["vacuum_pages"] = int(vacuum_pages)
+                except sqlite3.Error:
+                    pass
+            self._last_checkpoint_ts = time.monotonic()
+        return result
+
+    def _maybe_periodic_checkpoint(self) -> None:
+        if self._journal_mode != "WAL":
+            return
+        should_run = False
+        with self._lock:
+            self._write_ops += 1
+            now = time.monotonic()
+            if self._write_ops >= 200 or (now - self._last_checkpoint_ts) >= 1800.0:
+                self._write_ops = 0
+                should_run = True
+        if should_run:
+            try:
+                self.checkpoint(mode="PASSIVE", vacuum_pages=64)
+            except sqlite3.Error:
+                pass
 
     @contextmanager
-    def connection(self, *, write=False):
+    def connection(self, *, write=False, read_snapshot=False):
         """Borrow the thread-cached SQLite connection with nested transaction safety.
+
+        In WAL mode, read-only connections bypass the shared writer lock so
+        concurrent reader threads do not serialize behind background writes.
+        In rollback (DELETE) mode, all operations share ``self._lock``.
 
         Args:
             write: Acquire the shared writer lock and start a transaction.
+            read_snapshot: When True on a top-level WAL read, start a DEFERRED
+                read transaction for MVCC snapshot consistency across queries.
 
         Yields:
             A connection with named rows.
         """
-        with self._lock:
+        need_lock = bool(write) or self._journal_mode != "WAL"
+        if need_lock:
+            self._lock.acquire()
+        should_checkpoint = False
+        try:
             depth = getattr(self._local, "depth", 0)
             if depth == 0:
                 db = self._ensure_conn()
@@ -382,9 +486,12 @@ class ArchiveStore:
                 try:
                     if write:
                         db.execute("BEGIN IMMEDIATE")
+                    elif read_snapshot and self._journal_mode == "WAL":
+                        db.execute("BEGIN DEFERRED")
                     yield db
                     if write:
                         db.commit()
+                        should_checkpoint = True
                     elif db.in_transaction:
                         db.rollback()
                 except BaseException:
@@ -406,6 +513,8 @@ class ArchiveStore:
                             sp_name = f"_sp_{depth}"
                             db.execute(f"SAVEPOINT {sp_name}")
                         else:
+                            if db.in_transaction:
+                                db.rollback()
                             db.execute("BEGIN IMMEDIATE")
                             self._local.in_write = True
                             started_write = True
@@ -414,6 +523,7 @@ class ArchiveStore:
                         db.execute(f"RELEASE SAVEPOINT {sp_name}")
                     elif started_write:
                         db.commit()
+                        should_checkpoint = True
                 except BaseException:
                     if sp_name is not None:
                         db.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
@@ -425,18 +535,32 @@ class ArchiveStore:
                     if started_write:
                         self._local.in_write = False
                     self._local.depth = depth
+        finally:
+            if need_lock:
+                self._lock.release()
+        if should_checkpoint:
+            self._maybe_periodic_checkpoint()
 
     @staticmethod
-    def _bump(db, umo, *, invalidate=False):
-        """Advance the fact revision inside an existing transaction.
+    def _bump(db, umo, *, invalidate=False, privacy=False):
+        """Advance fact revision inside an existing transaction.
 
-        Args:
-            db: Active transaction.
-            umo: Group session.
-            invalidate: Suppress previously generated editions after a correction.
+        Splits updates into ``privacy_revision`` (hide/leave/retract/revise safety
+        boundaries) and ``content_revision`` (ordinary messages, nicknames, new
+        events) while always incrementing legacy ``revision`` for compatibility.
         """
         db.execute("INSERT OR IGNORE INTO groups(umo) VALUES(?)", (umo,))
-        db.execute("UPDATE groups SET revision=revision+1 WHERE umo=?", (umo,))
+        if privacy:
+            db.execute(
+                "UPDATE groups SET revision=revision+1, privacy_revision=privacy_revision+1 WHERE umo=?",
+                (umo,),
+            )
+            db.execute("DELETE FROM report_drafts WHERE umo=?", (umo,))
+        else:
+            db.execute(
+                "UPDATE groups SET revision=revision+1, content_revision=content_revision+1 WHERE umo=?",
+                (umo,),
+            )
         if invalidate:
             db.execute("UPDATE reports SET invalid=1 WHERE umo=?", (umo,))
 
@@ -468,7 +592,7 @@ class ArchiveStore:
             return [r[0] for r in db.execute("SELECT umo FROM groups ORDER BY umo")]
 
     def revision(self, umo):
-        """Read a fact revision without registering a disallowed group.
+        """Read combined fact revision (compatible with legacy callers).
 
         Args:
             umo: Group session.
@@ -482,8 +606,24 @@ class ArchiveStore:
             ).fetchone()
             return row[0] if row else 0
 
+    def privacy_revision(self, umo):
+        """Read safety/privacy boundary revision (hide/leave/retract/revise)."""
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT privacy_revision FROM groups WHERE umo=?", (umo,)
+            ).fetchone()
+            return row[0] if row else 0
+
+    def content_revision(self, umo):
+        """Read content revision (ordinary messages, nickname updates, new events)."""
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT content_revision FROM groups WHERE umo=?", (umo,)
+            ).fetchone()
+            return row[0] if row else 0
+
     def snapshot(self, umo, *, since=0, uid=None, rules=None):
-        """Read related facts and their revision under the same writer lock.
+        """Read related facts and revisions from a consistent WAL read snapshot.
 
         Args:
             umo: Group session.
@@ -492,11 +632,13 @@ class ArchiveStore:
             rules: Biography grade thresholds.
 
         Returns:
-            Consistent facts, revision, member, and grade data.
+            Consistent facts, revisions, member, and grade data.
         """
-        with self._lock:
+        with self.connection(write=False, read_snapshot=True):
             return {
                 "revision": self.revision(umo),
+                "privacy_revision": self.privacy_revision(umo),
+                "content_revision": self.content_revision(umo),
                 "facts": self.events(umo, since=since, uid=uid),
                 "member": self.member(umo, uid) if uid is not None else None,
                 "grade": self.grade(umo, uid, rules) if uid is not None else None,
@@ -545,7 +687,8 @@ class ArchiveStore:
                 ),
             )
             if changed:
-                ArchiveStore._bump(db, umo, invalidate=bool(old["hidden"]))
+                is_hidden = bool(old["hidden"])
+                ArchiveStore._bump(db, umo, invalidate=is_hidden, privacy=is_hidden)
         else:
             db.execute(
                 "INSERT INTO members VALUES(?,?,?,?,?,?,0)",
@@ -623,7 +766,10 @@ class ArchiveStore:
             raise ValueError("无效的入退群通知")
         with self.connection(write=True) as db:
             if (
-                db.execute("INSERT OR IGNORE INTO notices VALUES(?)", (key,)).rowcount
+                db.execute(
+                    "INSERT OR IGNORE INTO notices(key, created) VALUES(?, ?)",
+                    (key, float(ts)),
+                ).rowcount
                 == 0
             ):
                 return False
@@ -698,7 +844,7 @@ class ArchiveStore:
                         "UPDATE periods SET departed=?,closed=1,reason=? WHERE id=?",
                         (ts, reason, p["id"]),
                     )
-            self._bump(db, umo)
+            self._bump(db, umo, privacy=(kind == "leave"))
             return True
 
     def member(self, umo, uid):
@@ -1230,6 +1376,91 @@ class ArchiveStore:
                 )
             return True
 
+    def refund_quota(self, day, *, kind=None):
+        """Refund one previously reserved daily extraction slot (e.g. on LLM failure/busy)."""
+        with self.connection(write=True) as db:
+            db.execute(
+                "UPDATE quota SET used=MAX(0, used-1) WHERE day=?",
+                (day,),
+            )
+            if kind in ("history", "culture"):
+                db.execute(
+                    "UPDATE quota_buckets SET used=MAX(0, used-1) WHERE day=? AND kind=?",
+                    (day, kind),
+                )
+
+    def prune_retention(
+        self,
+        *,
+        revisions_days: int = 90,
+        notices_days: int = 90,
+        quota_days: int = 30,
+        max_revisions_per_group: int = 500,
+        max_notices: int = 50000,
+        now: float | None = None,
+    ) -> dict[str, int]:
+        """Prune aged revisions, notices, and quota rows, then incrementally vacuum."""
+        now_ts = float(now if now is not None else time.time())
+        rev_cutoff = now_ts - max(1, int(revisions_days)) * 86400.0
+        notice_cutoff = now_ts - max(1, int(notices_days)) * 86400.0
+        quota_cutoff_day = datetime.fromtimestamp(
+            now_ts - max(1, int(quota_days)) * 86400.0
+        ).date().isoformat()
+        deleted = {"revisions": 0, "notices": 0, "quota": 0, "quota_buckets": 0}
+        with self.connection(write=True) as db:
+            # Preserve entity='coverage' rows (coverage gap audit history).
+            cur = db.execute(
+                "DELETE FROM revisions WHERE entity!='coverage' AND created < ?",
+                (rev_cutoff,),
+            )
+            deleted["revisions"] += max(0, cur.rowcount)
+            if max_revisions_per_group > 0:
+                umos = [
+                    r[0]
+                    for r in db.execute(
+                        "SELECT DISTINCT umo FROM revisions WHERE entity!='coverage'"
+                    )
+                ]
+                for umo in umos:
+                    cur = db.execute(
+                        """DELETE FROM revisions WHERE id IN (
+                               SELECT id FROM revisions
+                               WHERE umo=? AND entity!='coverage'
+                               ORDER BY created DESC, id DESC
+                               LIMIT -1 OFFSET ?
+                           )""",
+                        (umo, int(max_revisions_per_group)),
+                    )
+                    deleted["revisions"] += max(0, cur.rowcount)
+
+            cur = db.execute(
+                "DELETE FROM notices WHERE created > 0 AND created < ?",
+                (notice_cutoff,),
+            )
+            deleted["notices"] += max(0, cur.rowcount)
+            if max_notices > 0:
+                cur = db.execute(
+                    """DELETE FROM notices WHERE rowid IN (
+                           SELECT rowid FROM notices
+                           ORDER BY created DESC, rowid DESC
+                           LIMIT -1 OFFSET ?
+                       )""",
+                    (int(max_notices),),
+                )
+                deleted["notices"] += max(0, cur.rowcount)
+
+            cur = db.execute("DELETE FROM quota WHERE day < ?", (quota_cutoff_day,))
+            deleted["quota"] += max(0, cur.rowcount)
+            cur = db.execute(
+                "DELETE FROM quota_buckets WHERE day < ?", (quota_cutoff_day,)
+            )
+            deleted["quota_buckets"] += max(0, cur.rowcount)
+
+        self._last_prune_ts = time.monotonic()
+        if any(deleted.values()):
+            self.checkpoint(mode="PASSIVE", vacuum_pages=256)
+        return deleted
+
     def quota(self, day):
         """Read global extraction usage.
 
@@ -1435,7 +1666,7 @@ class ArchiveStore:
                 "UPDATE corrections SET resolved=1 WHERE umo=? AND event_id=?",
                 (umo, event_id),
             )
-            self._bump(db, umo, invalidate=True)
+            self._bump(db, umo, invalidate=True, privacy=(action in ("reject", "revise")))
 
     def correction(self, umo, event_id, uid, note):
         """Submit a correction without changing shared facts.
@@ -1510,7 +1741,7 @@ class ArchiveStore:
                     "INSERT OR IGNORE INTO hides VALUES(?,?,?)",
                     (umo, str(uid), int(event_id)),
                 )
-            self._bump(db, umo, invalidate=True)
+            self._bump(db, umo, invalidate=True, privacy=True)
 
     def grade(self, umo, uid, rules=None):
         """Derive a transparent lifetime grade from distinct admitted contributions.
@@ -1656,26 +1887,110 @@ class ArchiveStore:
             (umo, _MAX_INVALID_FORCED_REVISION_PER_GROUP),
         )
 
-    def save_report(self, umo, key, entry, *, expected_revision=None):
+    def save_report_draft(
+        self, umo, facts_key, *, stage, payload, privacy_revision
+    ):
+        """Persist a resumable stage draft (e.g. ``stage='prose_ready'``) keyed by ``facts_key``."""
+        with self.connection(write=True) as db:
+            row = db.execute(
+                "SELECT privacy_revision FROM groups WHERE umo=?", (umo,)
+            ).fetchone()
+            current_priv = row[0] if row else 0
+            if current_priv != int(privacy_revision):
+                raise ValueError("档案隐私或安全边界已变化，阶段草稿未保存")
+            db.execute(
+                """INSERT OR REPLACE INTO report_drafts(
+                       umo, facts_key, stage, privacy_revision, payload, updated
+                   ) VALUES(?,?,?,?,?,?)""",
+                (
+                    umo,
+                    str(facts_key),
+                    str(stage),
+                    int(privacy_revision),
+                    encode(payload),
+                    time.time(),
+                ),
+            )
+            # Keep only the latest 10 drafts per group to bound storage
+            db.execute(
+                """DELETE FROM report_drafts WHERE umo=? AND facts_key NOT IN (
+                       SELECT facts_key FROM report_drafts
+                       WHERE umo=? ORDER BY updated DESC LIMIT 10
+                   )""",
+                (umo, umo),
+            )
+
+    def load_report_draft(self, umo, facts_key, *, expected_privacy_revision=None):
+        """Load a persisted stage draft if it matches the current privacy boundary."""
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT stage, privacy_revision, payload, updated FROM report_drafts WHERE umo=? AND facts_key=?",
+                (umo, str(facts_key)),
+            ).fetchone()
+            if not row:
+                return None
+            if (
+                expected_privacy_revision is not None
+                and int(row["privacy_revision"]) != int(expected_privacy_revision)
+            ):
+                return None
+            try:
+                data = json.loads(row["payload"])
+            except (ValueError, TypeError):
+                return None
+            if not isinstance(data, dict):
+                return None
+            return {
+                **data,
+                "stage": str(row["stage"]),
+                "privacy_revision": int(row["privacy_revision"]),
+                "updated": float(row["updated"]),
+            }
+
+    def delete_report_draft(self, umo, facts_key):
+        """Remove a completed draft once the final edition has been saved."""
+        with self.connection(write=True) as db:
+            db.execute(
+                "DELETE FROM report_drafts WHERE umo=? AND facts_key=?",
+                (umo, str(facts_key)),
+            )
+
+    def save_report(
+        self,
+        umo,
+        key,
+        entry,
+        *,
+        expected_revision=None,
+        expected_privacy_revision=None,
+    ):
         """Save a new edition without overwriting previous revisions.
 
         Args:
             umo: Group session.
             key: Unique cache key.
             entry: Compatible chronicle entry.
-            expected_revision: Optional optimistic fact revision checked atomically.
+            expected_revision: Optional optimistic combined fact revision checked atomically.
+            expected_privacy_revision: Optional optimistic privacy-boundary revision checked atomically.
 
         Returns:
             Stored report ID.
         """
         base_key = key.split(":forced:", 1)[0].split(":revision:", 1)[0]
         with self.connection(write=True) as db:
-            if expected_revision is not None:
+            if expected_revision is not None or expected_privacy_revision is not None:
                 group = db.execute(
-                    "SELECT revision FROM groups WHERE umo=?", (umo,)
+                    "SELECT revision, privacy_revision FROM groups WHERE umo=?", (umo,)
                 ).fetchone()
-                if (group[0] if group else 0) != expected_revision:
+                cur_rev = group[0] if group else 0
+                cur_priv = group[1] if group else 0
+                if expected_revision is not None and cur_rev != expected_revision:
                     raise ValueError("档案事实已变化，本次文章未保存，请重新生成")
+                if (
+                    expected_privacy_revision is not None
+                    and cur_priv != expected_privacy_revision
+                ):
+                    raise ValueError("档案隐私或安全边界已变化，本次文章未保存，请重新生成")
             row = db.execute(
                 "SELECT id,invalid FROM reports WHERE umo=? AND cache_key=?", (umo, key)
             ).fetchone()
