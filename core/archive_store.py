@@ -11,6 +11,7 @@ import re
 import sqlite3
 import threading
 import time
+from collections import deque
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -200,35 +201,60 @@ class ArchiveStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = self._locks.setdefault(str(self.path.resolve()), threading.RLock())
+        self._pool_lock = threading.Lock()
         self._local = threading.local()
+        self._idle_pool: deque[tuple[sqlite3.Connection, int, float]] = deque()
+        self._all_conns: set[sqlite3.Connection] = set()
+        self._in_use: set[sqlite3.Connection] = set()
+        self._max_pool_size = 6
+        self._idle_timeout_sec = 60.0
         self._generation = 0
         self._write_ops = 0
         self._last_checkpoint_ts = time.monotonic()
         self._last_prune_ts = 0.0
+        self._auto_vacuum_enabled = False
         self._journal_mode = _resolve_journal_mode(self.path)
         with self._lock:
-            db = self._ensure_conn()
+            db, gen = self._checkout_conn()
             try:
-                av_row = db.execute("PRAGMA auto_vacuum").fetchone()
-                if av_row is None or int(av_row[0]) != 2:
-                    db.execute("PRAGMA auto_vacuum=INCREMENTAL").fetchall()
-            except sqlite3.Error:
-                pass
-            try:
-                row = db.execute(f"PRAGMA journal_mode={self._journal_mode}").fetchone()
-                if self._journal_mode == "WAL" and (
-                    not row or str(row[0]).lower() != "wal"
-                ):
-                    self._journal_mode = "DELETE"
-                    db.execute("PRAGMA journal_mode=DELETE").fetchall()
-            except sqlite3.Error:
-                self._journal_mode = "DELETE"
                 try:
-                    db.execute("PRAGMA journal_mode=DELETE").fetchall()
+                    av_row = db.execute("PRAGMA auto_vacuum").fetchone()
+                    if av_row is None or int(av_row[0]) != 2:
+                        db.execute("PRAGMA auto_vacuum=INCREMENTAL").fetchall()
+                        av_after = db.execute("PRAGMA auto_vacuum").fetchone()
+                        if av_after is None or int(av_after[0]) != 2:
+                            pages_row = db.execute("PRAGMA page_count").fetchone()
+                            pages = int(pages_row[0]) if pages_row else 0
+                            if 0 < pages <= 25000:
+                                db.execute("VACUUM").fetchall()
+                                av_after = db.execute("PRAGMA auto_vacuum").fetchone()
+                        self._auto_vacuum_enabled = bool(
+                            av_after is not None and int(av_after[0]) == 2
+                        )
+                    else:
+                        self._auto_vacuum_enabled = True
                 except sqlite3.Error:
-                    pass
-                self.close()
-                _downgrade_to_rollback(self.path)
+                    self._auto_vacuum_enabled = False
+                try:
+                    row = db.execute(f"PRAGMA journal_mode={self._journal_mode}").fetchone()
+                    if self._journal_mode == "WAL" and (
+                        not row or str(row[0]).lower() != "wal"
+                    ):
+                        self._journal_mode = "DELETE"
+                        db.execute("PRAGMA journal_mode=DELETE").fetchall()
+                except sqlite3.Error:
+                    self._journal_mode = "DELETE"
+                    try:
+                        db.execute("PRAGMA journal_mode=DELETE").fetchall()
+                    except sqlite3.Error:
+                        pass
+                    self._return_conn(db, gen)
+                    db = None
+                    self.close()
+                    _downgrade_to_rollback(self.path)
+            finally:
+                if db is not None:
+                    self._return_conn(db, gen)
         with self.connection(write=True) as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
             if version not in (0, 1):
@@ -330,6 +356,24 @@ class ArchiveStore:
             db.execute(
                 "CREATE INDEX IF NOT EXISTS revisions_created ON revisions(umo,entity,created)"
             )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS revisions_cleanup ON revisions(created,entity)"
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS notices_created ON notices(created)"
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS corrections_group ON corrections(umo,resolved,created)"
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS hides_event ON hides(umo,event_id)"
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS report_drafts_updated ON report_drafts(updated)"
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS events_updated ON events(umo,updated)"
+            )
             columns = {r[1] for r in db.execute("PRAGMA table_info(jobs)")}
             for mode in ("back", "live"):
                 for field, decl in (
@@ -341,8 +385,8 @@ class ArchiveStore:
                         db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {decl}")
 
     def _open_conn(self):
-        """Open one thread-affine SQLite connection with safe concurrency pragmas."""
-        db = sqlite3.connect(self.path, timeout=10, check_same_thread=True)
+        """Open one managed SQLite connection with safe concurrency pragmas."""
+        db = sqlite3.connect(self.path, timeout=10, check_same_thread=False)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA busy_timeout=10000").close()
         db.execute("PRAGMA foreign_keys=ON").close()
@@ -354,52 +398,148 @@ class ArchiveStore:
         db.execute("PRAGMA temp_store=MEMORY").close()
         return db
 
-    def _ensure_conn(self):
-        """Return or recreate the current thread's cached connection."""
-        conn = getattr(self._local, "conn", None)
-        gen = getattr(self._local, "gen", -1)
-        if conn is not None:
-            if gen != self._generation:
-                try:
-                    if conn.in_transaction:
-                        conn.rollback()
-                    conn.close()
-                except sqlite3.Error:
-                    pass
-                conn = None
-            else:
-                try:
-                    if conn.in_transaction and getattr(self._local, "depth", 0) == 0:
-                        conn.rollback()
-                except sqlite3.Error:
-                    conn = None
+    @staticmethod
+    def _close_handle(conn: sqlite3.Connection | None) -> None:
         if conn is None:
-            conn = self._open_conn()
-            self._local.conn = conn
-            self._local.gen = self._generation
-        return conn
+            return
+        try:
+            if conn.in_transaction:
+                conn.rollback()
+        except sqlite3.Error:
+            pass
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+
+    def open_connection_count(self) -> int:
+        """Return the number of currently tracked live SQLite connections."""
+        with self._pool_lock:
+            return len(self._all_conns)
+
+    def reclaim_idle(self, *, max_idle_sec: float | None = None) -> int:
+        """Close pooled connections that have been idle past the threshold."""
+        threshold = (
+            float(self._idle_timeout_sec)
+            if max_idle_sec is None
+            else max(0.0, float(max_idle_sec))
+        )
+        now = time.monotonic()
+        to_close: list[sqlite3.Connection] = []
+        with self._pool_lock:
+            kept: deque[tuple[sqlite3.Connection, int, float]] = deque()
+            while self._idle_pool:
+                conn, gen, idle_since = self._idle_pool.popleft()
+                if (
+                    gen != self._generation
+                    or threshold <= 0.0
+                    or (now - idle_since) >= threshold
+                ):
+                    self._all_conns.discard(conn)
+                    to_close.append(conn)
+                else:
+                    kept.append((conn, gen, idle_since))
+            self._idle_pool = kept
+        for conn in to_close:
+            self._close_handle(conn)
+        return len(to_close)
+
+    def _checkout_conn(self) -> tuple[sqlite3.Connection, int]:
+        """Borrow an exclusive SQLite connection from the bounded pool."""
+        now = time.monotonic()
+        to_close: list[sqlite3.Connection] = []
+        chosen: tuple[sqlite3.Connection, int] | None = None
+        with self._pool_lock:
+            while self._idle_pool:
+                conn, gen, idle_since = self._idle_pool.pop()
+                if (
+                    gen != self._generation
+                    or (now - idle_since) >= self._idle_timeout_sec
+                ):
+                    self._all_conns.discard(conn)
+                    to_close.append(conn)
+                    continue
+                self._in_use.add(conn)
+                chosen = (conn, gen)
+                break
+            cur_gen = self._generation
+        for stale in to_close:
+            self._close_handle(stale)
+        if chosen is not None:
+            conn, gen = chosen
+            try:
+                if conn.in_transaction:
+                    conn.rollback()
+                return conn, gen
+            except sqlite3.Error:
+                with self._pool_lock:
+                    self._in_use.discard(conn)
+                    self._all_conns.discard(conn)
+                self._close_handle(conn)
+        conn = self._open_conn()
+        with self._pool_lock:
+            cur_gen = self._generation
+            self._all_conns.add(conn)
+            self._in_use.add(conn)
+        return conn, cur_gen
+
+    def _return_conn(self, conn: sqlite3.Connection, gen: int) -> None:
+        """Return a checked-out connection to the bounded idle pool or close it."""
+        healthy = True
+        try:
+            if conn.in_transaction:
+                conn.rollback()
+        except sqlite3.Error:
+            healthy = False
+        now = time.monotonic()
+        to_close: list[sqlite3.Connection] = []
+        with self._pool_lock:
+            self._in_use.discard(conn)
+            if (
+                not healthy
+                or gen != self._generation
+                or len(self._idle_pool) >= self._max_pool_size
+            ):
+                self._all_conns.discard(conn)
+                to_close.append(conn)
+            else:
+                self._idle_pool.append((conn, gen, now))
+            while self._idle_pool:
+                oldest_conn, oldest_gen, oldest_ts = self._idle_pool[0]
+                if (
+                    oldest_gen != self._generation
+                    or (now - oldest_ts) >= self._idle_timeout_sec
+                ):
+                    self._idle_pool.popleft()
+                    self._all_conns.discard(oldest_conn)
+                    to_close.append(oldest_conn)
+                else:
+                    break
+        for stale in to_close:
+            self._close_handle(stale)
 
     def close(self):
-        """Checkpoint WAL, invalidate cached connections, and close the calling thread's handle."""
+        """Close all tracked pooled connections across all worker threads and truncate WAL."""
         with self._lock:
-            self._generation += 1
-            conn = getattr(self._local, "conn", None)
-            if conn is not None:
-                try:
-                    if conn.in_transaction:
-                        conn.rollback()
-                    if self._journal_mode == "WAL":
-                        try:
-                            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
-                        except sqlite3.Error:
-                            pass
-                    conn.close()
-                except sqlite3.Error:
-                    pass
+            to_close: list[sqlite3.Connection] = []
+            with self._pool_lock:
+                self._generation += 1
+                while self._idle_pool:
+                    conn, _, _ = self._idle_pool.popleft()
+                    self._all_conns.discard(conn)
+                    to_close.append(conn)
+                # Close any untracked-as-idle connections that are not actively in-use
+                dangling = [c for c in self._all_conns if c not in self._in_use]
+                for conn in dangling:
+                    self._all_conns.discard(conn)
+                    to_close.append(conn)
+            for conn in to_close:
+                self._close_handle(conn)
+            if getattr(self._local, "depth", 0) == 0:
                 self._local.conn = None
-                self._local.depth = 0
+                self._local.gen = -1
                 self._local.in_write = False
-            elif self._journal_mode == "WAL" and self.path.exists():
+            if self._journal_mode == "WAL" and self.path.exists():
                 tmp_conn = None
                 try:
                     tmp_conn = self._open_conn()
@@ -407,36 +547,44 @@ class ArchiveStore:
                 except sqlite3.Error:
                     pass
                 finally:
-                    if tmp_conn is not None:
-                        try:
-                            tmp_conn.close()
-                        except sqlite3.Error:
-                            pass
+                    self._close_handle(tmp_conn)
 
     def checkpoint(self, *, mode: str = "PASSIVE", vacuum_pages: int = 128) -> dict:
-        """Run bounded WAL checkpoint and incremental vacuum."""
+        """Reclaim idle handles, run bounded WAL checkpoint, and incremental vacuum."""
         safe_mode = mode.upper() if str(mode).upper() in ("PASSIVE", "FULL", "RESTART", "TRUNCATE") else "PASSIVE"
-        result = {"journal_mode": self._journal_mode, "checkpoint": None, "vacuum_pages": 0}
+        result = {
+            "journal_mode": self._journal_mode,
+            "checkpoint": None,
+            "vacuum_pages": 0,
+            "auto_vacuum_incremental": self._auto_vacuum_enabled,
+            "reclaimed_conns": 0,
+        }
         with self._lock:
             if getattr(self._local, "depth", 0) > 0:
                 return result
-            db = self._ensure_conn()
-            if db.in_transaction:
-                db.rollback()
-            if self._journal_mode == "WAL":
-                try:
-                    row = db.execute(f"PRAGMA wal_checkpoint({safe_mode})").fetchone()
-                    if row is not None:
-                        result["checkpoint"] = tuple(row)
-                except sqlite3.Error:
-                    pass
-            if vacuum_pages > 0:
-                try:
-                    db.execute(f"PRAGMA incremental_vacuum({int(vacuum_pages)})").fetchall()
-                    result["vacuum_pages"] = int(vacuum_pages)
-                except sqlite3.Error:
-                    pass
-            self._last_checkpoint_ts = time.monotonic()
+            result["reclaimed_conns"] = self.reclaim_idle(
+                max_idle_sec=0.0 if safe_mode == "TRUNCATE" else self._idle_timeout_sec
+            )
+            db, gen = self._checkout_conn()
+            try:
+                if db.in_transaction:
+                    db.rollback()
+                if self._journal_mode == "WAL":
+                    try:
+                        row = db.execute(f"PRAGMA wal_checkpoint({safe_mode})").fetchone()
+                        if row is not None:
+                            result["checkpoint"] = tuple(row)
+                    except sqlite3.Error:
+                        pass
+                if vacuum_pages > 0 and self._auto_vacuum_enabled:
+                    try:
+                        db.execute(f"PRAGMA incremental_vacuum({int(vacuum_pages)})").fetchall()
+                        result["vacuum_pages"] = int(vacuum_pages)
+                    except sqlite3.Error:
+                        pass
+                self._last_checkpoint_ts = time.monotonic()
+            finally:
+                self._return_conn(db, gen)
         return result
 
     def _maybe_periodic_checkpoint(self) -> None:
@@ -478,9 +626,9 @@ class ArchiveStore:
         try:
             depth = getattr(self._local, "depth", 0)
             if depth == 0:
-                db = self._ensure_conn()
-                if db.in_transaction:
-                    db.rollback()
+                db, gen = self._checkout_conn()
+                self._local.conn = db
+                self._local.gen = gen
                 self._local.depth = 1
                 self._local.in_write = bool(write)
                 try:
@@ -501,8 +649,13 @@ class ArchiveStore:
                 finally:
                     self._local.depth = 0
                     self._local.in_write = False
+                    self._local.conn = None
+                    self._local.gen = -1
+                    self._return_conn(db, gen)
             else:
-                db = self._ensure_conn()
+                db = getattr(self._local, "conn", None)
+                if db is None:
+                    raise RuntimeError("Re-entrant ArchiveStore connection missing active handle")
                 self._local.depth = depth + 1
                 in_write = getattr(self._local, "in_write", False)
                 sp_name = None
@@ -718,16 +871,24 @@ class ArchiveStore:
                 (umo, uid, ts, int(closed)),
             )
 
-    def observe(self, umo, uid, name, ts=None):
-        """Record a message or roster observation.
+    @staticmethod
+    def _upsert_group(db, umo, group_name=None):
+        db.execute("INSERT OR IGNORE INTO groups(umo) VALUES(?)", (umo,))
+        if group_name:
+            db.execute("UPDATE groups SET name=? WHERE umo=?", (str(group_name), umo))
+
+    def observe(self, umo, uid, name, ts=None, *, group_name=None):
+        """Record a message or roster observation (merging group upsert into one transaction).
 
         Args:
             umo: Group session.
             uid: Member identifier.
             name: Nickname.
             ts: Source timestamp, defaulting to now.
+            group_name: Optional display name to upsert in the same transaction.
         """
         with self.connection(write=True) as db:
+            self._upsert_group(db, umo, group_name)
             self._observe(db, umo, uid, name, float(ts or time.time()))
 
     def roster(self, umo, members, now=None):
@@ -746,7 +907,9 @@ class ArchiveStore:
                 "UPDATE groups SET roster_at=?,unavailable=0 WHERE umo=?", (now, umo)
             )
 
-    def membership(self, umo, uid, kind, ts, key, name=None, reason="", self_id=""):
+    def membership(
+        self, umo, uid, kind, ts, key, name=None, reason="", self_id="", *, group_name=None
+    ):
         """Apply an idempotent OneBot membership notification.
 
         Args:
@@ -758,6 +921,7 @@ class ArchiveStore:
             name: Optional nickname.
             reason: Reported departure subtype.
             self_id: Bot identifier.
+            group_name: Optional group display name updated in the same transaction.
 
         Returns:
             Whether a new notification was applied.
@@ -765,6 +929,7 @@ class ArchiveStore:
         if kind not in ("join", "leave") or not uid or not math.isfinite(ts) or ts <= 0:
             raise ValueError("无效的入退群通知")
         with self.connection(write=True) as db:
+            self._upsert_group(db, umo, group_name)
             if (
                 db.execute(
                     "INSERT OR IGNORE INTO notices(key, created) VALUES(?, ?)",
@@ -773,7 +938,6 @@ class ArchiveStore:
                 == 0
             ):
                 return False
-            db.execute("INSERT OR IGNORE INTO groups(umo) VALUES(?)", (umo,))
             if str(uid) == str(self_id):
                 db.execute(
                     "UPDATE groups SET unavailable=? WHERE umo=?",
@@ -1389,24 +1553,81 @@ class ArchiveStore:
                     (day, kind),
                 )
 
+    @staticmethod
+    def _prune_disk_dir(
+        directory: Path,
+        *,
+        cutoff_ts: float,
+        max_files: int,
+        allowed_suffixes: tuple[str, ...],
+    ) -> int:
+        if not directory.is_dir():
+            return 0
+        entries: list[tuple[float, Path]] = []
+        try:
+            for item in directory.iterdir():
+                if item.is_symlink() or not item.is_file():
+                    continue
+                if allowed_suffixes and item.suffix.lower() not in allowed_suffixes:
+                    continue
+                try:
+                    mtime = item.stat().st_mtime
+                except OSError:
+                    continue
+                entries.append((mtime, item))
+        except OSError:
+            return 0
+        entries.sort(key=lambda pair: pair[0], reverse=True)
+        removed = 0
+        for idx, (mtime, path) in enumerate(entries):
+            if mtime < cutoff_ts or (max_files > 0 and idx >= max_files):
+                try:
+                    path.unlink(missing_ok=True)
+                    removed += 1
+                except OSError:
+                    pass
+        return removed
+
     def prune_retention(
         self,
         *,
         revisions_days: int = 90,
         notices_days: int = 90,
         quota_days: int = 30,
+        drafts_days: int = 14,
+        invalid_reports_days: int = 30,
+        media_days: int = 30,
+        exports_days: int = 7,
         max_revisions_per_group: int = 500,
         max_notices: int = 50000,
+        max_media_files: int = 200,
+        max_export_files: int = 100,
+        data_dir: Path | str | None = None,
         now: float | None = None,
     ) -> dict[str, int]:
-        """Prune aged revisions, notices, and quota rows, then incrementally vacuum."""
+        """Prune aged DB rows and disk images/exports, then incrementally vacuum."""
         now_ts = float(now if now is not None else time.time())
         rev_cutoff = now_ts - max(1, int(revisions_days)) * 86400.0
         notice_cutoff = now_ts - max(1, int(notices_days)) * 86400.0
+        draft_cutoff = now_ts - max(1, int(drafts_days)) * 86400.0
+        invalid_report_cutoff = now_ts - max(1, int(invalid_reports_days)) * 86400.0
+        media_cutoff = now_ts - max(1, int(media_days)) * 86400.0
+        export_cutoff = now_ts - max(1, int(exports_days)) * 86400.0
         quota_cutoff_day = datetime.fromtimestamp(
             now_ts - max(1, int(quota_days)) * 86400.0
         ).date().isoformat()
-        deleted = {"revisions": 0, "notices": 0, "quota": 0, "quota_buckets": 0}
+        deleted = {
+            "revisions": 0,
+            "notices": 0,
+            "quota": 0,
+            "quota_buckets": 0,
+            "report_drafts": 0,
+            "invalid_reports": 0,
+            "corrections": 0,
+            "culture_revisions": 0,
+            "media_files": 0,
+            "export_files": 0,
+        }
         with self.connection(write=True) as db:
             # Preserve entity='coverage' rows (coverage gap audit history).
             cur = db.execute(
@@ -1455,6 +1676,64 @@ class ArchiveStore:
                 "DELETE FROM quota_buckets WHERE day < ?", (quota_cutoff_day,)
             )
             deleted["quota_buckets"] += max(0, cur.rowcount)
+
+            cur = db.execute(
+                "DELETE FROM report_drafts WHERE updated < ?", (draft_cutoff,)
+            )
+            deleted["report_drafts"] += max(0, cur.rowcount)
+
+            cur = db.execute(
+                "DELETE FROM reports WHERE invalid=1 AND created < ?",
+                (invalid_report_cutoff,),
+            )
+            deleted["invalid_reports"] += max(0, cur.rowcount)
+
+            cur = db.execute(
+                "DELETE FROM corrections WHERE resolved=1 AND created < ?",
+                (rev_cutoff,),
+            )
+            deleted["corrections"] += max(0, cur.rowcount)
+
+            has_culture_revs = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='culture_revisions'"
+            ).fetchone()
+            if has_culture_revs:
+                cur = db.execute(
+                    "DELETE FROM culture_revisions WHERE created < ?", (rev_cutoff,)
+                )
+                deleted["culture_revisions"] += max(0, cur.rowcount)
+                if max_revisions_per_group > 0:
+                    c_umos = [
+                        r[0]
+                        for r in db.execute(
+                            "SELECT DISTINCT umo FROM culture_revisions"
+                        )
+                    ]
+                    for umo in c_umos:
+                        cur = db.execute(
+                            """DELETE FROM culture_revisions WHERE id IN (
+                                   SELECT id FROM culture_revisions
+                                   WHERE umo=?
+                                   ORDER BY created DESC, id DESC
+                                   LIMIT -1 OFFSET ?
+                               )""",
+                            (umo, int(max_revisions_per_group)),
+                        )
+                        deleted["culture_revisions"] += max(0, cur.rowcount)
+
+        base_dir = Path(data_dir) if data_dir is not None else self.path.parent
+        deleted["media_files"] = self._prune_disk_dir(
+            base_dir / "images",
+            cutoff_ts=media_cutoff,
+            max_files=max_media_files,
+            allowed_suffixes=(".png", ".jpg", ".jpeg", ".webp"),
+        )
+        deleted["export_files"] = self._prune_disk_dir(
+            base_dir / "exports",
+            cutoff_ts=export_cutoff,
+            max_files=max_export_files,
+            allowed_suffixes=(".md", ".html", ".htm"),
+        )
 
         self._last_prune_ts = time.monotonic()
         if any(deleted.values()):

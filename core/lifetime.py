@@ -927,9 +927,7 @@ class HistoryService:
             self.bot_ids.setdefault(umo.split(":", 1)[0], set()).add(
                 observation["self_id"]
             )
-        await asyncio.to_thread(self.store.group, umo, observation.get("group_name"))
-        if not await self.allowed(umo, cfg):
-            return
+        group_name = observation.get("group_name")
         if observation.get("kind"):
             await asyncio.to_thread(
                 self.store.membership,
@@ -941,6 +939,7 @@ class HistoryService:
                 name=observation.get("name"),
                 reason=observation.get("reason", ""),
                 self_id=observation.get("self_id", ""),
+                group_name=group_name,
             )
         elif observation["uid"] != observation.get("self_id"):
             await asyncio.to_thread(
@@ -949,7 +948,22 @@ class HistoryService:
                 observation["uid"],
                 observation.get("name"),
                 observation["ts"],
+                group_name=group_name,
             )
+        else:
+            await asyncio.to_thread(self.store.group, umo, group_name)
+
+    async def _maybe_prune_retention(self):
+        if self.plugin._terminating or not hasattr(self.store, "prune_retention"):
+            return
+        last_prune_ts = float(getattr(self.store, "_last_prune_ts", 0.0) or 0.0)
+        if last_prune_ts > 0.0 and (time.monotonic() - last_prune_ts) < 86400.0:
+            return
+        try:
+            data_dir = getattr(self.plugin, "data_dir", None)
+            await asyncio.to_thread(self.store.prune_retention, data_dir=data_dir)
+        except Exception:
+            logger.debug("ArchiveStore retention prune skipped", exc_info=True)
 
     async def run_cycle(self):
         """Run a bounded, fair cycle with fresh material preceding backfill."""
@@ -963,226 +977,223 @@ class HistoryService:
         self.plugin._bg_tasks.add(task)
         try:
             async with self.cycle_lock:
-                if lm_bridge.history_connection(self.plugin.context) is None:
-                    logger.info(
-                        "Lifetime history cycle deferred until LivingMemory is ready"
-                    )
-                    return
-                provider_id = self.plugin._llm_provider_id()
-                if provider_id:
-                    circuit_rem = _provider_circuit_remaining(
-                        self.plugin.context, provider_id
-                    )
-                    if circuit_rem > 0:
-                        logger.info(
-                            "Lifetime history cycle deferred: provider '%s' circuit open (%.1fs remaining)",
-                            provider_id,
-                            circuit_rem,
-                        )
-                        return
-                await self.refresh_scope()
-                groups = await self.discover()
-                culture = getattr(self.plugin, "culture", None)
-                culture_enabled = bool(
-                    culture is not None and self.plugin._cfg("culture_enabled", False)
-                )
-
-                def _group_sort_keys():
-                    keys = {
-                        u: (self.store.job(u) or {}).get("updated", 0) for u in groups
-                    }
-                    if (
-                        culture_enabled
-                        and hasattr(culture, "store")
-                        and hasattr(culture.store, "job")
-                    ):
-                        for u in groups:
-                            c_updated = (culture.store.job(u) or {}).get("updated", 0)
-                            keys[u] = min(keys[u], c_updated)
-                    return keys
-
-                sort_keys = await asyncio.to_thread(_group_sort_keys)
-                groups.sort(key=lambda umo: sort_keys.get(umo, 0))
-                day = datetime.now(self._series_tz()).date().isoformat()
-                raw_limit = self.plugin._cfg("history_daily_limit", 20)
-                daily_limit = max(0, int(20 if raw_limit is None else raw_limit))
-                cycle_budget = (
-                    max(1, math.ceil(daily_limit / _HOURLY_CYCLE_DIVISOR))
-                    if daily_limit > 0
-                    else 0
-                )
-                start_quota = await asyncio.to_thread(self.store.quota, day)
-                if start_quota >= daily_limit or cycle_budget <= 0:
-                    return
-                max_empty_passes = max(4, cycle_budget + 2)
-                # Batch consecutive pages of the same group to boost prompt prefix caching.
-                per_group_batch = (
-                    min(
-                        cycle_budget,
-                        max(2, min(4, math.ceil(cycle_budget / max(1, len(groups))))),
-                    )
-                    if cycle_budget >= 2
-                    else 1
-                )
-
-                async def _budget_exhausted():
-                    used_now = await asyncio.to_thread(self.store.quota, day)
-                    return (
-                        used_now >= daily_limit
-                        or used_now - start_quota >= cycle_budget
-                    )
-
-                for mode in ("live", "back"):
-                    empty_passes = 0
-                    while not self.plugin._terminating:
-                        before_quota = await asyncio.to_thread(self.store.quota, day)
-                        if (
-                            before_quota >= daily_limit
-                            or before_quota - start_quota >= cycle_budget
-                        ):
-                            return
-                        progressed = False
-                        for umo in groups:
-                            if self.plugin._terminating or not await self.allowed(umo):
-                                continue
-                            group_pages = 0
-                            group_empty = 0
-                            while (
-                                not self.plugin._terminating
-                                and group_pages < per_group_batch
-                                and group_empty < max_empty_passes
-                            ):
-                                if await _budget_exhausted():
-                                    return
-                                q_before = await asyncio.to_thread(self.store.quota, day)
-                                try:
-                                    operation = asyncio.create_task(
-                                        self.process_one(umo, mode)
-                                    )
-                                    step_ok = await operation
-                                except asyncio.CancelledError:
-                                    if (
-                                        self.plugin._terminating
-                                        or getattr(
-                                            asyncio.current_task(),
-                                            "cancelling",
-                                            lambda: 0,
-                                        )()
-                                    ):
-                                        raise
-                                    break
-                                except Exception as exc:
-                                    if is_budget_busy_error(exc):
-                                        retry_after = budget_busy_retry_after(exc)
-                                        logger.warning(
-                                            "Lifetime cycle paused immediately due to busy/open provider budget (retry_after=%.1fs)",
-                                            retry_after,
-                                        )
-                                        return
-                                    await asyncio.to_thread(
-                                        self.store.job_error,
-                                        umo,
-                                        f"整理失败：{type(exc).__name__}；进度已保留",
-                                    )
-                                    logger.warning(
-                                        "Lifetime batch failed without advancing its checkpoint",
-                                        exc_info=True,
-                                    )
-                                    break
-                                if not step_ok:
-                                    break
-                                progressed = True
-                                q_after = await asyncio.to_thread(self.store.quota, day)
-                                if q_after > q_before:
-                                    group_pages += 1
-                                    group_empty = 0
-                                else:
-                                    group_empty += 1
-                        if culture is not None:
-                            for umo in groups:
-                                if self.plugin._terminating or not await self.allowed(
-                                    umo
-                                ):
-                                    continue
-                                group_pages = 0
-                                group_empty = 0
-                                while (
-                                    not self.plugin._terminating
-                                    and group_pages < per_group_batch
-                                    and group_empty < max_empty_passes
-                                ):
-                                    if await _budget_exhausted():
-                                        return
-                                    q_before = await asyncio.to_thread(
-                                        self.store.quota, day
-                                    )
-                                    try:
-                                        operation = asyncio.create_task(
-                                            culture.step(
-                                                umo, mode, raise_on_budget_busy=True
-                                            )
-                                        )
-                                        step_ok = await operation
-                                    except asyncio.CancelledError:
-                                        if (
-                                            self.plugin._terminating
-                                            or getattr(
-                                                asyncio.current_task(),
-                                                "cancelling",
-                                                lambda: 0,
-                                            )()
-                                        ):
-                                            raise
-                                        break
-                                    except Exception as exc:
-                                        if is_budget_busy_error(exc):
-                                            retry_after = budget_busy_retry_after(exc)
-                                            logger.warning(
-                                                "Culture cycle paused immediately due to busy/open provider budget (retry_after=%.1fs)",
-                                                retry_after,
-                                            )
-                                            return
-                                        logger.warning(
-                                            "Culture step failed inside lifetime cycle",
-                                            exc_info=True,
-                                        )
-                                        break
-                                    if not step_ok:
-                                        break
-                                    progressed = True
-                                    q_after = await asyncio.to_thread(
-                                        self.store.quota, day
-                                    )
-                                    if q_after > q_before:
-                                        group_pages += 1
-                                        group_empty = 0
-                                    else:
-                                        group_empty += 1
-                        if not progressed:
-                            break
-                        after_quota = await asyncio.to_thread(self.store.quota, day)
-                        if (
-                            after_quota >= daily_limit
-                            or after_quota - start_quota >= cycle_budget
-                        ):
-                            return
-                        if after_quota == before_quota:
-                            empty_passes += 1
-                            if empty_passes >= max_empty_passes:
-                                break
-                        else:
-                            empty_passes = 0
-                if (
-                    hasattr(self.store, "prune_retention")
-                    and (time.monotonic() - getattr(self.store, "_last_prune_ts", 0.0))
-                    >= 86400.0
-                ):
-                    try:
-                        await asyncio.to_thread(self.store.prune_retention)
-                    except Exception:
-                        logger.debug("ArchiveStore retention prune skipped", exc_info=True)
+                try:
+                    await self._run_cycle_body()
+                finally:
+                    await self._maybe_prune_retention()
         finally:
             self.plugin._bg_tasks.discard(task)
+
+    async def _run_cycle_body(self):
+        if lm_bridge.history_connection(self.plugin.context) is None:
+            logger.info(
+                "Lifetime history cycle deferred until LivingMemory is ready"
+            )
+            return
+        provider_id = self.plugin._llm_provider_id()
+        if provider_id:
+            circuit_rem = _provider_circuit_remaining(
+                self.plugin.context, provider_id
+            )
+            if circuit_rem > 0:
+                logger.info(
+                    "Lifetime history cycle deferred: provider '%s' circuit open (%.1fs remaining)",
+                    provider_id,
+                    circuit_rem,
+                )
+                return
+        await self.refresh_scope()
+        groups = await self.discover()
+        culture = getattr(self.plugin, "culture", None)
+        culture_enabled = bool(
+            culture is not None and self.plugin._cfg("culture_enabled", False)
+        )
+
+        def _group_sort_keys():
+            keys = {
+                u: (self.store.job(u) or {}).get("updated", 0) for u in groups
+            }
+            if (
+                culture_enabled
+                and hasattr(culture, "store")
+                and hasattr(culture.store, "job")
+            ):
+                for u in groups:
+                    c_updated = (culture.store.job(u) or {}).get("updated", 0)
+                    keys[u] = min(keys[u], c_updated)
+            return keys
+
+        sort_keys = await asyncio.to_thread(_group_sort_keys)
+        groups.sort(key=lambda umo: sort_keys.get(umo, 0))
+        day = datetime.now(self._series_tz()).date().isoformat()
+        raw_limit = self.plugin._cfg("history_daily_limit", 20)
+        daily_limit = max(0, int(20 if raw_limit is None else raw_limit))
+        cycle_budget = (
+            max(1, math.ceil(daily_limit / _HOURLY_CYCLE_DIVISOR))
+            if daily_limit > 0
+            else 0
+        )
+        start_quota = await asyncio.to_thread(self.store.quota, day)
+        if start_quota >= daily_limit or cycle_budget <= 0:
+            return
+        max_empty_passes = max(4, cycle_budget + 2)
+        # Batch consecutive pages of the same group to boost prompt prefix caching.
+        per_group_batch = (
+            min(
+                cycle_budget,
+                max(2, min(4, math.ceil(cycle_budget / max(1, len(groups))))),
+            )
+            if cycle_budget >= 2
+            else 1
+        )
+
+        async def _budget_exhausted():
+            used_now = await asyncio.to_thread(self.store.quota, day)
+            return (
+                used_now >= daily_limit
+                or used_now - start_quota >= cycle_budget
+            )
+
+        for mode in ("live", "back"):
+            empty_passes = 0
+            while not self.plugin._terminating:
+                before_quota = await asyncio.to_thread(self.store.quota, day)
+                if (
+                    before_quota >= daily_limit
+                    or before_quota - start_quota >= cycle_budget
+                ):
+                    return
+                progressed = False
+                for umo in groups:
+                    if self.plugin._terminating or not await self.allowed(umo):
+                        continue
+                    group_pages = 0
+                    group_empty = 0
+                    while (
+                        not self.plugin._terminating
+                        and group_pages < per_group_batch
+                        and group_empty < max_empty_passes
+                    ):
+                        if await _budget_exhausted():
+                            return
+                        q_before = await asyncio.to_thread(self.store.quota, day)
+                        try:
+                            operation = asyncio.create_task(
+                                self.process_one(umo, mode)
+                            )
+                            step_ok = await operation
+                        except asyncio.CancelledError:
+                            if (
+                                self.plugin._terminating
+                                or getattr(
+                                    asyncio.current_task(),
+                                    "cancelling",
+                                    lambda: 0,
+                                )()
+                            ):
+                                raise
+                            break
+                        except Exception as exc:
+                            if is_budget_busy_error(exc):
+                                retry_after = budget_busy_retry_after(exc)
+                                logger.warning(
+                                    "Lifetime cycle paused immediately due to busy/open provider budget (retry_after=%.1fs)",
+                                    retry_after,
+                                )
+                                return
+                            await asyncio.to_thread(
+                                self.store.job_error,
+                                umo,
+                                f"整理失败：{type(exc).__name__}；进度已保留",
+                            )
+                            logger.warning(
+                                "Lifetime batch failed without advancing its checkpoint",
+                                exc_info=True,
+                            )
+                            break
+                        if not step_ok:
+                            break
+                        progressed = True
+                        q_after = await asyncio.to_thread(self.store.quota, day)
+                        if q_after > q_before:
+                            group_pages += 1
+                            group_empty = 0
+                        else:
+                            group_empty += 1
+                if culture is not None:
+                    for umo in groups:
+                        if self.plugin._terminating or not await self.allowed(
+                            umo
+                        ):
+                            continue
+                        group_pages = 0
+                        group_empty = 0
+                        while (
+                            not self.plugin._terminating
+                            and group_pages < per_group_batch
+                            and group_empty < max_empty_passes
+                        ):
+                            if await _budget_exhausted():
+                                return
+                            q_before = await asyncio.to_thread(
+                                self.store.quota, day
+                            )
+                            try:
+                                operation = asyncio.create_task(
+                                    culture.step(
+                                        umo, mode, raise_on_budget_busy=True
+                                    )
+                                )
+                                step_ok = await operation
+                            except asyncio.CancelledError:
+                                if (
+                                    self.plugin._terminating
+                                    or getattr(
+                                        asyncio.current_task(),
+                                        "cancelling",
+                                        lambda: 0,
+                                    )()
+                                ):
+                                    raise
+                                break
+                            except Exception as exc:
+                                if is_budget_busy_error(exc):
+                                    retry_after = budget_busy_retry_after(exc)
+                                    logger.warning(
+                                        "Culture cycle paused immediately due to busy/open provider budget (retry_after=%.1fs)",
+                                        retry_after,
+                                    )
+                                    return
+                                logger.warning(
+                                    "Culture step failed inside lifetime cycle",
+                                    exc_info=True,
+                                )
+                                break
+                            if not step_ok:
+                                break
+                            progressed = True
+                            q_after = await asyncio.to_thread(
+                                self.store.quota, day
+                            )
+                            if q_after > q_before:
+                                group_pages += 1
+                                group_empty = 0
+                            else:
+                                group_empty += 1
+                if not progressed:
+                    break
+                after_quota = await asyncio.to_thread(self.store.quota, day)
+                if (
+                    after_quota >= daily_limit
+                    or after_quota - start_quota >= cycle_budget
+                ):
+                    return
+                if after_quota == before_quota:
+                    empty_passes += 1
+                    if empty_passes >= max_empty_passes:
+                        break
+                else:
+                    empty_passes = 0
 
     @tracked_operation
     async def process_one(self, umo, mode="back"):

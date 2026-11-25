@@ -51,6 +51,10 @@ class CultureStore:
                     id INTEGER PRIMARY KEY, umo TEXT NOT NULL, entry_id INTEGER NOT NULL,
                     before_data TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
                     note TEXT NOT NULL, created REAL NOT NULL);
+                CREATE INDEX IF NOT EXISTS culture_revisions_entry
+                    ON culture_revisions(umo,entry_id,id DESC);
+                CREATE INDEX IF NOT EXISTS culture_revisions_created
+                    ON culture_revisions(created);
                 CREATE TABLE IF NOT EXISTS culture_exclusions (
                     umo TEXT NOT NULL, source TEXT NOT NULL, source_id TEXT NOT NULL,
                     PRIMARY KEY(umo,source,source_id));
