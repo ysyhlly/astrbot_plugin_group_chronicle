@@ -1,4 +1,11 @@
-# astrbot_plugin_group_chronicle v0.3.0-rc.9
+# astrbot_plugin_group_chronicle v0.3.0-rc.10
+
+## v0.3.0-rc.10 — 2026-11-25
+
+- 安全加固（Batch 1）：收紧作用域边界、加固 SSRF/URL 校验并接入全系列统一管理鉴权。
+- 数据与存储修复（Batch 2）：消除线程局部 SQLite 连接泄漏、修复归档保留期清理并加固存储层。
+- 性能与运行时优化（Batch 3）：将热点路径 I/O 移出主事件循环并加固史记调度运行时。
+- 工程与发布治理（Batch 4）：补齐配置 Schema 前置提示、修复沙箱浏览器测试、加固 CI 门禁并同步系列共享资产。
 
 ## v0.3.0-rc.9 — 2026-11-24
 
