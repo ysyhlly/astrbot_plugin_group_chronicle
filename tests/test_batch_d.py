@@ -163,13 +163,13 @@ def test_vote_propose_stores_state_and_replies(monkeypatch):
         "generate_topic_candidates",
         amock(["年度大会", "烧烤聚会", "摸鱼大赛"]),
     )
-    event = FakeEvent(umo="g1")
-    run(plugin._vote_propose_run(event, "g1"))
+    event = FakeEvent(umo="default:GroupMessage:g1")
+    run(plugin._vote_propose_run(event, "default:GroupMessage:g1"))
     texts = all_sent_texts(plugin, event)
     assert any("📮 本周选题候选" in t for t in texts)
     assert any("1. 年度大会" in t for t in texts)
     assert any("史记选票" in t for t in texts)
-    state = plugin._vote_state["g1"]
+    state = plugin._vote_state["default:GroupMessage:g1"]
     assert state["topics"] == ["年度大会", "烧烤聚会", "摸鱼大赛"]
     assert state["voters"] == set()
     assert state["expires_at"] > time.time()  # 10 分钟有效期
@@ -185,10 +185,10 @@ def test_vote_topic_command_dispatches(monkeypatch):
         coro.close()
 
     monkeypatch.setattr(plugin, "_spawn_bg", fake_spawn)
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     results = run(collect(plugin.vote_topic_command(event)))
     assert any("正在生成选题候选" in r for r in results)
-    assert spawned == ["vote_propose:g1"]
+    assert spawned == ["vote_propose:default:GroupMessage:g1"]
 
     plugin2 = make_plugin({"enable_vote": False})
     results2 = run(collect(plugin2.vote_topic_command(event)))
@@ -198,35 +198,35 @@ def test_vote_topic_command_dispatches(monkeypatch):
 def test_vote_cast_records_voter(monkeypatch, tmp_path):
     """史记选票 N: 记录 (sender, choice), 回复已投票。"""
     plugin = make_plugin({"enable_vote": True})
-    plugin._vote_state["g1"] = {
+    plugin._vote_state["default:GroupMessage:g1"] = {
         "topics": ["年度大会", "烧烤聚会", "摸鱼大赛"],
         "expires_at": time.time() + 600,
         "voters": set(),
     }
-    event = FakeEvent(umo="g1", sender_id="u1")
+    event = FakeEvent(umo="default:GroupMessage:g1", sender_id="u1")
     results = run(collect(plugin.vote_cast_command(event, "2")))
     assert results == ["已投票：烧烤聚会"]
-    assert plugin._vote_state["g1"]["voters"] == {"u1:2"}
+    assert plugin._vote_state["default:GroupMessage:g1"]["voters"] == {"u1:2"}
 
 
 def test_vote_cast_dedupe_by_sender(monkeypatch):
     """同一发送者重复投票 → 拒绝。"""
     plugin = make_plugin({"enable_vote": True})
-    plugin._vote_state["g1"] = {
+    plugin._vote_state["default:GroupMessage:g1"] = {
         "topics": ["年度大会", "烧烤聚会", "摸鱼大赛"],
         "expires_at": time.time() + 600,
         "voters": {"u1:2"},
     }
-    event = FakeEvent(umo="g1", sender_id="u1")
+    event = FakeEvent(umo="default:GroupMessage:g1", sender_id="u1")
     results = run(collect(plugin.vote_cast_command(event, "1")))
     assert results == ["你已经投过票了"]
-    assert plugin._vote_state["g1"]["voters"] == {"u1:2"}  # 未重复记录
+    assert plugin._vote_state["default:GroupMessage:g1"]["voters"] == {"u1:2"}  # 未重复记录
 
 
 def test_vote_cast_invalid_n(monkeypatch):
     """史记选票 非法 N → 中文提示。"""
     plugin = make_plugin({"enable_vote": True})
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     assert run(collect(plugin.vote_cast_command(event, "abc"))) == [
         "请回复「史记选票 N」，N 为 1-3"
     ]
@@ -237,7 +237,7 @@ def test_vote_cast_invalid_n(monkeypatch):
 def test_vote_cast_no_active_state(monkeypatch):
     """无进行中的投票 → 提示先发起。"""
     plugin = make_plugin({"enable_vote": True})
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     results = run(collect(plugin.vote_cast_command(event, "1")))
     assert results == ["当前没有进行中的选题投票（可用 史记选题 发起）"]
 
@@ -245,21 +245,21 @@ def test_vote_cast_no_active_state(monkeypatch):
 def test_vote_expired_guarded(monkeypatch):
     """投票过期 → 选票/公布均提示过期, 状态被清理。"""
     plugin = make_plugin({"enable_vote": True})
-    plugin._vote_state["g1"] = {
+    plugin._vote_state["default:GroupMessage:g1"] = {
         "topics": ["A", "B", "C"],
         "expires_at": time.time() - 10,
         "voters": {"u1:1"},
     }
-    event = FakeEvent(umo="g1", sender_id="u2")
+    event = FakeEvent(umo="default:GroupMessage:g1", sender_id="u2")
     results = run(collect(plugin.vote_cast_command(event, "2")))
     assert results == ["选题投票已过期，请重新发起 史记选题"]
-    assert "g1" not in plugin._vote_state
+    assert "default:GroupMessage:g1" not in plugin._vote_state
 
 
 def test_vote_announce_winner_and_passes_topic(monkeypatch):
     """史记选题公布: 计票 → 公布获胜选题 → 以 topic 参数触发生成。"""
     plugin = make_plugin({"enable_vote": True})
-    plugin._vote_state["g1"] = {
+    plugin._vote_state["default:GroupMessage:g1"] = {
         "topics": ["年度大会", "烧烤聚会", "摸鱼大赛"],
         "expires_at": time.time() + 600,
         "voters": {"u1:3", "u2:3", "u3:1"},
@@ -271,20 +271,20 @@ def test_vote_announce_winner_and_passes_topic(monkeypatch):
         captured["umo"] = kwargs.get("umo")
 
     monkeypatch.setattr(plugin, "_run_group_analysis", fake_run)
-    event = FakeEvent(umo="g1", is_admin=True)
+    event = FakeEvent(umo="default:GroupMessage:g1", is_admin=True)
     results = run(collect(plugin.vote_announce_command(event)))
     joined = "\n".join(results)
     assert "🎉 本期选题公布" in joined
     assert "摸鱼大赛（2 票）" in joined
     assert "🏆 获胜选题：摸鱼大赛" in joined
     assert captured["topic"] == "摸鱼大赛"
-    assert "g1" not in plugin._vote_state  # 投票结束已清理
+    assert "default:GroupMessage:g1" not in plugin._vote_state  # 投票结束已清理
 
 
 def test_vote_announce_admin_only(monkeypatch):
     """史记选题公布 非管理员 → 无权限。"""
     plugin = make_plugin({"enable_vote": True})
-    event = FakeEvent(umo="g1", is_admin=False)
+    event = FakeEvent(umo="default:GroupMessage:g1", is_admin=False)
     results = run(collect(plugin.vote_announce_command(event)))
     assert results == ["无权限"]
 
@@ -307,7 +307,7 @@ def test_topic_flows_into_generate_chronicle(monkeypatch, tmp_path):
     monkeypatch.setattr(main_module, "rank_influential", amock([]))
     monkeypatch.setattr(main_module, "resolve_system_prompt", amock(None))
     monkeypatch.setattr(main_module, "render_text_or_image", _identity_render)
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     run(plugin._run_group_analysis(event, None, True, topic="年度大会"))
     assert captured["topic"] == "年度大会"
 
@@ -323,7 +323,7 @@ def test_webpage_command_writes_html_file(monkeypatch, tmp_path):
     plugin.store = ChronicleStore(str(tmp_path))
     plugin.store.save(
         {
-            "umo": "g1",
+            "umo": "default:GroupMessage:g1",
             "group_name": "测试群",
             "iso_year": datetime.now().isocalendar()[0],
             "iso_week": 1,
@@ -335,7 +335,7 @@ def test_webpage_command_writes_html_file(monkeypatch, tmp_path):
             "version": 1,
         }
     )
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     results = run(collect(plugin.chronicle_webpage_command(event, "1")))
     # 桩 MessageChain 无 .file() → 回退路径文本
     assert len(results) == 1
@@ -356,7 +356,7 @@ def test_webpage_command_writes_html_file(monkeypatch, tmp_path):
 def test_webpage_command_not_found(monkeypatch, tmp_path):
     plugin = make_plugin()
     plugin.store = ChronicleStore(str(tmp_path))
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     results = run(collect(plugin.chronicle_webpage_command(event, "1")))
     assert results == ["未找到该条史记"]
 
@@ -369,26 +369,26 @@ def test_webpage_command_not_found(monkeypatch, tmp_path):
 def test_universe_command_empty_config(monkeypatch):
     """universe_groups 为空 → 提示未配置。"""
     plugin = make_plugin()
-    event = FakeEvent(umo="g1", is_admin=True)
+    event = FakeEvent(umo="default:GroupMessage:g1", is_admin=True)
     results = run(collect(plugin.universe_command(event)))
     assert results == ["未配置宇宙史记群列表（universe_groups）"]
 
 
 def test_universe_command_admin_only(monkeypatch):
     """宇宙史记 非管理员 → 无权限。"""
-    plugin = make_plugin({"universe_groups": ["gA", "gB"]})
-    event = FakeEvent(umo="g1", is_admin=False)
+    plugin = make_plugin({"universe_groups": ["default:GroupMessage:gA", "default:GroupMessage:gB"]})
+    event = FakeEvent(umo="default:GroupMessage:g1", is_admin=False)
     results = run(collect(plugin.universe_command(event)))
     assert results == ["无权限"]
 
 
 def test_universe_run_combines_groups(monkeypatch):
     """宇宙史记主体: 逐群采集 (单群失败跳过), 一次 LLM 调用, 发送结果。"""
-    plugin = make_plugin({"universe_groups": ["gA", "gB", "gBad"]})
+    plugin = make_plugin({"universe_groups": ["default:GroupMessage:gA", "default:GroupMessage:gB", "default:GroupMessage:gBad"]})
     gathered = {}
 
     async def fake_gather(umo, days=None, *, progress=None):
-        if umo == "gBad":
+        if umo == "default:GroupMessage:gBad":
             raise NoActivityError("无活动")
         gathered[umo] = True
         return make_evidence(msg_count=3), 7
@@ -402,15 +402,15 @@ def test_universe_run_combines_groups(monkeypatch):
 
     monkeypatch.setattr(main_module, "generate_universe_chronicle", fake_universe)
     monkeypatch.setattr(main_module, "resolve_system_prompt", amock(None))
-    event = FakeEvent(umo="g1", is_admin=True)
-    run(plugin._universe_run(event, "g1", ["gA", "gB", "gBad"]))
-    assert captured["groups"] == ["gA", "gB"]  # gBad 失败被跳过
+    event = FakeEvent(umo="default:GroupMessage:g1", is_admin=True)
+    run(plugin._universe_run(event, "default:GroupMessage:g1", ["default:GroupMessage:gA", "default:GroupMessage:gB", "default:GroupMessage:gBad"]))
+    assert captured["groups"] == ["default:GroupMessage:gA", "default:GroupMessage:gB"]  # gBad 失败被跳过
     assert any("宇宙史记正文" in t for t in all_sent_texts(plugin, event))
 
 
 def test_universe_run_all_groups_fail(monkeypatch):
     """所有群采集失败 → 提示无法生成, 不调 LLM。"""
-    plugin = make_plugin({"universe_groups": ["gBad"]})
+    plugin = make_plugin({"universe_groups": ["default:GroupMessage:gBad"]})
     calls = []
 
     async def fake_gather(umo, days=None, *, progress=None):
@@ -423,15 +423,15 @@ def test_universe_run_all_groups_fail(monkeypatch):
         return "x"
 
     monkeypatch.setattr(main_module, "generate_universe_chronicle", fake_universe)
-    event = FakeEvent(umo="g1")
-    run(plugin._universe_run(event, "g1", ["gBad"]))
+    event = FakeEvent(umo="default:GroupMessage:g1")
+    run(plugin._universe_run(event, "default:GroupMessage:g1", ["default:GroupMessage:gBad"]))
     assert calls == []
     assert any("所有群均无可用数据" in t for t in all_sent_texts(plugin, event))
 
 
 def test_universe_run_llm_unavailable(monkeypatch):
     """宇宙史记 LLM 不可用 → 明确提示。"""
-    plugin = make_plugin({"universe_groups": ["gA"]})
+    plugin = make_plugin({"universe_groups": ["default:GroupMessage:gA"]})
     monkeypatch.setattr(
         plugin, "_lm_and_gather", amock((make_evidence(msg_count=3), 7))
     )
@@ -441,8 +441,8 @@ def test_universe_run_llm_unavailable(monkeypatch):
         araise(LLMUnavailableError("未配置可用的 LLM")),
     )
     monkeypatch.setattr(main_module, "resolve_system_prompt", amock(None))
-    event = FakeEvent(umo="g1")
-    run(plugin._universe_run(event, "g1", ["gA"]))
+    event = FakeEvent(umo="default:GroupMessage:g1")
+    run(plugin._universe_run(event, "default:GroupMessage:g1", ["default:GroupMessage:gA"]))
     assert any(
         "未配置可用的 LLM，无法生成宇宙史记" in t for t in all_sent_texts(plugin, event)
     )
@@ -465,7 +465,7 @@ def test_coverage_note_appears_when_near_cap(monkeypatch, tmp_path):
     monkeypatch.setattr(main_module, "rank_influential", amock([]))
     monkeypatch.setattr(main_module, "resolve_system_prompt", amock(None))
     monkeypatch.setattr(main_module, "render_text_or_image", _identity_render)
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     run(plugin._run_group_analysis(event, None, True))
     texts = all_sent_texts(plugin, event)
     assert any("仅保留最近 10 条消息" in t for t in texts)
@@ -484,7 +484,7 @@ def test_coverage_note_absent_when_far_below_cap(monkeypatch, tmp_path):
     monkeypatch.setattr(main_module, "rank_influential", amock([]))
     monkeypatch.setattr(main_module, "resolve_system_prompt", amock(None))
     monkeypatch.setattr(main_module, "render_text_or_image", _identity_render)
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     run(plugin._run_group_analysis(event, None, True))
     assert not any("仅保留最近" in t for t in all_sent_texts(plugin, event))
 
@@ -518,7 +518,7 @@ def test_gallery_wired_after_bios(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(main_module, "resolve_system_prompt", amock(None))
     monkeypatch.setattr(main_module, "render_text_or_image", _identity_render)
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     run(plugin._run_group_analysis(event, None, True))
     texts = all_sent_texts(plugin, event)
     assert any("## 群友图鉴" in t for t in texts)
@@ -551,7 +551,7 @@ def test_gallery_skipped_when_disabled(monkeypatch, tmp_path):
     monkeypatch.setattr(main_module, "generate_biography", amock("传记"))
     monkeypatch.setattr(main_module, "resolve_system_prompt", amock(None))
     monkeypatch.setattr(main_module, "render_text_or_image", _identity_render)
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     run(plugin._run_group_analysis(event, None, True))
     assert calls == []
     assert not any("群友图鉴" in t for t in all_sent_texts(plugin, event))
@@ -579,7 +579,7 @@ def test_gallery_failure_does_not_break_entry(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(main_module, "resolve_system_prompt", amock(None))
     monkeypatch.setattr(main_module, "render_text_or_image", _identity_render)
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     run(plugin._run_group_analysis(event, None, True))
     assert any("## 正文" in t for t in all_sent_texts(plugin, event))
 
@@ -618,7 +618,7 @@ def test_bios_gather_order_preserved(monkeypatch, tmp_path):
     monkeypatch.setattr(main_module, "generate_biography", slow_bio)
     monkeypatch.setattr(main_module, "resolve_system_prompt", amock(None))
     monkeypatch.setattr(main_module, "render_text_or_image", _identity_render)
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     run(plugin._run_group_analysis(event, None, True))
     texts = all_sent_texts(plugin, event)
     joined = "\n".join(texts)
@@ -651,7 +651,7 @@ def test_bios_gather_failure_handled(monkeypatch, tmp_path):
     monkeypatch.setattr(main_module, "generate_biography", mixed_bio)
     monkeypatch.setattr(main_module, "resolve_system_prompt", amock(None))
     monkeypatch.setattr(main_module, "render_text_or_image", _identity_render)
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     run(plugin._run_group_analysis(event, None, True))
     texts = all_sent_texts(plugin, event)
     joined = "\n".join(texts)
@@ -701,21 +701,21 @@ def test_cron_signature_stored_at_register():
     """注册成功 → _cron_signature 记录当前配置签名。"""
     config = {
         "enable_weekly_push": True,
-        "push_groups": ["g1", "g2"],
+        "push_groups": ["default:GroupMessage:g1", "g2"],
         "push_time": "20:30",
         "push_weekday": 6,
     }
     plugin, scheduler, _ = make_scheduler_context(config)
     run(plugin.initialize())
     assert len(scheduler.added) == 1
-    assert plugin._cron_signature == (True, ("g1", "g2"), "20:30", 6)
+    assert plugin._cron_signature == (True, ("default:GroupMessage:g1", "g2"), "20:30", 6)
 
 
 def test_cron_signature_change_reregisters(monkeypatch):
     """推送配置变化 → _weekly_push 开头自动重注册 (remove + add 新时间)。"""
     config = {
         "enable_weekly_push": True,
-        "push_groups": ["g1", "g2"],
+        "push_groups": ["default:GroupMessage:g1", "g2"],
         "push_time": "20:30",
         "push_weekday": 6,
     }
@@ -731,14 +731,14 @@ def test_cron_signature_change_reregisters(monkeypatch):
     assert len(scheduler.added) == 2
     trigger_text = str(scheduler.added[-1]["trigger"])
     assert "hour='21'" in trigger_text
-    assert plugin._cron_signature == (True, ("g1", "g2"), "21:00", 6)
+    assert plugin._cron_signature == (True, ("default:GroupMessage:g1", "g2"), "21:00", 6)
 
 
 def test_cron_signature_unchanged_no_reregister(monkeypatch):
     """配置未变 → 不重复注册。"""
     config = {
         "enable_weekly_push": True,
-        "push_groups": ["g1"],
+        "push_groups": ["default:GroupMessage:g1"],
         "push_time": "20:30",
         "push_weekday": 6,
     }
@@ -754,7 +754,7 @@ def test_cron_reload_disabled(monkeypatch):
     """enable_cron_reload=false → 不检测/不重注册。"""
     config = {
         "enable_weekly_push": True,
-        "push_groups": ["g1"],
+        "push_groups": ["default:GroupMessage:g1"],
         "push_time": "20:30",
         "push_weekday": 6,
         "enable_cron_reload": False,
@@ -771,7 +771,7 @@ def test_cron_reload_disabled(monkeypatch):
 def test_terminate_clears_vote_state_and_render_cache(monkeypatch):
     """terminate → 清理投票状态, 调用 clear_render_cache。"""
     plugin = make_plugin()
-    plugin._vote_state["g1"] = {"topics": ["A"], "expires_at": 1, "voters": set()}
+    plugin._vote_state["default:GroupMessage:g1"] = {"topics": ["A"], "expires_at": 1, "voters": set()}
     cleared = []
 
     def fake_clear():

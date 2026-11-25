@@ -38,7 +38,15 @@ _SLANG_KEYWORDS = ("梗", "黑话")
 #: 单条黑话线索最长截断
 _SLANG_MAX_CHARS = 60
 #: self_learning 黑话查询方法候选 (公共 API, 守卫调用)
-_JARGON_METHOD_NAMES = ("get_jargon", "query_jargon", "get_slang_terms")
+_JARGON_ALIASES = ("astrbot_plugin_dynamics_learning", *_SL_ALIASES)
+_JARGON_METHOD_NAMES = (
+    "get_culture_jargon_v1",
+    "get_jargon",
+    "query_jargon",
+    "get_slang_terms",
+)
+_FULL_SCOPE_PARAM_NAMES = ("scope", "umo", "session_id", "unified_msg_origin")
+_GROUP_ID_PARAM_NAMES = ("group_id", "chat_id")
 
 
 # ---------- 群友图鉴 ----------
@@ -209,15 +217,44 @@ def _jargon_to_lines(result) -> list[str]:
     return lines
 
 
-async def _soft_read_jargon(context) -> list[str]:
-    """经注册星软读取 self_learning 的黑话数据 (仅公开查询方法)。
+def _bind_scope_kwargs(method, scope: str) -> dict[str, str] | None:
+    """Resolve an explicit named scope parameter for a jargon method.
 
-    绝不直接读 SQLite; 插件缺失 / 无公开方法 / 调用失败一律跳过, 返回空列表。
+    Returns None when the method does not declare any known group/session scope
+    parameter, so callers safely skip it instead of performing an unscoped read.
     """
-    if context is None:
+    try:
+        sig = inspect.signature(method)
+    except (TypeError, ValueError):
+        return None
+    params = sig.parameters
+    acceptable = (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
+    for key in _FULL_SCOPE_PARAM_NAMES:
+        param = params.get(key)
+        if param is not None and param.kind in acceptable:
+            return {key: scope}
+    group_id = scope.rsplit(":", 1)[-1].strip() if ":GroupMessage:" in scope else scope
+    for key in _GROUP_ID_PARAM_NAMES:
+        param = params.get(key)
+        if param is not None and param.kind in acceptable:
+            return {key: group_id}
+    return None
+
+
+async def _soft_read_jargon(context, umo: str | None = None) -> list[str]:
+    """经注册星软读取 self_learning 的当前群黑话数据 (仅公开作用域查询方法)。
+
+    绝不直接读 SQLite，绝不无作用域读取全量黑话；
+    缺少作用域 / 插件缺失 / 无接受作用域参数的公开方法 / 调用失败一律安全跳过，返回空列表。
+    """
+    scope = str(umo or "").strip()
+    if context is None or not scope:
         return []
     try:
-        plugin = _resolve_star_instance(context, _SL_ALIASES)
+        plugin = _resolve_star_instance(context, _JARGON_ALIASES)
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[gallery] 定位 self_learning 失败, 跳过黑话读取: {e}")
         return []
@@ -228,13 +265,27 @@ async def _soft_read_jargon(context) -> list[str]:
         method = getattr(plugin, name, None)
         if not callable(method):
             continue
+        scope_kwargs = _bind_scope_kwargs(method, scope)
+        if scope_kwargs is None:
+            logger.debug(f"[gallery] 黑话方法 {name} 不接受群作用域参数, 已安全跳过")
+            continue
         try:
-            result = method()
+            result = method(**scope_kwargs)
             if inspect.isawaitable(result):
                 result = await result
         except Exception as e:  # noqa: BLE001 - 单方法失败跳过
             logger.warning(f"[gallery] 读取黑话方法 {name} 失败: {e}")
             continue
+        if isinstance(result, dict):
+            res_scope = result.get("scope")
+            if res_scope is not None and str(res_scope).strip() != scope:
+                logger.warning(
+                    f"[gallery] 黑话方法 {name} 返回跨群作用域 {res_scope!r} != {scope!r}, 已丢弃"
+                )
+                continue
+            if isinstance(result.get("terms"), list):
+                lines.extend(_jargon_to_lines(result["terms"]))
+                continue
         lines.extend(_jargon_to_lines(result))
     return lines
 
@@ -245,6 +296,8 @@ async def append_slang(
     structured: dict | None,
     context,
     enabled: bool,
+    *,
+    umo: str | None = None,
 ) -> str:
     """启用时把「## 本周黑话」分节追加到证据文本末尾; 无内容时原样返回。
 
@@ -254,6 +307,7 @@ async def append_slang(
         structured: extract_structured 输出 (可为 None/空 dict)。
         context: AstrBot 插件上下文 (软读取 self_learning 黑话)。
         enabled: enable_slang 配置。
+        umo: 当前群作用域标识 (必须提供才会软读取 self_learning 黑话)。
 
     Returns:
         追加了黑话分节的证据文本; 未启用或无黑话时原样返回。
@@ -263,7 +317,7 @@ async def append_slang(
     lines = _slang_from_structured(structured)
     lines += _slang_from_memories(evidence)
     try:
-        lines += await _soft_read_jargon(context)
+        lines += await _soft_read_jargon(context, umo=umo)
     except Exception as e:  # noqa: BLE001 - 黑话软读取失败不影响主流程
         logger.warning(f"[gallery] 黑话软读取失败: {e}")
     deduped: list[str] = []

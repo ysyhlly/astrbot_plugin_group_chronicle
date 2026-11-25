@@ -174,7 +174,7 @@ def test_chronicle_command_dispatches_pipeline_with_days(monkeypatch):
         )
 
     monkeypatch.setattr(plugin, "_run_group_analysis", fake_run)
-    event = FakeEvent(umo="g1", message_str="群史记 3")
+    event = FakeEvent(umo="default:GroupMessage:g1", message_str="群史记 3")
 
     async def main():
         results = await collect(plugin.chronicle_command(event, "3"))
@@ -183,7 +183,7 @@ def test_chronicle_command_dispatches_pipeline_with_days(monkeypatch):
 
     results = run(main())
     assert any("正在生成群史记" in r for r in results)
-    assert calls == [("g1", 3, True)]
+    assert calls == [("default:GroupMessage:g1", 3, True)]
 
 
 def test_chronicle_command_default_days_when_missing(monkeypatch):
@@ -195,7 +195,7 @@ def test_chronicle_command_default_days_when_missing(monkeypatch):
         calls.append(days)
 
     monkeypatch.setattr(plugin, "_run_group_analysis", fake_run)
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
 
     async def main():
         await collect(plugin.chronicle_command(event, None))
@@ -214,7 +214,7 @@ def test_invalid_days_falls_back_to_none(monkeypatch):
         calls.append(days)
 
     monkeypatch.setattr(plugin, "_run_group_analysis", fake_run)
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
 
     async def main():
         await collect(plugin.chronicle_command(event, "abc"))
@@ -255,7 +255,7 @@ def test_bio_admin_only_false_allows_non_admin(monkeypatch):
         calls.append((umo, target))
 
     monkeypatch.setattr(plugin, "_bio_only", fake_bio)
-    event = FakeEvent(umo="g1", is_admin=False)
+    event = FakeEvent(umo="default:GroupMessage:g1", is_admin=False)
 
     async def main():
         results = await collect(plugin.biography_command(event))
@@ -264,7 +264,7 @@ def test_bio_admin_only_false_allows_non_admin(monkeypatch):
 
     results = run(main())
     assert any("正在生成人物传记" in r for r in results)
-    assert calls == [("g1", None)]
+    assert calls == [("default:GroupMessage:g1", None)]
 
 
 def test_chronicle_admin_only_gates_command(monkeypatch):
@@ -276,7 +276,7 @@ def test_chronicle_admin_only_gates_command(monkeypatch):
         spawned.append(label)
 
     monkeypatch.setattr(plugin, "_spawn_bg", fake_spawn)
-    event = FakeEvent(umo="g1", is_admin=False, message_str="群史记 3")
+    event = FakeEvent(umo="default:GroupMessage:g1", is_admin=False, message_str="群史记 3")
     results = run(collect(plugin.chronicle_command(event, "3")))
     assert results == ["无权限"]
     assert spawned == []
@@ -292,7 +292,7 @@ def test_chronicle_admin_only_false_allows_non_admin(monkeypatch):
         coro.close()  # 测试中不真正运行生成, 关闭协程避免未 await 警告
 
     monkeypatch.setattr(plugin, "_spawn_bg", fake_spawn)
-    event = FakeEvent(umo="g1", is_admin=False, message_str="群史记")
+    event = FakeEvent(umo="default:GroupMessage:g1", is_admin=False, message_str="群史记")
     results = run(collect(plugin.chronicle_command(event, None)))
     assert any("正在生成群史记" in r for r in results)
     assert len(spawned) == 1
@@ -301,7 +301,7 @@ def test_chronicle_admin_only_false_allows_non_admin(monkeypatch):
 def test_admin_commands_reject_non_admin():
     """非管理员触发 人物传 / 史记周推 → 无权限, 不执行任何生成。"""
     plugin = make_plugin()
-    event = FakeEvent(umo="g1", is_admin=False)
+    event = FakeEvent(umo="default:GroupMessage:g1", is_admin=False)
 
     results = run(collect(plugin.biography_command(event)))
     assert results == ["无权限"]
@@ -319,7 +319,7 @@ def test_biography_command_dispatches_bio_only(monkeypatch):
         calls.append((umo, target))
 
     monkeypatch.setattr(plugin, "_bio_only", fake_bio)
-    event = FakeEvent(umo="g1", messages=[At(qq="12345")])
+    event = FakeEvent(umo="default:GroupMessage:g1", messages=[At(qq="12345")])
 
     async def main():
         results = await collect(plugin.biography_command(event))
@@ -328,7 +328,7 @@ def test_biography_command_dispatches_bio_only(monkeypatch):
 
     results = run(main())
     assert any("正在生成人物传记" in r for r in results)
-    assert calls == [("g1", "12345")]
+    assert calls == [("default:GroupMessage:g1", "12345")]
 
 
 def test_biography_command_without_at_dispatches_top_n(monkeypatch):
@@ -340,7 +340,7 @@ def test_biography_command_without_at_dispatches_top_n(monkeypatch):
         calls.append(target)
 
     monkeypatch.setattr(plugin, "_bio_only", fake_bio)
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
 
     async def main():
         await collect(plugin.biography_command(event))
@@ -368,8 +368,8 @@ def test_concurrent_same_umo_second_call_rejected(monkeypatch):
         await release.wait()
 
     monkeypatch.setattr(plugin, "_analyze", slow_analyze)
-    event1 = FakeEvent(umo="g1")
-    event2 = FakeEvent(umo="g1")
+    event1 = FakeEvent(umo="default:GroupMessage:g1")
+    event2 = FakeEvent(umo="default:GroupMessage:g1")
 
     async def main():
         t1 = asyncio.create_task(plugin._run_group_analysis(event1, None, True))
@@ -381,7 +381,7 @@ def test_concurrent_same_umo_second_call_rejected(monkeypatch):
         return done
 
     run(main())
-    assert calls == ["g1"]  # 生成只执行一次
+    assert calls == ["default:GroupMessage:g1"]  # 生成只执行一次
     # 后台路径 prefer_context=True → 拒绝提示走 context.send_message
     assert any("正在生成中" in t for t in all_sent_texts(plugin, event2))
     assert event1.sent_texts() == []  # 第一次调用正常执行, 无拒绝提示
@@ -400,7 +400,7 @@ def test_different_umos_run_without_mutual_reject():
         await release.wait()
 
     plugin._analyze = slow_analyze
-    event1 = FakeEvent(umo="g1")
+    event1 = FakeEvent(umo="default:GroupMessage:g1")
     event2 = FakeEvent(umo="g2")
 
     async def main():
@@ -430,7 +430,7 @@ def test_should_skip_prevents_llm_call(monkeypatch, tmp_path):
     iso_year, iso_week = datetime.now().isocalendar()[:2]
     plugin.store.save(
         {
-            "umo": "g1",
+            "umo": "default:GroupMessage:g1",
             "group_name": "测试群",
             "iso_year": iso_year,
             "iso_week": iso_week,
@@ -454,7 +454,7 @@ def test_should_skip_prevents_llm_call(monkeypatch, tmp_path):
 
     monkeypatch.setattr(main_module, "generate_chronicle", fake_generate)
 
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     run(plugin._run_group_analysis(event, None, True))
     assert gen_calls == []  # LLM 未被调用
     assert any("本周史记已生成" in t for t in all_sent_texts(plugin, event))
@@ -467,7 +467,7 @@ def test_new_messages_do_not_skip(monkeypatch, tmp_path):
     iso_year, iso_week = datetime.now().isocalendar()[:2]
     plugin.store.save(
         {
-            "umo": "g1",
+            "umo": "default:GroupMessage:g1",
             "group_name": "测试群",
             "iso_year": iso_year,
             "iso_week": iso_week,
@@ -498,7 +498,7 @@ def test_new_messages_do_not_skip(monkeypatch, tmp_path):
         _identity_render,
     )
 
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     run(plugin._run_group_analysis(event, None, True))
     assert gen_calls == [1]
     assert any("新史记" in t for t in all_sent_texts(plugin, event))
@@ -516,14 +516,14 @@ def test_success_saves_entry_with_week_key(monkeypatch, tmp_path):
     monkeypatch.setattr(main_module, "resolve_system_prompt", amock(None))
     monkeypatch.setattr(main_module, "render_text_or_image", _identity_render)
 
-    event = FakeEvent(umo="g1", group_name="测试群")
+    event = FakeEvent(umo="default:GroupMessage:g1", group_name="测试群")
     run(plugin._run_group_analysis(event, None, True))
 
     iso_year, iso_week = datetime.now().isocalendar()[:2]
-    entries = plugin.store.list("g1")
+    entries = plugin.store.list("default:GroupMessage:g1")
     assert len(entries) == 1
     entry = entries[0]
-    assert entry["umo"] == "g1"
+    assert entry["umo"] == "default:GroupMessage:g1"
     assert entry["group_name"] == "测试群"
     assert entry["iso_year"] == iso_year
     assert entry["iso_week"] == iso_week
@@ -544,7 +544,7 @@ def test_no_activity_replies_error(monkeypatch):
         "gather_evidence",
         araise(NoActivityError("该群在时间窗内无足够活动")),
     )
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     run(plugin._run_group_analysis(event, None, True))
     assert any("无足够活动" in t for t in all_sent_texts(plugin, event))
 
@@ -559,7 +559,7 @@ def test_llm_unavailable_replies(monkeypatch):
         "generate_chronicle",
         araise(main_module.LLMUnavailableError("未配置可用的 LLM")),
     )
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     run(plugin._run_group_analysis(event, None, True))
     assert any(
         "未配置可用的 LLM，无法生成群史记" in t for t in all_sent_texts(plugin, event)
@@ -570,7 +570,7 @@ def test_lm_not_detected_replies_reason(monkeypatch):
     """LivingMemory 不可用 → 回复 lm_unavailable_reason 的具体原因。"""
     plugin = make_plugin()
     monkeypatch.setattr(main_module, "detect_lm", lambda ctx: None)
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     run(plugin._run_group_analysis(event, None, True))
     expected = main_module.lm_unavailable_reason(plugin.context, "not_detected")
     assert expected  # 非空原因
@@ -584,7 +584,7 @@ def test_lm_not_detected_replies_reason(monkeypatch):
 
 def test_chronicle_list_empty():
     plugin = make_plugin()
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     results = run(collect(plugin.chronicle_list_command(event)))
     assert results == ["暂无史记"]
 
@@ -595,7 +595,7 @@ def test_chronicle_list_format(monkeypatch, tmp_path):
     iso_year, iso_week = datetime.now().isocalendar()[:2]
     plugin.store.save(
         {
-            "umo": "g1",
+            "umo": "default:GroupMessage:g1",
             "group_name": "测试群",
             "iso_year": iso_year,
             "iso_week": iso_week,
@@ -607,7 +607,7 @@ def test_chronicle_list_format(monkeypatch, tmp_path):
             "version": 1,
         }
     )
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     results = run(collect(plugin.chronicle_list_command(event)))
     assert len(results) == 1
     assert f"1. {iso_year}-W{iso_week:02d}" in results[0]
@@ -615,7 +615,7 @@ def test_chronicle_list_format(monkeypatch, tmp_path):
 
 def test_chronicle_view_not_found():
     plugin = make_plugin()
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     results = run(collect(plugin.chronicle_view_command(event, "1")))
     assert results == ["未找到该条史记"]
 
@@ -626,7 +626,7 @@ def test_chronicle_view_ok_with_image_note(monkeypatch, tmp_path):
     iso_year, iso_week = datetime.now().isocalendar()[:2]
     plugin.store.save(
         {
-            "umo": "g1",
+            "umo": "default:GroupMessage:g1",
             "group_name": "测试群",
             "iso_year": iso_year,
             "iso_week": iso_week,
@@ -638,7 +638,7 @@ def test_chronicle_view_ok_with_image_note(monkeypatch, tmp_path):
             "version": 1,
         }
     )
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     results = run(collect(plugin.chronicle_view_command(event, "1")))
     assert len(results) == 1
     assert "本周史记正文" in results[0]
@@ -670,7 +670,7 @@ def test_influence_command_renders_ranking(monkeypatch):
             ]
         ),
     )
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     results = run(collect(plugin.influence_command(event)))
     assert len(results) == 1
     assert "1. 张三 (0.9)" in results[0]
@@ -693,9 +693,9 @@ def test_bio_only_with_target(monkeypatch):
     monkeypatch.setattr(main_module, "gather_evidence", amock(evidence))
     monkeypatch.setattr(main_module, "generate_biography", amock("张三的传记正文"))
     monkeypatch.setattr(main_module, "resolve_system_prompt", amock(None))
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
 
-    run(plugin._bio_only(event, "g1", "123"))
+    run(plugin._bio_only(event, "default:GroupMessage:g1", "123"))
     texts = all_sent_texts(plugin, event)
     assert any("## 人物传记：张三" in t for t in texts)
     assert any("张三的传记正文" in t for t in texts)
@@ -705,8 +705,8 @@ def test_bio_only_target_not_found(monkeypatch):
     plugin = make_plugin()
     patch_lm(monkeypatch)
     monkeypatch.setattr(main_module, "gather_evidence", amock(make_evidence()))
-    event = FakeEvent(umo="g1")
-    run(plugin._bio_only(event, "g1", "99999"))
+    event = FakeEvent(umo="default:GroupMessage:g1")
+    run(plugin._bio_only(event, "default:GroupMessage:g1", "99999"))
     assert any("未找到该成员的发言记录" in t for t in all_sent_texts(plugin, event))
 
 

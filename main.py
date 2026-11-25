@@ -88,7 +88,7 @@ if __package__:
     )
     from .core.history_commands import COMMANDS, command_reply
     from .core.influence import rank_influential, relation_pairs
-    from .core.lifetime import HistoryService
+    from .core.lifetime import GROUP_PATTERN, HistoryService, scope_lists
     from .core.llm_call import LLMUnavailableError
     from .core.lm_bridge import (
         detect_lm,
@@ -122,7 +122,7 @@ else:  # Top-level import is reserved for the test harness.
     )
     from core.history_commands import COMMANDS, command_reply
     from core.influence import rank_influential, relation_pairs
-    from core.lifetime import HistoryService
+    from core.lifetime import GROUP_PATTERN, HistoryService, scope_lists
     from core.llm_call import LLMUnavailableError
     from core.lm_bridge import (
         detect_lm,
@@ -1840,6 +1840,30 @@ class GroupChroniclePlugin(Star):
                 )
         return pid or None
 
+    async def _check_group_scope(self, umo: str) -> tuple[bool, str]:
+        """Enforce group-only pattern, core exclude_groups, allow/block lists, and history.allowed."""
+        clean = str(umo or "").strip()
+        if not clean or not GROUP_PATTERN.fullmatch(clean):
+            return False, "此命令只能在群内使用"
+        if self._is_excluded_by_core(clean):
+            return False, "本群已在主控排除列表中，无法执行此操作"
+        try:
+            allow, block = scope_lists(self.config)
+        except ValueError:
+            return False, "群作用域配置无效，请管理员检查配置"
+        if clean in block or (allow and clean not in allow):
+            return False, "本群不在允许范围"
+        history = getattr(self, "history", None)
+        if history is not None:
+            recording = bool(self._cfg("history_enabled", True))
+            try:
+                allowed = await history.allowed(clean, recording=recording)
+            except TypeError:
+                allowed = await history.allowed(clean)
+            if not allowed:
+                return False, "本群长期记录已停用或不在允许范围"
+        return True, ""
+
     async def _lm_and_gather(
         self, umo: str, days: int | None, *, progress=None
     ) -> tuple[Any, int]:
@@ -1854,9 +1878,12 @@ class GroupChroniclePlugin(Star):
             (evidence, 实际使用的 chronicle_days)。
 
         Raises:
-            LLMUnavailableError: LivingMemory 未检测到 / 未初始化。
+            LLMUnavailableError: LivingMemory 未检测到 / 未初始化 / 群不在允许范围。
             NoActivityError: 时间窗内无足够活动或数据异常。
         """
+        scope_ok, scope_reason = await self._check_group_scope(umo)
+        if not scope_ok:
+            raise LLMUnavailableError(scope_reason)
         history = getattr(self, "history", None)
         if history is not None and await asyncio.to_thread(
             history.store.privacy_active, umo
@@ -2107,6 +2134,10 @@ class GroupChroniclePlugin(Star):
             return
         if not self._cfg("enable_vote", False):
             yield event.plain_result("投票选题功能未启用（enable_vote=false）")
+            return
+        scope_ok, scope_reason = await self._check_group_scope(umo)
+        if not scope_ok:
+            yield event.plain_result(scope_reason)
             return
         self._spawn_bg(
             self._vote_propose_run(event, umo, prefer_context=True),
@@ -2378,6 +2409,10 @@ class GroupChroniclePlugin(Star):
         if not umo:
             yield event.plain_result("无法获取会话标识")
             return
+        scope_ok, scope_reason = await self._check_group_scope(umo)
+        if not scope_ok:
+            yield event.plain_result(scope_reason)
+            return
         groups = self._cfg("universe_groups", []) or []
         if not groups:
             yield event.plain_result("未配置宇宙史记群列表（universe_groups）")
@@ -2403,10 +2438,20 @@ class GroupChroniclePlugin(Star):
         self, event, umo: str, groups: list, *, prefer_context: bool = True
     ) -> None:
         """宇宙史记主体: 逐群采集证据 (单群失败跳过), 一次 LLM 调用综合成文。"""
+        scope_ok, scope_reason = await self._check_group_scope(umo)
+        if not scope_ok:
+            await self._reply(
+                event, scope_reason, umo=umo, prefer_context=prefer_context
+            )
+            return
         group_evidences: list = []
         for g in groups:
             g = str(g).strip()
             if not g:
+                continue
+            g_ok, g_reason = await self._check_group_scope(g)
+            if not g_ok:
+                logger.info(f"宇宙史记: 群 {g} 不在允许范围, 跳过 ({g_reason})")
                 continue
             try:
                 evidence, _ = await self._lm_and_gather(g, None)
@@ -2481,6 +2526,10 @@ class GroupChroniclePlugin(Star):
         umo = getattr(event, "unified_msg_origin", None)
         if not umo:
             yield event.plain_result("无法获取会话标识")
+            return
+        scope_ok, scope_reason = await self._check_group_scope(umo)
+        if not scope_ok:
+            yield event.plain_result(scope_reason)
             return
         try:
             evidence, _ = await self._lm_and_gather(umo, None)

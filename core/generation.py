@@ -269,7 +269,7 @@ async def generate_chronicle(
         )
     if enable_slang:
         evidence_text = await append_slang(
-            evidence_text, evidence, structured, context, True
+            evidence_text, evidence, structured, context, True, umo=umo
         )
 
     if enable_structured and structured:

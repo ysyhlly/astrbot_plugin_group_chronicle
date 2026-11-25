@@ -132,7 +132,7 @@ def patch_full_pipeline(monkeypatch, chronicle_text="新史记", evidence=None):
     monkeypatch.setattr(main_module, "render_text_or_image", _identity_render)
 
 
-def save_entry(store, umo="g1", week=1, msg_count=5, text="史记正文", newest=100.0):
+def save_entry(store, umo="default:GroupMessage:g1", week=1, msg_count=5, text="史记正文", newest=100.0):
     iso_year = datetime.now().isocalendar()[0]
     store.save(
         {
@@ -163,7 +163,7 @@ def test_force_skips_should_skip(monkeypatch, tmp_path):
     save_entry(plugin.store, newest=2000.0, text="旧史记")
     patch_full_pipeline(monkeypatch)
 
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     run(plugin._run_group_analysis(event, None, True, force=True))
     texts = all_sent_texts(plugin, event)
     assert any("新史记" in t for t in texts)
@@ -215,7 +215,7 @@ def test_chronicle_command_passes_force_style_skip(monkeypatch):
         )
 
     monkeypatch.setattr(plugin, "_run_group_analysis", fake_run)
-    event = FakeEvent(umo="g1", message_str="群史记 月 强制 风格=文言")
+    event = FakeEvent(umo="default:GroupMessage:g1", message_str="群史记 月 强制 风格=文言")
 
     async def main():
         await collect(plugin.chronicle_command(event, "月 强制 风格=文言"))
@@ -256,11 +256,11 @@ def test_generation_timeout_replies_and_releases_lock(monkeypatch):
         return make_evidence()
 
     monkeypatch.setattr(main_module, "gather_evidence", slow_gather)
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     run(plugin._run_group_analysis(event, None, True))
     texts = all_sent_texts(plugin, event)
     assert any("生成超时" in t for t in texts)
-    assert plugin._gen_locks["g1"].locked() is False  # 锁已释放
+    assert plugin._gen_locks["default:GroupMessage:g1"].locked() is False  # 锁已释放
 
 
 def test_progress_stages_sent(monkeypatch, tmp_path):
@@ -268,7 +268,7 @@ def test_progress_stages_sent(monkeypatch, tmp_path):
     plugin = make_plugin()
     plugin.store = ChronicleStore(str(tmp_path))
     patch_full_pipeline(monkeypatch)
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     run(plugin._run_group_analysis(event, None, True))
     texts = ctx_sent_texts(plugin)
     assert any(t.startswith("⏳ [1/5]") for t in texts)
@@ -282,7 +282,7 @@ def test_progress_disabled_no_stage_messages(monkeypatch, tmp_path):
     plugin = make_plugin({"enable_progress": False})
     plugin.store = ChronicleStore(str(tmp_path))
     patch_full_pipeline(monkeypatch)
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     run(plugin._run_group_analysis(event, None, True))
     assert not any(t.startswith("⏳") for t in ctx_sent_texts(plugin))
 
@@ -297,7 +297,7 @@ def test_export_command_writes_file_and_falls_back_to_text(monkeypatch, tmp_path
     plugin = make_plugin()
     plugin.store = ChronicleStore(str(tmp_path))
     save_entry(plugin.store, text="本周史记正文内容")
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
 
     async def unsupported(*args, **kwargs):
         raise RuntimeError("synthetic unsupported file delivery")
@@ -317,7 +317,7 @@ def test_export_command_writes_file_and_falls_back_to_text(monkeypatch, tmp_path
 def test_export_command_not_found(monkeypatch, tmp_path):
     plugin = make_plugin()
     plugin.store = ChronicleStore(str(tmp_path))
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     results = run(collect(plugin.chronicle_export_command(event, "1")))
     assert results == ["未找到该条史记"]
 
@@ -343,8 +343,8 @@ def test_continue_command_generates_from_latest(monkeypatch, tmp_path):
         return "续篇正文内容"
 
     monkeypatch.setattr(main_module, "generate_continuation", fake_continuation)
-    event = FakeEvent(umo="g1")
-    run(plugin._continue_run(event, "g1"))
+    event = FakeEvent(umo="default:GroupMessage:g1")
+    run(plugin._continue_run(event, "default:GroupMessage:g1"))
     texts = all_sent_texts(plugin, event)
     assert any("续篇正文内容" in t for t in texts)
     assert captured["previous"] == "上一期史记正文"
@@ -353,8 +353,8 @@ def test_continue_command_generates_from_latest(monkeypatch, tmp_path):
 def test_continue_command_no_entry(monkeypatch, tmp_path):
     plugin = make_plugin()
     plugin.store = ChronicleStore(str(tmp_path))
-    event = FakeEvent(umo="g1")
-    run(plugin._continue_run(event, "g1"))
+    event = FakeEvent(umo="default:GroupMessage:g1")
+    run(plugin._continue_run(event, "default:GroupMessage:g1"))
     assert any("暂无史记可续写" in t for t in all_sent_texts(plugin, event))
 
 
@@ -365,7 +365,7 @@ def test_compare_command_two_entries(monkeypatch, tmp_path):
     save_entry(
         plugin.store, week=31, msg_count=15, text="新" * 80, newest=100.0 + 86400
     )
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     results = run(collect(plugin.chronicle_compare_command(event)))
     assert len(results) == 1
     assert "史记对比" in results[0]
@@ -378,7 +378,7 @@ def test_compare_command_insufficient_entries(monkeypatch, tmp_path):
     plugin = make_plugin()
     plugin.store = ChronicleStore(str(tmp_path))
     save_entry(plugin.store)
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     results = run(collect(plugin.chronicle_compare_command(event)))
     assert results == ["至少需要两条史记才能对比"]
 
@@ -402,7 +402,7 @@ def test_relation_arc_section_added_when_ra_available(monkeypatch, tmp_path):
     monkeypatch.setattr(
         main_module, "relation_pairs", amock([("1", "2", 5.0), ("9", "8", 0.5)])
     )
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     run(plugin._run_group_analysis(event, None, True))
     texts = all_sent_texts(plugin, event)
     assert any("## 本周关系弧" in t for t in texts)
@@ -416,7 +416,7 @@ def test_relation_arc_skipped_when_ra_missing(monkeypatch, tmp_path):
     plugin.store = ChronicleStore(str(tmp_path))
     patch_full_pipeline(monkeypatch)
     monkeypatch.setattr(main_module, "relation_pairs", amock(None))
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     run(plugin._run_group_analysis(event, None, True))
     assert not any("本周关系弧" in t for t in all_sent_texts(plugin, event))
 
@@ -431,6 +431,6 @@ def test_relation_arc_skipped_when_ra_raises(monkeypatch, tmp_path):
         raise RuntimeError("ra boom")
 
     monkeypatch.setattr(main_module, "relation_pairs", boom)
-    event = FakeEvent(umo="g1")
+    event = FakeEvent(umo="default:GroupMessage:g1")
     run(plugin._run_group_analysis(event, None, True))
     assert any("新史记" in t for t in all_sent_texts(plugin, event))

@@ -410,7 +410,7 @@ class CultureStore:
         target_id=None,
         target_revision=None,
     ):
-        if not note.strip() or len(note) > 1000:
+        if not isinstance(note, str) or not note.strip() or len(note) > 1000:
             raise ValueError("请填写不超过1000字的处理理由")
         with self.archive.connection(write=True) as db:
             row = db.execute(

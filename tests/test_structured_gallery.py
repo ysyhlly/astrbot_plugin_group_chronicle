@@ -203,13 +203,17 @@ def test_generate_chronicle_slang_appended(monkeypatch):
         captured["prompt"] = prompt
         return "ok"
 
-    async def fake_append_slang(evidence_text, evidence, structured, context, enabled):
+    async def fake_append_slang(
+        evidence_text, evidence, structured, context, enabled, *, umo=None
+    ):
+        captured["slang_umo"] = umo
         return evidence_text + "\n\n## 本周黑话\n- 测试梗：含义"
 
     monkeypatch.setattr(gen, "call_llm", fake_call_llm)
     monkeypatch.setattr(gen, "append_slang", fake_append_slang)
     evidence = SimpleNamespace(chronicle_msgs=[], memories=[], graph_snapshot=None)
     run(gen.generate_chronicle("ctx", "g1", evidence, None, 7))
+    assert captured["slang_umo"] == "g1"
     assert "## 本周黑话\n- 测试梗：含义" in captured["prompt"]
 
 

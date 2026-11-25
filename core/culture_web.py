@@ -45,24 +45,25 @@ class CultureWeb:
                 )
             ]
 
-    async def authorize(self):
+    async def authorize(self, *, check_csrf: bool = False):
         from astrbot.api.web import request
-        from astrbot.dashboard.api.auth import require_dashboard_user
 
-        raw = getattr(request, "_request", None)
-        if raw is None:
-            raise PermissionError("需要 Dashboard 管理员登录")
-        username = await require_dashboard_user(raw)
-        expected = self.plugin.context.get_config().get("dashboard", {}).get("username")
-        if not username or (expected and username != expected):
-            raise PermissionError("需要 Dashboard 管理员登录")
+        if __package__ == "core":
+            from series_panels import require_series_admin
+        else:
+            from ..series_panels import require_series_admin
+
+        username = await require_series_admin(
+            self.plugin.context, request, check_csrf=check_csrf
+        )
         return "human:" + str(username)
 
-    async def respond(self, callback, body=False):
+    async def respond(self, callback, body=False, *, check_csrf=None):
         from astrbot.api.web import json_response, request
 
         try:
-            actor = await self.authorize()
+            enforce_csrf = bool(body) if check_csrf is None else bool(check_csrf)
+            actor = await self.authorize(check_csrf=enforce_csrf)
             if self.plugin._terminating:
                 raise ValueError("插件已卸载")
             data = {}
@@ -93,7 +94,7 @@ class CultureWeb:
             )
 
     async def overview(self):
-        return await self.respond(self.overview_data)
+        return await self.respond(self.overview_data, check_csrf=False)
 
     async def overview_data(self, body=None, actor=""):
         raw_groups = await asyncio.to_thread(self.service.history.store.groups)
@@ -134,7 +135,7 @@ class CultureWeb:
         }
 
     async def handle(self):
-        return await self.respond(self.dispatch, body=True)
+        return await self.respond(self.dispatch, body=True, check_csrf=True)
 
     async def inspect_entries(self, umo, items):
         if not items:
@@ -311,9 +312,36 @@ class CultureWeb:
                 raise ValueError("分页或查询参数无效")
 
             def _load_list():
-                return self.service.token(umo), self.service.store.entries(
-                    umo, status=status, query=query, limit=20, offset=(page - 1) * 20
+                token = self.service.token(umo)
+                all_items, _ = self.service.store.entries(
+                    umo, status=None, query="", limit=1000000, offset=0
                 )
+                snapshot = self.service._privacy_snapshot(
+                    umo, {i.get("source") for i in all_items}
+                )
+                q = query.strip()
+                matched = []
+                for item in all_items:
+                    blocked = self.service._is_item_blocked(item, snapshot)
+                    eff_status = "hidden" if blocked else item["status"]
+                    if status and eff_status != status:
+                        continue
+                    if q:
+                        if blocked:
+                            continue
+                        haystack = [
+                            item["name"],
+                            item["meaning"],
+                            *(a["name"] for a in item["aliases"]),
+                        ]
+                        if (
+                            not any(q.casefold() in s.casefold() for s in haystack)
+                            and q != str(item["id"])
+                        ):
+                            continue
+                    matched.append(item)
+                start = (page - 1) * 20
+                return token, (matched[start : start + 20], len(matched))
 
             token, (items, total) = await asyncio.to_thread(_load_list)
             entries = await self.inspect_entries(umo, items)
@@ -360,6 +388,11 @@ class CultureWeb:
                 raise ValueError("资料已更新，请刷新")
             return {"entry": detail, "revisions": revisions}
         if op == "action":
+            raw_note = body.get("note", "")
+            if raw_note is None:
+                raw_note = ""
+            if not isinstance(raw_note, str):
+                raise ValueError("请填写不超过1000字的处理理由")
             return await self.service.action(
                 umo,
                 body.get("action"),
@@ -367,7 +400,7 @@ class CultureWeb:
                 admin=True,
                 entry_id=body.get("id"),
                 revision=body.get("revision"),
-                note=body.get("note", ""),
+                note=raw_note,
                 patch=body.get("patch"),
                 target_id=body.get("target_id"),
                 target_revision=body.get("target_revision"),

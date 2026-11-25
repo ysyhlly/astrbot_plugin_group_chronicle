@@ -205,7 +205,7 @@ async def handle_command(service, event, supplied=None):
         return "此命令只能在群内使用。"
     try:
         message = str(getattr(event, "message_str", "") or "")
-        match = re.search(r"(?:^|\s)(" + "|".join(COMMANDS) + r")(?=\s|$)", message)
+        match = re.search(r"(?:^|\s)/*(" + "|".join(COMMANDS) + r")(?=\s|$)", message)
         if not match:
             return "无法识别史记命令。"
         command = match.group(1)
@@ -540,7 +540,8 @@ async def command_reply(plugin, event, supplied=None):
     umo = getattr(event, "unified_msg_origin", "")
     guarded = bool(
         re.search(
-            r"(?:^|\s)(群大事|人物等级)(?=\s|$)", str(getattr(event, "message_str", ""))
+            r"(?:^|\s)/*(群大事|人物等级)(?=\s|$)",
+            str(getattr(event, "message_str", "")),
         )
     )
     revision = (
