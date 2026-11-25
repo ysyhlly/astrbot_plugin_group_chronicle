@@ -66,3 +66,7 @@ jobs:
         run: |
           mkdir -p "$ASTRBOT_ROOT"
           python -m pytest tests -q --ignore-glob="*browser*"
+
+      - name: Verify release packaging
+        working-directory: AstrBot/data/plugins/${{ github.event.repository.name }}
+        run: python tools/package_release.py --output "${{ runner.temp }}/dist"

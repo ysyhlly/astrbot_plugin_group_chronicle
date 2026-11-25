@@ -11,7 +11,6 @@ Covers:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import sys
 import types
@@ -21,7 +20,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import main as main_module
-from core import gallery, history_commands, lm_bridge
+from core import gallery, history_commands
 from core.llm_call import LLMUnavailableError
 from tests.test_commands import (
     FakeEvent,

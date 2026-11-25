@@ -22,19 +22,19 @@
         "description": "👤 人物传记时间窗天数",
         "type": "int",
         "default": 30,
-        "hint": "仅兼容模式使用；长期模式人物传读取全部已收录的生涯重要事件。"
+        "hint": "前置条件：仅兼容模式（history_enabled=false）生效；默认长期群史模式读取全部已收录的生涯重要事件。"
     },
     "max_msgs": {
         "description": "📨 拉取消息上限",
         "type": "int",
         "default": 800,
-        "hint": "单个群聊单次生成任务最多拉取的历史消息条数"
+        "hint": "前置条件：仅兼容模式（history_enabled=false）及「影响力榜 / 史记续写 / 宇宙史记」生效；默认长期群史模式由 history_batch_size 分批采集。单个群聊单次任务最多拉取的历史消息条数"
     },
     "max_memories": {
         "description": "🧠 拉取记忆上限",
         "type": "int",
         "default": 80,
-        "hint": "单个群聊单次生成任务最多拉取的长期记忆条数"
+        "hint": "前置条件：仅兼容模式（history_enabled=false）及「史记续写 / 宇宙史记」生效；默认长期群史模式直接读取已入史事件库。单个群聊单次任务最多拉取的长期记忆条数"
     },
     "top_n_bios": {
         "description": "🏆 自动传记人数",
@@ -63,31 +63,31 @@
         "type": "string",
         "default": "",
         "_special": "select_persona",
-        "hint": "persona_mode 为 core_persona 时使用的人格 ID，可在 AstrBot 人格管理中获得"
+        "hint": "前置条件：需将 persona_mode 设为 core_persona 才生效（默认 off 时忽略），可在 AstrBot 人格管理中获得"
     },
     "custom_persona_prompt": {
         "description": "📝 自定义系统提示词（custom_prompt 模式）",
         "type": "text",
         "default": "",
-        "hint": "persona_mode 为 custom_prompt 时使用的自定义系统提示词，用于指导 LLM 生成群史记/人物传记"
+        "hint": "前置条件：需将 persona_mode 设为 custom_prompt 才生效（默认 off 时忽略），用于指导 LLM 生成群史记/人物传记"
     },
     "influence_w_lm": {
         "description": "⚖️ 本期活跃度权重",
         "type": "float",
         "default": 0.5,
-        "hint": "本期消息量与活跃天数在影响力排行中的权重"
+        "hint": "前置条件：仅兼容模式（history_enabled=false）与「影响力榜」生效；默认长期群史模式按入史贡献分评选。本期消息量与活跃天数在影响力排行中的权重"
     },
     "influence_w_sl": {
         "description": "⚖️ 社交影响力权重",
         "type": "float",
         "default": 0.3,
-        "hint": "self_learning 社交图在本期活跃成员排行中的权重"
+        "hint": "前置条件：仅兼容模式（history_enabled=false）与「影响力榜」生效，且需安装 self_learning。self_learning 社交图在本期活跃成员排行中的权重"
     },
     "influence_w_ra": {
         "description": "⚖️ 关系中心度权重",
         "type": "float",
         "default": 0.2,
-        "hint": "关系分析数据在本期活跃成员排行中的权重"
+        "hint": "前置条件：仅兼容模式（history_enabled=false）与「影响力榜」生效，且需安装 group_relation_analyzer。关系分析数据在本期活跃成员排行中的权重"
     },
     "enable_weekly_push": {
         "description": "📬 启用每周定时推送",
@@ -99,25 +99,25 @@
         "description": "📅 推送星期",
         "type": "int",
         "default": 6,
-        "hint": "0=周一 ... 6=周日，与 APScheduler 的 day_of_week 参数一致"
+        "hint": "前置条件：需开启 enable_weekly_push=true 且配置 push_groups 才生效。0=周一 ... 6=周日，与 APScheduler 的 day_of_week 参数一致"
     },
     "push_time": {
         "description": "🕐 推送时间",
         "type": "string",
         "default": "20:00",
-        "hint": "格式 HH:MM，例如 20:00 表示晚上 8 点推送"
+        "hint": "前置条件：需开启 enable_weekly_push=true 且配置 push_groups 才生效。格式 HH:MM，例如 20:00 表示晚上 8 点推送"
     },
     "push_groups": {
         "description": "👥 推送目标群聊列表",
         "type": "list",
         "default": [],
-        "hint": "完整的 UMO 字符串列表，形如 platform:MessageType:id，例如 default:GroupMessage:123456789；可在群内发送「史记sid」获取当前会话 UMO"
+        "hint": "前置条件：需开启 enable_weekly_push=true 才会触发每周自动推送。完整的 UMO 字符串列表，形如 platform:MessageType:id，例如 default:GroupMessage:123456789；可在群内发送「史记sid」获取当前会话 UMO"
     },
     "min_activity_messages": {
         "description": "📊 最小活动消息数",
         "type": "int",
         "default": 1,
-        "hint": "仅兼容模式使用；长期模式不以消息量决定是否有值得记的大事。"
+        "hint": "前置条件：仅兼容模式（history_enabled=false）生效；默认长期群史模式不以消息量决定是否有值得记的大事。"
     },
     "generation_timeout_sec": {
         "description": "⏱️ 生成超时（秒）",
@@ -187,37 +187,37 @@
         "description": "🧩 两阶段生成",
         "type": "bool",
         "default": false,
-        "hint": "开启后先生成按天要点摘要，再据摘要成文，长窗口（月/年）下质量更好，但多一次 LLM 调用"
+        "hint": "前置条件：仅兼容模式（history_enabled=false）生效；默认长期群史模式直接基于已沉淀事件成文。开启后先生成按天要点摘要，再据摘要成文，长窗口（月/年）下质量更好，但多一次 LLM 调用"
     },
     "enable_golden_quotes": {
         "description": "💬 候选金句",
         "type": "bool",
         "default": true,
-        "hint": "从群聊消息中挑选金句候选注入生成提示词，供 LLM 酌情引用"
+        "hint": "前置条件：仅兼容模式（history_enabled=false）与「史记续写」生效；默认长期群史模式不使用此开关。从群聊消息中挑选金句候选注入生成提示词，供 LLM 酌情引用"
     },
     "enable_relation_arc": {
         "description": "🕸️ 本周关系弧",
         "type": "bool",
         "default": true,
-        "hint": "安装 group_relation_analyzer 且有关系数据时，在史记末尾追加「本周关系弧」分节；数据缺失自动跳过"
+        "hint": "前置条件：仅兼容模式（history_enabled=false）生效且需安装 group_relation_analyzer；默认长期群史模式不追加此分节。有关系数据时在史记末尾追加「本周关系弧」，数据缺失自动跳过"
     },
     "enable_structured": {
         "description": "🧬 结构化输出",
         "type": "bool",
         "default": false,
-        "hint": "先提取结构化事实；选用人设、文风、主题或两阶段时再据事实成文，可能增加一次 LLM 调用。解析或渲染失败自动回退自由散文"
+        "hint": "前置条件：仅兼容模式（history_enabled=false）生效；默认长期群史模式已有独立结构化事件库。先提取结构化事实；选用人设、文风、主题或两阶段时再据事实成文，解析或渲染失败自动回退自由散文"
     },
     "enable_gallery": {
         "description": "🖼️ 群友图鉴",
         "type": "bool",
         "default": true,
-        "hint": "生成群史记时为影响力 Top-N 群友追加「群友图鉴」分节（名称｜称号｜一句话标签）；关闭则不生成"
+        "hint": "前置条件：仅兼容模式（history_enabled=false）生效；默认长期群史模式由长期人物档案与群文化系统替代。生成群史记时为影响力 Top-N 群友追加「群友图鉴」分节；关闭则不生成"
     },
     "enable_slang": {
         "description": "💬 本周黑话",
         "type": "bool",
         "default": true,
-        "hint": "生成群史记时从长期记忆/结构化结果中收集「本周黑话」分节注入提示词；无黑话素材时自动省略"
+        "hint": "前置条件：仅兼容模式（history_enabled=false）生效；默认长期群史模式请开启 culture_enabled（群文化沿革）。从长期记忆/结构化结果中收集「本周黑话」分节注入提示词；无黑话素材时自动省略"
     },
     "enable_vote": {
         "description": "🗳️ 投票选题",
@@ -257,7 +257,7 @@
         "description": "🔁 t2i 失败回退 playwright",
         "type": "bool",
         "default": true,
-        "hint": "t2i 渲染失败时是否回退到本地 playwright 渲染（未安装浏览器则最终降级为纯文本）"
+        "hint": "前置条件：仅 render_mode=t2i 时生效。t2i 渲染失败时是否回退到本地 playwright 渲染（未安装浏览器则最终降级为纯文本）"
     },
     "t2i_scale": {
         "description": "🔍 T2I 截图比例",
@@ -271,13 +271,13 @@
             "css（按 CSS 尺寸）"
         ],
         "default": "device",
-        "hint": "AstrBot 文转图服务截图比例：高分辨率屏幕下 device 更清晰，css 按模板 CSS 尺寸输出"
+        "hint": "前置条件：仅 render_mode=t2i 时生效。AstrBot 文转图服务截图比例：高分辨率屏幕下 device 更清晰，css 按模板 CSS 尺寸输出"
     },
     "enable_cron_reload": {
         "description": "🔄 定时配置热加载",
         "type": "bool",
         "default": true,
-        "hint": "每周推送触发时检测 enable_weekly_push / push_groups / push_time / push_weekday 是否变化，变化则自动重新注册定时任务（无需重启）"
+        "hint": "前置条件：需开启 enable_weekly_push=true 才生效。每周推送触发时检测 enable_weekly_push / push_groups / push_time / push_weekday 是否变化，变化则自动重新注册定时任务（无需重启）"
     },
     "history_enabled": {
         "description": "长期群史与人物档案",

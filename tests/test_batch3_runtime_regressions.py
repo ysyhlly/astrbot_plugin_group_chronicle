@@ -172,7 +172,6 @@ async def test_p1_7_culture_not_starved_by_history_and_daily_limit_zero_pauses(
     plugin = make_plugin({"history_enabled": True, "culture_enabled": True, "history_daily_limit": 24})
     plugin.data_dir = tmp_path
     mgr = HistoryService(plugin, plugin.store)
-    day = "2026-11-25"
     quota_used = {"n": 0}
     order: list[str] = []
 

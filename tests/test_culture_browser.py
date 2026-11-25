@@ -9,6 +9,7 @@ import functools
 import html
 import json
 import os
+import re
 import threading
 import types
 from http.server import HTTPServer, SimpleHTTPRequestHandler
@@ -95,6 +96,14 @@ def wire_server(culture, monkeypatch, tmp_path):  # noqa: F811 - pytest fixture 
         def log_message(self, *args):
             pass
 
+        def end_headers(self):
+            # Allow opaque-origin sandboxed srcdoc iframes (Origin: null) to fetch
+            # static ES modules (e.g. ./series-ui.js, ./series-messages.js) while
+            # API endpoints remain gated by require_dashboard_user on the host shell.
+            if self.command == "GET" and not self.path.startswith("/api/"):
+                self.send_header("Access-Control-Allow-Origin", "*")
+            super().end_headers()
+
         def api(self, overview=False):
             payload = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             web_module.request._request = Request(self.headers, payload)
@@ -112,8 +121,20 @@ def wire_server(culture, monkeypatch, tmp_path):  # noqa: F811 - pytest fixture 
         def do_GET(self):
             if self.path.startswith("/api/culture_overview"):
                 self.api(True)
+            elif self.path.startswith("/api/"):
+                content = json.dumps({"status": "error", "message": "not_found"}).encode()
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(content)
             elif self.path == "/sandbox":
+                base_href = f"http://127.0.0.1:{self.server.server_port}/"
                 document = (page_root / "index.html").read_text(encoding="utf-8")
+                document = document.replace(
+                    "<head>",
+                    f'<head><base href="{base_href}">',
+                    1,
+                )
                 document = document.replace(
                     '<link rel="stylesheet" href="style.css">',
                     "<style>"
@@ -127,14 +148,20 @@ def wire_server(culture, monkeypatch, tmp_path):  # noqa: F811 - pytest fixture 
                     + "</script>",
                 )
                 bridge = """let seq=0;const waiting=new Map();window.addEventListener('message',e=>{if(e.source===parent&&e.data.cultureResponse&&waiting.has(e.data.id)){waiting.get(e.data.id)(e.data.result);waiting.delete(e.data.id);}});function call(path,body){return new Promise(resolve=>{const id=++seq;waiting.set(id,resolve);parent.postMessage({cultureRequest:true,id,path,body},'*');});}window.AstrBotPluginPage={ready:async()=>{},apiGet:path=>call(path),apiPost:(path,body)=>call(path,body)};"""
-                document = document.replace(
-                    '<script type="module" src="app.js"></script>',
+                inline_app = (
                     "<script>"
                     + bridge
                     + '</script><script type="module">'
                     + (page_root / "app.js").read_text(encoding="utf-8")
-                    + "</script>",
+                    + "</script>"
                 )
+                document, replaced = re.subn(
+                    r'<script\s+type="module"\s+src="app\.js(?:\?[^"]*)?"\s*></script>',
+                    lambda _m: inline_app,
+                    document,
+                    count=1,
+                )
+                assert replaced == 1, "Failed to inject sandbox bridge for app.js"
                 shell = (
                     '<!doctype html><html><body style="margin:0"><iframe style="width:100%;height:100vh;border:0" sandbox="allow-scripts allow-forms allow-downloads" srcdoc="'
                     + html.escape(document, quote=True)

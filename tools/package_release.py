@@ -40,7 +40,7 @@ SOURCE_ONLY = {
     "scripts",
     "frontend",
 }
-SKIP_FILES = {"validation.json", "cmd_config.json", "requirements-dev.txt", "nul"}
+SKIP_FILES = {"validation.json", "cmd_config.json", "requirements-dev.txt", "build_release.py", "nul"}
 STATE_SUFFIXES = {
     ".db",
     ".sqlite",
