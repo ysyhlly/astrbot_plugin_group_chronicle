@@ -309,6 +309,22 @@ def _render_html_fallback(content_html: str, group_name: str, generated_at: str)
         )
 
 
+_PLAYWRIGHT_MAX_CONCURRENCY = 2
+_PLAYWRIGHT_SEMAPHORES: dict[int, asyncio.Semaphore] = {}
+
+
+def _get_playwright_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    key = id(loop)
+    sem = _PLAYWRIGHT_SEMAPHORES.get(key)
+    if sem is None:
+        if len(_PLAYWRIGHT_SEMAPHORES) > 16:
+            _PLAYWRIGHT_SEMAPHORES.clear()
+        sem = asyncio.Semaphore(_PLAYWRIGHT_MAX_CONCURRENCY)
+        _PLAYWRIGHT_SEMAPHORES[key] = sem
+    return sem
+
+
 async def render_chronicle_image(
     markdown_text: str, group_name: str, out_dir: str
 ) -> str | None:
@@ -340,13 +356,14 @@ async def render_chronicle_image(
             )
             suffix += 1
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(args=["--no-sandbox"])
-            page = await browser.new_page(viewport={"width": 1280, "height": 1400})
-            await page.set_content(html_content)
-            await page.wait_for_timeout(200)
-            element = await page.query_selector("body")
-            await element.screenshot(path=out_path)
+        async with _get_playwright_semaphore():
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(args=["--no-sandbox"])
+                page = await browser.new_page(viewport={"width": 1280, "height": 1400})
+                await page.set_content(html_content)
+                await page.wait_for_timeout(200)
+                element = await page.query_selector("body")
+                await element.screenshot(path=out_path)
     except Exception as exc:  # noqa: BLE001 — 任何异常都降级为纯文本
         logger.warning(f"渲染群史记图片失败，降级为纯文本输出: {exc}")
         if out_path and os.path.exists(out_path):

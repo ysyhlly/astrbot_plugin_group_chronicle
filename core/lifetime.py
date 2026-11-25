@@ -448,6 +448,18 @@ def pack_messages(
     return material, cursor, next_offset, observed
 
 
+_POISON_SKIP_THRESHOLD = 3
+
+
+def _strip_think_and_fences(raw: str) -> str:
+    """Strip reasoning <think>...</think> blocks and markdown JSON fences."""
+    text = re.sub(r"<think>.*?</think>", "", str(raw or ""), flags=re.IGNORECASE | re.DOTALL)
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
 def validate_extraction(raw, material, existing=(), known_members=None):
     """Validate source references and assign conservative admission states.
 
@@ -463,9 +475,7 @@ def validate_extraction(raw, material, existing=(), known_members=None):
     Raises:
         ValueError: Invalid output; the batch must remain retryable.
     """
-    text = str(raw).strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE)
+    text = _strip_think_and_fences(raw)
     data = json.loads(text)
     if (
         not isinstance(data, dict)
@@ -604,6 +614,8 @@ class HistoryService:
         self._scope_log = None
         self.bot_ids = {}
         self.operations = {}
+        self._poison_counts = {}
+        self._cycle_turn = 0
 
     def _series_tz(self):
         return resolve_series_timezone(getattr(self.plugin, "context", None))
@@ -764,21 +776,29 @@ class HistoryService:
         """Watch configuration and cancel newly excluded source/model work."""
         signature = None
         while not self.plugin._terminating:
-            current = encode(
-                [
-                    self.plugin._cfg("history_enabled", True),
-                    self.plugin._cfg("history_allow_groups", []),
-                    self.plugin._cfg("history_block_groups", []),
-                    lm_bridge.history_connection(self.plugin.context) is not None,
-                ]
-            )
-            await self.refresh_scope()
-            if current != signature:
-                signature = current
-                if self.plugin._cfg("history_enabled", True):
-                    self.plugin._spawn_bg(
-                        self.run_cycle(), label="history-scope-refresh"
-                    )
+            try:
+                current = encode(
+                    [
+                        self.plugin._cfg("history_enabled", True),
+                        self.plugin._cfg("history_allow_groups", []),
+                        self.plugin._cfg("history_block_groups", []),
+                        lm_bridge.history_connection(self.plugin.context) is not None,
+                    ]
+                )
+                await self.refresh_scope()
+                if current != signature:
+                    signature = current
+                    if self.plugin._cfg("history_enabled", True):
+                        self.plugin._spawn_bg(
+                            self.run_cycle(), label="history-scope-refresh"
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Lifetime watch_scope iteration failed; will retry on next tick",
+                    exc_info=True,
+                )
             await asyncio.sleep(_WATCH_SCOPE_INTERVAL_SEC)
 
     async def terminate(self):
@@ -795,7 +815,7 @@ class HistoryService:
         tasks = self.cancel_operations()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        self.store.close()
+        await asyncio.to_thread(self.store.close)
 
     def cancel_operations(self, umo=None):
         """Cancel tracked work while keeping the current privacy/unload caller alive.
@@ -1054,6 +1074,20 @@ class HistoryService:
                 or used_now - start_quota >= cycle_budget
             )
 
+        turn = int(getattr(self, "_cycle_turn", 0) or 0)
+        self._cycle_turn = (turn + 1) % 2
+        lanes = ["history", "culture"] if culture is not None else ["history"]
+        if culture is not None and culture_enabled and turn == 1:
+            lanes = ["culture", "history"]
+        # Split per-group burst fairly across lanes so history backlog never starves culture
+        lane_batch = (
+            max(1, per_group_batch // 2)
+            if (culture is not None and culture_enabled and per_group_batch >= 2)
+            else 1
+            if (culture is not None and culture_enabled)
+            else per_group_batch
+        )
+
         for mode in ("live", "back"):
             empty_passes = 0
             while not self.plugin._terminating:
@@ -1067,83 +1101,28 @@ class HistoryService:
                 for umo in groups:
                     if self.plugin._terminating or not await self.allowed(umo):
                         continue
-                    group_pages = 0
-                    group_empty = 0
-                    while (
-                        not self.plugin._terminating
-                        and group_pages < per_group_batch
-                        and group_empty < max_empty_passes
-                    ):
-                        if await _budget_exhausted():
-                            return
-                        q_before = await asyncio.to_thread(self.store.quota, day)
-                        try:
-                            operation = asyncio.create_task(
-                                self.process_one(umo, mode)
-                            )
-                            step_ok = await operation
-                        except asyncio.CancelledError:
-                            if (
-                                self.plugin._terminating
-                                or getattr(
-                                    asyncio.current_task(),
-                                    "cancelling",
-                                    lambda: 0,
-                                )()
-                            ):
-                                raise
-                            break
-                        except Exception as exc:
-                            if is_budget_busy_error(exc):
-                                retry_after = budget_busy_retry_after(exc)
-                                logger.warning(
-                                    "Lifetime cycle paused immediately due to busy/open provider budget (retry_after=%.1fs)",
-                                    retry_after,
-                                )
-                                return
-                            await asyncio.to_thread(
-                                self.store.job_error,
-                                umo,
-                                f"整理失败：{type(exc).__name__}；进度已保留",
-                            )
-                            logger.warning(
-                                "Lifetime batch failed without advancing its checkpoint",
-                                exc_info=True,
-                            )
-                            break
-                        if not step_ok:
-                            break
-                        progressed = True
-                        q_after = await asyncio.to_thread(self.store.quota, day)
-                        if q_after > q_before:
-                            group_pages += 1
-                            group_empty = 0
-                        else:
-                            group_empty += 1
-                if culture is not None:
-                    for umo in groups:
-                        if self.plugin._terminating or not await self.allowed(
-                            umo
-                        ):
-                            continue
+                    for lane in lanes:
                         group_pages = 0
                         group_empty = 0
                         while (
                             not self.plugin._terminating
-                            and group_pages < per_group_batch
+                            and group_pages < lane_batch
                             and group_empty < max_empty_passes
                         ):
                             if await _budget_exhausted():
                                 return
-                            q_before = await asyncio.to_thread(
-                                self.store.quota, day
-                            )
+                            q_before = await asyncio.to_thread(self.store.quota, day)
                             try:
-                                operation = asyncio.create_task(
-                                    culture.step(
-                                        umo, mode, raise_on_budget_busy=True
+                                if lane == "history":
+                                    operation = asyncio.create_task(
+                                        self.process_one(umo, mode)
                                     )
-                                )
+                                else:
+                                    operation = asyncio.create_task(
+                                        culture.step(
+                                            umo, mode, raise_on_budget_busy=True
+                                        )
+                                    )
                                 step_ok = await operation
                             except asyncio.CancelledError:
                                 if (
@@ -1160,21 +1139,31 @@ class HistoryService:
                                 if is_budget_busy_error(exc):
                                     retry_after = budget_busy_retry_after(exc)
                                     logger.warning(
-                                        "Culture cycle paused immediately due to busy/open provider budget (retry_after=%.1fs)",
+                                        "%s cycle paused immediately due to busy/open provider budget (retry_after=%.1fs)",
+                                        "Lifetime" if lane == "history" else "Culture",
                                         retry_after,
                                     )
                                     return
-                                logger.warning(
-                                    "Culture step failed inside lifetime cycle",
-                                    exc_info=True,
-                                )
+                                if lane == "history":
+                                    await asyncio.to_thread(
+                                        self.store.job_error,
+                                        umo,
+                                        f"整理失败：{type(exc).__name__}；进度已保留",
+                                    )
+                                    logger.warning(
+                                        "Lifetime batch failed without advancing its checkpoint",
+                                        exc_info=True,
+                                    )
+                                else:
+                                    logger.warning(
+                                        "Culture step failed inside lifetime cycle",
+                                        exc_info=True,
+                                    )
                                 break
                             if not step_ok:
                                 break
                             progressed = True
-                            q_after = await asyncio.to_thread(
-                                self.store.quota, day
-                            )
+                            q_after = await asyncio.to_thread(self.store.quota, day)
                             if q_after > q_before:
                                 group_pages += 1
                                 group_empty = 0
@@ -1365,9 +1354,32 @@ class HistoryService:
                             self.store.refund_quota, day, kind="history"
                         )
                         raise
-                    facts = validate_extraction(
-                        raw, material, previous, known_members=known
-                    )
+                    poison_key = (umo, mode, int(cursor), int(offset))
+                    poison_gap = None
+                    try:
+                        facts = validate_extraction(
+                            raw, material, previous, known_members=known
+                        )
+                        self._poison_counts.pop(poison_key, None)
+                    except (ValueError, json.JSONDecodeError) as exc:
+                        fail_count = self._poison_counts.get(poison_key, 0) + 1
+                        if fail_count < _POISON_SKIP_THRESHOLD:
+                            self._poison_counts[poison_key] = fail_count
+                            raise
+                        self._poison_counts.pop(poison_key, None)
+                        logger.warning(
+                            "Skipping poison extraction batch for %s (%s cursor=%s offset=%s) after %d validation failures: %s",
+                            umo,
+                            mode,
+                            cursor,
+                            offset,
+                            fail_count,
+                            exc,
+                        )
+                        facts = []
+                        poison_gap = f"该批次连续 {fail_count} 次抽取校验失败，已跳过以防游标阻塞"
+                else:
+                    poison_gap = None
                 if (
                     not await self.allowed(umo)
                     or await asyncio.to_thread(self.privacy_key, umo) != privacy
@@ -1391,7 +1403,7 @@ class HistoryService:
                     next_offset,
                     observed,
                     facts,
-                    gap="；".join(v for v in (resume_gap, gap) if v) or None,
+                    gap="；".join(v for v in (resume_gap, gap, poison_gap) if v) or None,
                     fragment=fragment_checkpoint(rows, end, next_offset),
                 )
             finally:
@@ -2006,12 +2018,11 @@ class HistoryService:
             "origin_plugin": "astrbot_plugin_dynamics_games",
             "activity_id": str(outcome.get("activity_id") or "")[:64],
         }
-        await asyncio.to_thread(
-            self.store.roster,
-            umo,
-            [(p["uid"], p["name"]) for p in participants],
-            event_at,
-        )
+        def _observe_participants():
+            for p in participants:
+                self.store.observe(umo, p["uid"], p["name"], event_at)
+
+        await asyncio.to_thread(_observe_participants)
         eid = await asyncio.to_thread(
             self.store.add_event,
             umo,

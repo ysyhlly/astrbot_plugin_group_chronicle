@@ -239,37 +239,103 @@ class GroupChroniclePlugin(Star):
             return bool(mod.is_series_in_quiet_hours(getattr(self, "context", None)))
         return False
 
-    def get_series_summary(self) -> dict[str, Any]:
-        """Strictly synchronous, read-only summary for the v2 series status matrix."""
+    def _series_summary_stamp(self, culture_enabled: bool, allowed_umos: list[str]) -> tuple:
+        with self.history.store.connection() as db:
+            c_row = db.execute(
+                "SELECT COALESCE(SUM(revision), 0), COUNT(*) FROM culture_groups"
+            ).fetchone()
+            g_row = db.execute(
+                "SELECT COALESCE(SUM(privacy_revision), 0), COUNT(*) FROM groups"
+            ).fetchone()
+        return (
+            culture_enabled,
+            tuple(allowed_umos),
+            int(c_row[0] or 0) if c_row else 0,
+            int(c_row[1] or 0) if c_row else 0,
+            int(g_row[0] or 0) if g_row else 0,
+            int(g_row[1] or 0) if g_row else 0,
+        )
+
+    def _compute_series_summary(self) -> dict[str, Any]:
         tz = self._series_tz()
-        try:
-            if (
-                self._terminating
-                or getattr(self, "history", None) is None
-                or getattr(self, "culture", None) is None
-            ):
-                return {
-                    "badge": {"count": 0, "tone": "muted", "label": "未就绪"},
-                    "pulse": {"headline": "群文化沿革未就绪", "updated_at": ""},
-                }
-            culture_enabled = bool(self._cfg("culture_enabled", False))
-            raw_groups = self.history.store.groups()
-            allowed_umos = [
-                umo for umo in raw_groups if self.history.enabled_for(umo)
-            ]
-            pending_count = 0
-            approved_count = 0
-            latest_ts = 0.0
-            if allowed_umos:
-                placeholders = ",".join("?" for _ in allowed_umos)
-                with self.history.store.connection() as db:
-                    rows = db.execute(
-                        f"SELECT * FROM culture_entries WHERE umo IN ({placeholders}) "
-                        "AND status IN ('pending', 'disputed', 'approved')",
+        if (
+            self._terminating
+            or getattr(self, "history", None) is None
+            or getattr(self, "culture", None) is None
+        ):
+            return {
+                "badge": {"count": 0, "tone": "muted", "label": "未就绪"},
+                "pulse": {"headline": "群文化沿革未就绪", "updated_at": ""},
+            }
+        culture_enabled = bool(self._cfg("culture_enabled", False))
+        raw_groups = self.history.store.groups()
+        allowed_umos = [
+            umo for umo in raw_groups if self.history.enabled_for(umo)
+        ]
+        stamp = self._series_summary_stamp(culture_enabled, allowed_umos)
+        cached = getattr(self, "_series_summary_cache", None)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+
+        pending_count = 0
+        approved_count = 0
+        latest_ts = 0.0
+        if allowed_umos:
+            placeholders = ",".join("?" for _ in allowed_umos)
+            with self.history.store.connection() as db:
+                # Identify groups with hidden members or source exclusions (only those need row-level JSON unpack)
+                hidden_umos = {
+                    r[0]
+                    for r in db.execute(
+                        f"SELECT DISTINCT umo FROM members WHERE umo IN ({placeholders}) AND hidden=1",
                         tuple(allowed_umos),
                     ).fetchall()
+                }
+                excl_umos = {
+                    r[0]
+                    for r in db.execute(
+                        f"SELECT DISTINCT umo FROM culture_exclusions WHERE umo IN ({placeholders})",
+                        tuple(allowed_umos),
+                    ).fetchall()
+                }
+                ev_hide_umos = {
+                    r[0]
+                    for r in db.execute(
+                        f"SELECT DISTINCT umo FROM hides WHERE umo IN ({placeholders})",
+                        tuple(allowed_umos),
+                    ).fetchall()
+                }
+                privacy_umos = hidden_umos | excl_umos | ev_hide_umos
+                fast_umos = [u for u in allowed_umos if u not in privacy_umos]
+                slow_umos = [u for u in allowed_umos if u in privacy_umos]
+
+                if fast_umos:
+                    fph = ",".join("?" for _ in fast_umos)
+                    for st, cnt, mx in db.execute(
+                        f"SELECT status, COUNT(*), COALESCE(MAX(updated), 0) "
+                        f"FROM culture_entries WHERE umo IN ({fph}) "
+                        "AND status IN ('pending', 'disputed', 'approved') "
+                        "GROUP BY status",
+                        tuple(fast_umos),
+                    ).fetchall():
+                        if float(mx or 0) > latest_ts:
+                            latest_ts = float(mx or 0)
+                        if st in ("pending", "disputed"):
+                            pending_count += int(cnt or 0)
+                        elif st == "approved":
+                            approved_count += int(cnt or 0)
+
+                slow_rows = []
+                if slow_umos:
+                    sph = ",".join("?" for _ in slow_umos)
+                    slow_rows = db.execute(
+                        f"SELECT * FROM culture_entries WHERE umo IN ({sph}) "
+                        "AND status IN ('pending', 'disputed', 'approved')",
+                        tuple(slow_umos),
+                    ).fetchall()
+            if slow_rows:
                 by_umo: dict[str, list[dict[str, Any]]] = {}
-                for row in rows:
+                for row in slow_rows:
                     item = self.culture.store.unpack(row)
                     by_umo.setdefault(item["umo"], []).append(item)
                 for umo, items in by_umo.items():
@@ -286,45 +352,60 @@ class GroupChroniclePlugin(Star):
                             pending_count += 1
                         elif item["status"] == "approved":
                             approved_count += 1
-            updated_at = (
-                datetime.fromtimestamp(latest_ts, tz).isoformat(timespec="seconds")
-                if latest_ts > 0
-                else ""
-            )
-            if pending_count > 0:
-                badge = {
-                    "count": pending_count,
-                    "tone": "warm",
-                    "label": f"{pending_count} 条待核",
-                }
-                headline = (
-                    f"{pending_count} 条待审核/纠正 · 已公开 {approved_count} 条"
-                )
-            else:
-                badge = {
-                    "count": 0,
-                    "tone": "accent",
-                    "label": (
-                        f"已收录 {approved_count} 条"
-                        if approved_count > 0
-                        else "无待核"
-                    ),
-                }
-                if approved_count > 0:
-                    headline = f"已公开 {approved_count} 条文化词条 · 覆盖 {len(allowed_umos)} 个群"
-                elif not culture_enabled:
-                    headline = "群文化整理未开启 · 可在插件配置中启用"
-                else:
-                    headline = f"已就绪 · 监听 {len(allowed_umos)} 个群聊"
-            return {
-                "badge": badge,
-                "pulse": {"headline": headline, "updated_at": updated_at},
+        updated_at = (
+            datetime.fromtimestamp(latest_ts, tz).isoformat(timespec="seconds")
+            if latest_ts > 0
+            else ""
+        )
+        if pending_count > 0:
+            badge = {
+                "count": pending_count,
+                "tone": "warm",
+                "label": f"{pending_count} 条待核",
             }
+            headline = (
+                f"{pending_count} 条待审核/纠正 · 已公开 {approved_count} 条"
+            )
+        else:
+            badge = {
+                "count": 0,
+                "tone": "accent",
+                "label": (
+                    f"已收录 {approved_count} 条"
+                    if approved_count > 0
+                    else "无待核"
+                ),
+            }
+            if approved_count > 0:
+                headline = f"已公开 {approved_count} 条文化词条 · 覆盖 {len(allowed_umos)} 个群"
+            elif not culture_enabled:
+                headline = "群文化整理未开启 · 可在插件配置中启用"
+            else:
+                headline = f"已就绪 · 监听 {len(allowed_umos)} 个群聊"
+        result = {
+            "badge": badge,
+            "pulse": {"headline": headline, "updated_at": updated_at},
+        }
+        self._series_summary_cache = (stamp, result)
+        return result
+
+    def get_series_summary(self) -> dict[str, Any]:
+        """Strictly synchronous, read-only summary for the v2 series status matrix."""
+        try:
+            return self._compute_series_summary()
         except Exception:
             return {
                 "badge": {"count": 0, "tone": "muted", "label": "暂不可用"},
                 "pulse": {"headline": "群文化状态暂不可用", "updated_at": ""},
             }
+
+    async def get_series_summary_async(self) -> dict[str, Any]:
+        """Offload summary computation to a worker thread for async callers."""
+        return await asyncio.to_thread(self.get_series_summary)
+
+    async def get_series_health_async(self) -> dict[str, Any]:
+        """Offload health diagnostics to a worker thread for async callers."""
+        return await asyncio.to_thread(self.get_series_health)
 
     def get_series_health(self) -> dict[str, Any]:
         """Strictly synchronous, read-only health diagnostics for series control panel."""
@@ -1177,7 +1258,7 @@ class GroupChroniclePlugin(Star):
             "influence_w_sl": (0, 1),
             "influence_w_ra": (0, 1),
             "history_batch_size": (1, 1000),
-            "history_daily_limit": (1, 1000),
+            "history_daily_limit": (0, 1000),
             "history_bio_points": (1, 10000),
             "history_bio_events": (1, 1000),
             "history_full_points": (1, 100000),

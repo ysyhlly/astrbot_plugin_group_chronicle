@@ -74,6 +74,23 @@ except ImportError:
 
 _RETRY_ATTEMPTS = 2  # 首次 + 1 次重试
 _RETRY_SLEEP_SECONDS = 1.0
+_DEFAULT_CALL_TIMEOUT_SEC = 120.0
+_TRUNCATE_MARKER = "\n...[中间素材已按预算截断]...\n"
+
+
+def _truncate_prompt_preserving_tail(prompt_text: str, budget: int) -> str:
+    """Truncate oversized prompts in the middle so trailing instructions & structure stay intact."""
+    text = str(prompt_text)
+    limit = max(1, int(budget))
+    if len(text) <= limit:
+        return text
+    marker_len = len(_TRUNCATE_MARKER)
+    if limit <= marker_len + 64:
+        return text[:limit]
+    usable = limit - marker_len
+    tail_len = min(2500, max(128, usable // 4))
+    head_len = max(1, usable - tail_len)
+    return text[:head_len] + _TRUNCATE_MARKER + text[-tail_len:]
 
 
 def encode_compact(value) -> str:
@@ -249,6 +266,8 @@ async def call_llm(
     prompt: str,
     system_prompt: str | None = None,
     provider_id: str | None = None,
+    *,
+    call_timeout: float | None = None,
 ) -> str:
     """调用 LLM 生成文本。
 
@@ -274,7 +293,14 @@ async def call_llm(
         if system_prompt
         else None
     )
-    prompt = str(prompt)[: max(1, 24000 - len(system_prompt or ""))]
+    prompt = _truncate_prompt_preserving_tail(
+        prompt, max(1, 24000 - len(system_prompt or ""))
+    )
+    effective_timeout = (
+        max(0.05, float(call_timeout))
+        if call_timeout is not None
+        else _DEFAULT_CALL_TIMEOUT_SEC
+    )
     last_exc: Exception | None = None
     for attempt in range(1, _RETRY_ATTEMPTS + 1):
         try:
@@ -285,6 +311,7 @@ async def call_llm(
                 system_prompt,
                 configured,
                 explicit_configured=explicit_configured,
+                call_timeout=effective_timeout,
             )
         except _ProviderExecutionError as e:
             last_exc = e
@@ -309,6 +336,8 @@ async def call_llm(
                 f"[llm_call] LLM 调用失败 (第 {attempt}/{_RETRY_ATTEMPTS} 次), "
                 f"类型: {type(e).__name__}, 详情: {e}"
             )
+            if _is_non_retryable_error(e):
+                break
             if attempt < _RETRY_ATTEMPTS:
                 await asyncio.sleep(_RETRY_SLEEP_SECONDS)
             continue
@@ -332,6 +361,7 @@ async def _try_call_once(
     configured_id: str | None,
     *,
     explicit_configured: bool = False,
+    call_timeout: float = _DEFAULT_CALL_TIMEOUT_SEC,
 ) -> str:
     """单次尝试: 配置 Provider → 会话 Provider → 默认 Provider。
 
@@ -366,6 +396,7 @@ async def _try_call_once(
                 raise_on_non_retryable=True,
                 provider_obj=provider_obj,
                 return_invoked=True,
+                call_timeout=call_timeout,
             )
             if text is not None:
                 return text
@@ -378,6 +409,7 @@ async def _try_call_once(
                 raise_on_execution_error=explicit_configured,
                 raise_on_non_retryable=True,
                 provider_obj=provider_obj,
+                call_timeout=call_timeout,
             )
             if text is not None:
                 return text
@@ -393,13 +425,26 @@ async def _try_call_once(
     # 2. 当前会话 Provider (新接口)
     session_id = await _resolve_session_provider_id(context, umo)
     if session_id and session_id != configured_id:
-        text = await _try_llm_generate(context, session_id, prompt, system_prompt)
+        text = await _try_llm_generate(
+            context,
+            session_id,
+            prompt,
+            system_prompt,
+            raise_on_non_retryable=True,
+            call_timeout=call_timeout,
+        )
         if text is not None:
             return text
 
     # 3. 旧接口: 当前正在使用的 Provider
     text = await _try_provider_text_chat(
-        context, umo, prompt, system_prompt, by_id=False
+        context,
+        umo,
+        prompt,
+        system_prompt,
+        by_id=False,
+        raise_on_non_retryable=True,
+        call_timeout=call_timeout,
     )
     if text is not None:
         return text
@@ -430,6 +475,7 @@ async def _try_llm_generate(
     raise_on_non_retryable: bool = False,
     provider_obj=None,
     return_invoked: bool = False,
+    call_timeout: float = _DEFAULT_CALL_TIMEOUT_SEC,
 ):
     """新版统一接口调用。"""
     def _ret(val: str | None, invoked: bool):
@@ -467,12 +513,15 @@ async def _try_llm_generate(
         )
         if anchor_contexts and _accepts_kwarg(llm_generate, "contexts"):
             gen_kwargs["contexts"] = anchor_contexts
-        resp = await series_llm_call(
-            context,
-            provider_id,
-            "astrbot_plugin_group_chronicle",
-            "group_chronicle",
-            lambda: llm_generate(**gen_kwargs),
+        resp = await asyncio.wait_for(
+            series_llm_call(
+                context,
+                provider_id,
+                "astrbot_plugin_group_chronicle",
+                "group_chronicle",
+                lambda: llm_generate(**gen_kwargs),
+            ),
+            timeout=call_timeout,
         )
         if resp is None:
             return _ret(None, True)
@@ -521,6 +570,7 @@ async def _try_provider_text_chat(
     raise_on_execution_error: bool = False,
     raise_on_non_retryable: bool = False,
     provider_obj=None,
+    call_timeout: float = _DEFAULT_CALL_TIMEOUT_SEC,
 ) -> str | None:
     """旧接口 text_chat。
 
@@ -575,12 +625,15 @@ async def _try_provider_text_chat(
                 or "default"
             ).strip()
         )
-        resp = await series_llm_call(
-            context,
-            label or "default",
-            "astrbot_plugin_group_chronicle",
-            "group_chronicle",
-            lambda: text_chat(**chat_kwargs),
+        resp = await asyncio.wait_for(
+            series_llm_call(
+                context,
+                label or "default",
+                "astrbot_plugin_group_chronicle",
+                "group_chronicle",
+                lambda: text_chat(**chat_kwargs),
+            ),
+            timeout=call_timeout,
         )
         if resp is None or _is_error_response(resp):
             err_text = str(getattr(resp, "completion_text", "") or "") if resp is not None else ""

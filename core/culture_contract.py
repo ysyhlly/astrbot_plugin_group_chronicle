@@ -80,9 +80,10 @@ def independent_sources(sources):
 
 def _candidate_list(raw):
     if isinstance(raw, str):
+        raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.IGNORECASE | re.DOTALL)
         raw = raw.strip()
         if raw.startswith("```"):
-            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
+            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE)
         raw = json.loads(raw)
     if (
         not isinstance(raw, dict)
