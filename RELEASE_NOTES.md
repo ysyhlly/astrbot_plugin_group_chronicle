@@ -1,4 +1,8 @@
-# astrbot_plugin_group_chronicle v0.3.0-rc.10
+# astrbot_plugin_group_chronicle v0.3.0
+
+## v0.3.0 — 2026-11-26
+
+- **正式版发布（GA）**：整合全部 `v0.3.0-rc.x` 安全与作用域加固、SQLite 连接泄漏修复、热点 I/O 异步化、Schema 前置提示及系列共享资产同步。
 
 ## v0.3.0-rc.10 — 2026-11-25
 
