@@ -20,16 +20,123 @@ import html
 import os
 import re
 import time
+from collections import OrderedDict
+from contextlib import asynccontextmanager
 from datetime import datetime
+from typing import Any
 
 from astrbot.api import logger
+
+try:
+    from .. import series_panels as _series_panels
+except Exception:  # pragma: no cover - isolated import fallback
+    try:
+        import series_panels as _series_panels  # type: ignore
+    except Exception:
+        _series_panels = None
 
 _PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _TEMPLATES_DIR = os.path.join(_PLUGIN_DIR, "templates")
 _TEMPLATE_PATH = os.path.join(_TEMPLATES_DIR, "chronicle.html")
 
-#: 渲染缓存: hash(markdown+group) -> 已渲染图片路径 (P3 性能, 复用相同内容)
-_RENDER_CACHE: dict[str, str] = {}
+#: 渲染缓存: hash(markdown+group) -> 已渲染图片路径 (LRU 有界缓存, 上限 64)
+_RENDER_CACHE_MAX_SIZE = 64
+_RENDER_CACHE: OrderedDict[str, str] = OrderedDict()
+
+#: 模块级缓存 Jinja2 Environment（模板目录变更时自动重建，兼顾测试 monkeypatch）
+_JINJA_ENV: Any = None
+_JINJA_ENV_DIR: str | None = None
+
+#: 低内存容器/2GB VPS 安全 Chromium 启动参数
+_CHROMIUM_LAUNCH_ARGS = (
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-software-rasterizer",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--no-zygote",
+)
+
+
+def _get_jinja_env():
+    global _JINJA_ENV, _JINJA_ENV_DIR
+    if _JINJA_ENV is not None and _JINJA_ENV_DIR == _TEMPLATES_DIR:
+        return _JINJA_ENV
+    from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+    _JINJA_ENV = Environment(
+        loader=FileSystemLoader(_TEMPLATES_DIR),
+        autoescape=select_autoescape(enabled_extensions=("html",), default=True),
+    )
+    _JINJA_ENV_DIR = _TEMPLATES_DIR
+    return _JINJA_ENV
+
+
+def _render_cache_get(key: str) -> str | None:
+    cached = _RENDER_CACHE.get(key)
+    if cached is None:
+        return None
+    if os.path.exists(cached):
+        _RENDER_CACHE.move_to_end(key)
+        return cached
+    _RENDER_CACHE.pop(key, None)
+    return None
+
+
+def _render_cache_set(key: str, path: str) -> None:
+    _RENDER_CACHE[key] = path
+    _RENDER_CACHE.move_to_end(key)
+    while len(_RENDER_CACHE) > _RENDER_CACHE_MAX_SIZE:
+        _RENDER_CACHE.popitem(last=False)
+
+
+def _memory_watermark_is_hard(context: Any = None) -> bool:
+    if _series_panels is None:
+        return False
+    getter = getattr(_series_panels, "get_series_memory_watermark", None)
+    if not callable(getter):
+        return False
+    try:
+        wm = getter(context)
+        return isinstance(wm, dict) and str(wm.get("state", "")).lower() == "hard"
+    except Exception:
+        return False
+
+
+def _resolve_playwright_fallback(
+    explicit: bool | None, context: Any = None
+) -> bool:
+    if explicit is not None:
+        return bool(explicit)
+    if _series_panels is not None:
+        getter = getattr(_series_panels, "get_series_resource_limits", None)
+        if callable(getter):
+            try:
+                limits = getter(context)
+                if isinstance(limits, dict) and "chronicle_playwright_fallback" in limits:
+                    return bool(limits["chronicle_playwright_fallback"])
+            except Exception:
+                pass
+    return True
+
+
+@asynccontextmanager
+async def _heavy_render_slot(context: Any = None):
+    slot_fn = (
+        getattr(_series_panels, "heavy_subprocess_slot", None)
+        if _series_panels is not None
+        else None
+    )
+    if callable(slot_fn):
+        async with slot_fn(
+            context,
+            "chronicle_render",
+            plugin_id="astrbot_plugin_group_chronicle",
+        ):
+            yield
+    else:
+        yield
 
 #: 渲染模式常量 (render_mode 配置可选值)
 RENDER_MODE_T2I = "t2i"
@@ -337,12 +444,7 @@ def render_html(
         or ("传" if "传" in resolved_suffix else ("年" if "年" in resolved_suffix or "季" in resolved_suffix else "史"))
     )[:2]
     try:
-        from jinja2 import Environment, FileSystemLoader, select_autoescape
-
-        env = Environment(
-            loader=FileSystemLoader(_TEMPLATES_DIR),
-            autoescape=select_autoescape(enabled_extensions=("html",), default=True),
-        )
+        env = _get_jinja_env()
         return env.get_template("chronicle.html").render(
             group_name=group_name,
             content=content_html,
@@ -411,7 +513,7 @@ def _render_html_fallback(
         )
 
 
-_PLAYWRIGHT_MAX_CONCURRENCY = 2
+_PLAYWRIGHT_MAX_CONCURRENCY = 1
 _PLAYWRIGHT_SEMAPHORES: dict[int, asyncio.Semaphore] = {}
 
 
@@ -434,12 +536,17 @@ async def render_chronicle_image(
     *,
     theme: str | None = None,
     title_suffix: str = "群史记",
+    context: Any = None,
 ) -> str | None:
     """
     将 markdown 内容渲染为 PNG 图片并返回路径；任何失败返回 None（纯文本降级）。
 
-    playwright 未安装 / 导入失败 / 启动失败 / 截图失败时均不会抛异常。
+    playwright 未安装 / 导入失败 / 启动失败 / 截图失败 / 内存硬水位时均不会抛异常。
     """
+    if _memory_watermark_is_hard(context):
+        logger.warning("当前进程内存达到硬水位，跳过 Playwright 渲染并降级为纯文本输出")
+        return None
+
     if not render_available():
         logger.warning("playwright 未安装，降级为纯文本输出")
         return None
@@ -466,13 +573,18 @@ async def render_chronicle_image(
             suffix += 1
 
         async with _get_playwright_semaphore():
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(args=["--no-sandbox"])
-                page = await browser.new_page(viewport={"width": 1280, "height": 1400})
-                await page.set_content(html_content)
-                await page.wait_for_timeout(200)
-                element = await page.query_selector("body")
-                await element.screenshot(path=out_path)
+            async with _heavy_render_slot(context):
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(
+                        args=list(_CHROMIUM_LAUNCH_ARGS)
+                    )
+                    page = await browser.new_page(
+                        viewport={"width": 1280, "height": 1400}
+                    )
+                    await page.set_content(html_content)
+                    await page.wait_for_timeout(200)
+                    element = await page.query_selector("body")
+                    await element.screenshot(path=out_path)
     except Exception as exc:  # noqa: BLE001 — 任何异常都降级为纯文本
         logger.warning(f"渲染群史记图片失败，降级为纯文本输出: {exc}")
         if out_path and os.path.exists(out_path):
@@ -498,10 +610,11 @@ async def render_text_or_image(
     enable_cache: bool = True,
     render_mode: str = RENDER_MODE_T2I,
     html_render_func=None,
-    render_fallback_playwright: bool = True,
+    render_fallback_playwright: bool | None = None,
     options: dict | None = None,
     theme: str | None = None,
     title_suffix: str = "群史记",
+    context: Any = None,
 ) -> tuple[str, str | None]:
     """
     便捷包装：返回 (text, image_path_or_None)。图片渲染失败时 image 为 None，
@@ -519,6 +632,9 @@ async def render_text_or_image(
     mode = str(render_mode or RENDER_MODE_T2I)
     resolved_theme = normalize_render_theme(theme)
     resolved_suffix = str(title_suffix or "群史记").strip() or "群史记"
+    allow_playwright_fallback = _resolve_playwright_fallback(
+        render_fallback_playwright, context
+    )
     key = _render_cache_key(text, group_name) if enable_cache else None
     if key is not None:
         key += (
@@ -532,8 +648,8 @@ async def render_text_or_image(
             + resolved_suffix
         )
     if key is not None and mode != RENDER_MODE_OFF:
-        cached = _RENDER_CACHE.get(key)
-        if cached and os.path.exists(cached):
+        cached = _render_cache_get(key)
+        if cached:
             return text, cached
 
     image_path: str | None = None
@@ -546,12 +662,17 @@ async def render_text_or_image(
             image_path = await render_via_t2i(
                 html_render_func, html_content, out_dir, options=options
             )
-        if not image_path and not render_fallback_playwright:
+        if not image_path and not allow_playwright_fallback:
             return text, None
     if image_path is None and mode != RENDER_MODE_OFF:
         image_path = await render_chronicle_image(
-            text, group_name, out_dir, theme=resolved_theme, title_suffix=resolved_suffix
+            text,
+            group_name,
+            out_dir,
+            theme=resolved_theme,
+            title_suffix=resolved_suffix,
+            context=context,
         )
     if image_path and key is not None:
-        _RENDER_CACHE[key] = image_path
+        _render_cache_set(key, image_path)
     return text, image_path

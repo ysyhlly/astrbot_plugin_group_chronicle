@@ -83,6 +83,11 @@ class ChronicleStore:
             if tmp and os.path.exists(tmp):
                 os.remove(tmp)
 
+    def clear_memory(self) -> None:
+        """Release the in-memory legacy dict after successful SQLite migration."""
+        with self._lock:
+            self._data.clear()
+
     # ---------- 键 ----------
 
     def _key(self, umo: str, iso_year: int, iso_week: int) -> str:

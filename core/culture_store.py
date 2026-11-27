@@ -155,29 +155,53 @@ class CultureStore:
 
     def entries(self, umo, *, status=None, query="", limit=100, offset=0):
         # Search aliases/meanings as literal substrings, not SQL LIKE wildcards.
+        safe_offset = max(0, int(offset))
+        safe_limit = max(0, int(limit))
+        where_sql = "WHERE umo=?"
+        params: list = [umo]
+        if status:
+            where_sql += " AND status=?"
+            params.append(status)
         with self.archive.connection() as db:
-            rows = db.execute(
-                "SELECT * FROM culture_entries WHERE umo=? ORDER BY updated DESC,id DESC",
-                (umo,),
+            if not query:
+                total = int(
+                    db.execute(
+                        f"SELECT COUNT(*) FROM culture_entries {where_sql}",
+                        params,
+                    ).fetchone()[0]
+                )
+                if safe_limit == 0 or safe_offset >= total:
+                    return [], total
+                rows = db.execute(
+                    f"SELECT * FROM culture_entries {where_sql} "
+                    "ORDER BY updated DESC,id DESC LIMIT ? OFFSET ?",
+                    [*params, safe_limit, safe_offset],
+                ).fetchall()
+                return [self.unpack(row) for row in rows], total
+
+            query_cf = query.casefold()
+            cursor = db.execute(
+                f"SELECT * FROM culture_entries {where_sql} ORDER BY updated DESC,id DESC",
+                params,
             )
-            result = []
-            for row in rows:
-                if status and row["status"] != status:
-                    continue
+            page = []
+            matched = 0
+            page_end = safe_offset + safe_limit
+            for row in cursor:
                 item = self.unpack(row)
                 haystack = [
                     item["name"],
                     item["meaning"],
                     *(a["name"] for a in item["aliases"]),
                 ]
-                if (
-                    query
-                    and not any(query.casefold() in s.casefold() for s in haystack)
-                    and query != str(item["id"])
+                if not any(query_cf in s.casefold() for s in haystack) and query != str(
+                    item["id"]
                 ):
                     continue
-                result.append(item)
-            return result[offset : offset + limit], len(result)
+                if safe_offset <= matched < page_end:
+                    page.append(item)
+                matched += 1
+            return page, matched
 
     def entry(self, umo, entry_id):
         with self.archive.connection() as db:

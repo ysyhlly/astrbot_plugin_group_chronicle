@@ -54,7 +54,6 @@ from importlib import import_module, reload
 from typing import Any
 
 from apscheduler.triggers.cron import CronTrigger
-
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.event.filter import PermissionType
@@ -2246,7 +2245,14 @@ class GroupChroniclePlugin(Star):
         # 默认走 AstrBot 内置文转图 (T2I); playwright 为可选降级; 渲染异常绝不影响主流程
         try:
             render_mode = str(self._cfg("render_mode", "t2i")).strip() or "t2i"
-            fallback_pw = bool(self._cfg("render_fallback_playwright", True))
+            raw_fallback_pw = (
+                self.config.get("render_fallback_playwright")
+                if isinstance(self.config, dict)
+                else None
+            )
+            fallback_pw = (
+                bool(raw_fallback_pw) if raw_fallback_pw is not None else None
+            )
             t2i_scale = str(self._cfg("t2i_scale", "device")).strip() or "device"
             render_theme = normalize_render_theme(
                 self._cfg("render_theme", "classic_scroll")
@@ -2261,6 +2267,7 @@ class GroupChroniclePlugin(Star):
                 render_fallback_playwright=fallback_pw,
                 options={"scale": t2i_scale},
                 theme=render_theme,
+                context=getattr(self, "context", None),
             )
         except Exception as e:  # noqa: BLE001 - 渲染异常降级为纯文本, 不影响主流程
             logger.warning(f"渲染群史记图片失败，降级为纯文本: {e}")
@@ -3604,7 +3611,14 @@ class GroupChroniclePlugin(Star):
             render_mode = str(self._cfg("render_mode", "t2i")).strip() or "t2i"
             if render_mode == "off":
                 return None
-            fallback_pw = bool(self._cfg("render_fallback_playwright", True))
+            raw_fallback_pw = (
+                self.config.get("render_fallback_playwright")
+                if isinstance(self.config, dict)
+                else None
+            )
+            fallback_pw = (
+                bool(raw_fallback_pw) if raw_fallback_pw is not None else None
+            )
             t2i_scale = str(self._cfg("t2i_scale", "device")).strip() or "device"
             render_theme = normalize_render_theme(
                 self._cfg("render_theme", "classic_scroll")
@@ -3620,6 +3634,7 @@ class GroupChroniclePlugin(Star):
                 options={"scale": t2i_scale},
                 theme=render_theme,
                 title_suffix="人物传",
+                context=getattr(self, "context", None),
             )
             return image_path
         except Exception as exc:  # noqa: BLE001

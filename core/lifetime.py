@@ -9,6 +9,7 @@ import json
 import math
 import re
 import time
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 
 try:
@@ -598,6 +599,9 @@ def validate_extraction(raw, material, existing=(), known_members=None):
 class HistoryService:
     """Coordinate one plugin's fact database and background work."""
 
+    _OBSERVE_CACHE_MAX = 2048
+    _OBSERVE_DEBOUNCE_SEC = 300.0
+
     def __init__(self, plugin, legacy):
         """Attach a plugin without making external requests.
 
@@ -606,7 +610,10 @@ class HistoryService:
             legacy: Existing JSON edition store.
         """
         self.plugin = plugin
-        self.store = ArchiveStore(Path(plugin.data_dir) / "history.sqlite3")
+        self.store = ArchiveStore(
+            Path(plugin.data_dir) / "history.sqlite3",
+            context=getattr(plugin, "context", None),
+        )
         self.editions = EditionStore(self.store, legacy)
         self.legacy = legacy
         self.cycle_lock = asyncio.Lock()
@@ -619,6 +626,11 @@ class HistoryService:
         self._poison_counts = {}
         self._cycle_turn = 0
         self.pending_hides = {}
+        self._observe_debounce_sec: float = self._OBSERVE_DEBOUNCE_SEC
+        # (umo, uid) -> (display_name, group_name, last_ts)
+        self._observe_cache: OrderedDict[tuple[str, str], tuple[str, str, float]] = (
+            OrderedDict()
+        )
 
     def _series_tz(self):
         return resolve_series_timezone(getattr(self.plugin, "context", None))
@@ -755,6 +767,11 @@ class HistoryService:
             await asyncio.to_thread(
                 self.store.import_legacy, list(self.legacy._data.values())
             )
+            clear_fn = getattr(self.legacy, "clear_memory", None)
+            if callable(clear_fn):
+                clear_fn()
+            else:
+                self.legacy._data.clear()
         manager = getattr(self.plugin.context, "cron_manager", None)
         scheduler = getattr(manager, "scheduler", None)
         if scheduler is not None:
@@ -954,6 +971,8 @@ class HistoryService:
             )
         group_name = observation.get("group_name")
         if observation.get("kind"):
+            # Membership changes (join/leave) invalidate observe coalescing for this member.
+            self._observe_cache.pop((umo, str(observation["uid"])), None)
             await asyncio.to_thread(
                 self.store.membership,
                 umo,
@@ -967,14 +986,39 @@ class HistoryService:
                 group_name=group_name,
             )
         elif observation["uid"] != observation.get("self_id"):
+            uid_str = str(observation["uid"])
+            display_name = str(observation.get("name") or "")
+            gname_str = str(group_name or "")
+            ts_val = float(observation.get("ts") or time.time())
+            debounce = float(getattr(self, "_observe_debounce_sec", 300.0) or 0.0)
+            cache_key = (umo, uid_str)
+            cached = self._observe_cache.get(cache_key) if debounce > 0 else None
+            if (
+                cached is not None
+                and cached[0] == display_name
+                and (not gname_str or cached[1] == gname_str)
+                and 0.0 <= (ts_val - cached[2]) < debounce
+            ):
+                self._observe_cache.move_to_end(cache_key)
+                return
             await asyncio.to_thread(
                 self.store.observe,
                 umo,
                 observation["uid"],
                 observation.get("name"),
-                observation["ts"],
+                ts_val,
                 group_name=group_name,
             )
+            if debounce > 0:
+                effective_gname = gname_str or (cached[1] if cached else "")
+                self._observe_cache[cache_key] = (
+                    display_name,
+                    effective_gname,
+                    ts_val,
+                )
+                self._observe_cache.move_to_end(cache_key)
+                while len(self._observe_cache) > self._OBSERVE_CACHE_MAX:
+                    self._observe_cache.popitem(last=False)
         else:
             await asyncio.to_thread(self.store.group, umo, group_name)
 
@@ -1269,12 +1313,13 @@ class HistoryService:
                     def _prepare_extraction_inputs():
                         group_row = self.store.group(umo) or {}
                         group_name = str(group_row.get("name") or "")
-                        prev_all = self.store.events(umo, status=None, public=True)
-                        prev_filtered = [
-                            e
-                            for e in prev_all
-                            if e["status"] in ("approved", "pending")
-                        ]
+                        prev_filtered = self.store.events(
+                            umo,
+                            statuses=("approved", "pending"),
+                            public=True,
+                            limit=40,
+                            ongoing_first=True,
+                        )
                         prev_filtered = sorted(
                             prev_filtered,
                             key=lambda e: (not e.get("ongoing"), -e["event_at"]),
@@ -1934,18 +1979,24 @@ class HistoryService:
             raise ValueError("群范围或隐私设置已变化，本次结果未发布，请重新生成")
         image_path = None
         try:
+            raw_fallback = (
+                self.plugin.config.get("render_fallback_playwright")
+                if isinstance(getattr(self.plugin, "config", None), dict)
+                else None
+            )
             text, image_path = await render_text_or_image(
                 text,
                 group_name,
                 str(Path(self.plugin.data_dir) / "images"),
                 render_mode=self.plugin._cfg("render_mode", "t2i"),
                 html_render_func=getattr(self.plugin, "html_render", None),
-                render_fallback_playwright=self.plugin._cfg(
-                    "render_fallback_playwright", True
+                render_fallback_playwright=(
+                    bool(raw_fallback) if raw_fallback is not None else None
                 ),
                 options={"scale": self.plugin._cfg("t2i_scale", "device")},
                 enable_cache=self.plugin._cfg("enable_render_cache", True),
                 theme=render_theme,
+                context=getattr(self.plugin, "context", None),
             )
         except Exception:
             logger.warning(

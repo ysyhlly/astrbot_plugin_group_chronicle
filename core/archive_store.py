@@ -16,6 +16,28 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
+try:
+    from .. import series_panels as _series_panels
+except Exception:  # pragma: no cover - isolated import fallback
+    try:
+        import series_panels as _series_panels  # type: ignore
+    except Exception:
+        _series_panels = None
+
+
+def _resolve_chronicle_pool_size(context=None) -> int:
+    if _series_panels is not None:
+        getter = getattr(_series_panels, "get_series_resource_limits", None)
+        if callable(getter):
+            try:
+                limits = getter(context)
+                if isinstance(limits, dict) and limits.get("chronicle_pool_size"):
+                    return max(1, int(limits["chronicle_pool_size"]))
+            except Exception:
+                pass
+    return 4
+
+
 _UNSAFE_FS_TYPES = frozenset(
     {
         "9p",
@@ -192,13 +214,15 @@ class ArchiveStore:
 
     _locks = {}
 
-    def __init__(self, path):
+    def __init__(self, path, *, context=None):
         """Open or initialize the plugin-owned database.
 
         Args:
             path: SQLite file in the isolated plugin data directory.
+            context: Optional AstrBot context for series resource profile limits.
         """
         self.path = Path(path)
+        self._context = context
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = self._locks.setdefault(str(self.path.resolve()), threading.RLock())
         self._pool_lock = threading.Lock()
@@ -206,8 +230,8 @@ class ArchiveStore:
         self._idle_pool: deque[tuple[sqlite3.Connection, int, float]] = deque()
         self._all_conns: set[sqlite3.Connection] = set()
         self._in_use: set[sqlite3.Connection] = set()
-        self._max_pool_size = 6
-        self._idle_timeout_sec = 60.0
+        self._max_pool_size = _resolve_chronicle_pool_size(context)
+        self._idle_timeout_sec = 30.0
         self._generation = 0
         self._write_ops = 0
         self._last_checkpoint_ts = time.monotonic()
@@ -399,7 +423,24 @@ class ArchiveStore:
             if self._journal_mode == "WAL"
             else "PRAGMA synchronous=FULL"
         ).close()
-        db.execute("PRAGMA temp_store=MEMORY").close()
+        if _series_panels is not None and callable(
+            getattr(_series_panels, "apply_series_sqlite_pragmas", None)
+        ):
+            try:
+                _series_panels.apply_series_sqlite_pragmas(db, self._context)
+            except Exception:
+                db.execute("PRAGMA temp_store=FILE").close()
+        else:
+            for sql in (
+                "PRAGMA cache_size=-2000",
+                "PRAGMA temp_store=FILE",
+                "PRAGMA mmap_size=0",
+                "PRAGMA journal_size_limit=16777216",
+            ):
+                try:
+                    db.execute(sql).close()
+                except sqlite3.Error:
+                    pass
         return db
 
     @staticmethod
@@ -1341,29 +1382,66 @@ class ArchiveStore:
         )
         return not any(private_text(text, member) for member in hidden_members)
 
-    def events(self, umo, *, status="approved", since=0, public=True, uid=None):
+    def events(
+        self,
+        umo,
+        *,
+        status="approved",
+        statuses=None,
+        since=0,
+        public=True,
+        uid=None,
+        limit=None,
+        order_desc=False,
+        ongoing_first=False,
+    ):
         """Read bounded-by-time facts scoped to one group.
 
         Args:
             umo: Group session.
-            status: Status filter, or None for all statuses.
+            status: Status filter, or None for all statuses (ignored when ``statuses`` is set).
+            statuses: Optional sequence of statuses pushed into SQL ``IN (...)``.
             since: Inclusive timestamp lower bound.
             public: Apply privacy exclusions.
             uid: Optional participant filter.
+            limit: Optional result cap pushed into SQL where safe.
+            order_desc: Order newest-first instead of chronological.
+            ongoing_first: Order ongoing events ahead of newest-first events.
 
         Returns:
-            Facts in chronological order.
+            Matching facts.
         """
         with self.connection() as db:
             query = "SELECT * FROM events WHERE umo=? AND last_event_at>=?"
             args = [umo, since]
-            if status is not None:
+            if statuses is not None:
+                status_list = [str(s) for s in statuses if s is not None]
+                if not status_list:
+                    return []
+                placeholders = ",".join("?" for _ in status_list)
+                query += f" AND status IN ({placeholders})"
+                args.extend(status_list)
+            elif status is not None:
                 query += " AND status=?"
                 args.append(status)
-            rows = db.execute(query + " ORDER BY event_at,id", args).fetchall()
-            privacy_ctx = self._privacy_context(db, umo) if (public and rows) else None
+            if ongoing_first:
+                query += (
+                    " ORDER BY CASE WHEN json_extract(payload, '$.ongoing') = 1 "
+                    "THEN 0 ELSE 1 END, event_at DESC, id DESC"
+                )
+            elif order_desc:
+                query += " ORDER BY event_at DESC, id DESC"
+            else:
+                query += " ORDER BY event_at,id"
+            cap = max(1, int(limit)) if limit is not None else None
+            if cap is not None and uid is None:
+                sql_limit = cap if not public else max(cap * 4, cap + 32)
+                query += " LIMIT ?"
+                args.append(sql_limit)
+            cursor = db.execute(query, args)
+            privacy_ctx = self._privacy_context(db, umo) if public else None
             result = []
-            for row in rows:
+            for row in cursor:
                 event = {
                     **json.loads(row["payload"]),
                     "id": row["id"],
@@ -1380,6 +1458,8 @@ class ArchiveStore:
                 ):
                     continue
                 result.append(event)
+                if cap is not None and len(result) >= cap:
+                    break
             return result
 
     def event(self, umo, event_id, *, public=True):

@@ -7,7 +7,7 @@ import inspect
 import json
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 
 from . import lm_bridge
 from .archive_store import encode, private_text
