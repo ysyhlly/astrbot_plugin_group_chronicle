@@ -68,6 +68,7 @@ from astrbot.api.star import Context, Star, StarTools
 # .core.* 内部真实的缺依赖 ImportError 一并吞掉并伪装成「顶层 import main」，
 # 报错退化成 No module named 'core'，掩盖真正的故障。
 if __package__:
+    from .core.annual_report import build_annual_report, parse_annual_report_args
     from .core.biography import generate_biography
     from .core.culture_service import CultureService
     from .core.culture_web import CultureWeb
@@ -99,9 +100,15 @@ if __package__:
         lm_unavailable_reason,
     )
     from .core.persona import resolve_system_prompt
-    from .core.render import clear_render_cache, markdown_to_html, render_text_or_image
+    from .core.render import (
+        clear_render_cache,
+        markdown_to_html,
+        normalize_render_theme,
+        render_text_or_image,
+    )
     from .core.store import ChronicleStore
 else:  # Top-level import is reserved for the test harness.
+    from core.annual_report import build_annual_report, parse_annual_report_args
     from core.biography import generate_biography
     from core.culture_service import CultureService
     from core.culture_web import CultureWeb
@@ -133,7 +140,12 @@ else:  # Top-level import is reserved for the test harness.
         lm_unavailable_reason,
     )
     from core.persona import resolve_system_prompt
-    from core.render import clear_render_cache, markdown_to_html, render_text_or_image
+    from core.render import (
+        clear_render_cache,
+        markdown_to_html,
+        normalize_render_theme,
+        render_text_or_image,
+    )
     from core.store import ChronicleStore
 
 #: LLMUnavailableError 的固定消息 (core/llm_call.py), 用于区分"生成时 LLM 失败"与
@@ -2020,6 +2032,9 @@ class GroupChroniclePlugin(Star):
             render_mode = str(self._cfg("render_mode", "t2i")).strip() or "t2i"
             fallback_pw = bool(self._cfg("render_fallback_playwright", True))
             t2i_scale = str(self._cfg("t2i_scale", "device")).strip() or "device"
+            render_theme = normalize_render_theme(
+                self._cfg("render_theme", "classic_scroll")
+            )
             text, image_path = await render_text_or_image(
                 text,
                 group_name,
@@ -2029,6 +2044,7 @@ class GroupChroniclePlugin(Star):
                 enable_cache=bool(self._cfg("enable_render_cache", True)),
                 render_fallback_playwright=fallback_pw,
                 options={"scale": t2i_scale},
+                theme=render_theme,
             )
         except Exception as e:  # noqa: BLE001 - 渲染异常降级为纯文本, 不影响主流程
             logger.warning(f"渲染群史记图片失败，降级为纯文本: {e}")
@@ -2238,6 +2254,7 @@ class GroupChroniclePlugin(Star):
             "",
             "【群友常用指令】",
             "• 群史记 [天数|月|年] [风格=正史|八卦|文言] [强制] —— 生成或查看本群史记",
+            "• 我的群年报 [季度|年度] [主题=古籍|典雅|现代] / 群年报 —— 生成多维时光机年报长图卡片",
             "• 史记列表 / 史记查看 [序号] / 史记对比 —— 回看与对比往期卷册",
             "• 史记导出 [序号] / 史记网页 [序号] —— 导出 Markdown 或网页文件",
             "• 群大事 [全部|月|年|天数] —— 查看已入史的本群大事记",
@@ -2258,9 +2275,110 @@ class GroupChroniclePlugin(Star):
             "• 史记恢复 @成员 [全局] / 文化恢复 <ID> [全局] —— 管理员可恢复任意已隐藏记录",
             "• 史记进度 / 史记sid —— 查看回溯水位、每日额度与当前群 UMO 标识",
             "• 史记周推 / 史记续写 / 史记选题公布 / 宇宙史记 —— 定时推送、续写与跨群综合",
-            "• 文化工作台：在 AstrBot 面板打开「群文化沿革」WebUI 可审核、撤销隐藏与手动整理 1 批。",
+            "• 文化工作台：在 AstrBot 面板打开「群史馆 / 群文化沿革」WebUI 可阅览卷册、审核大事与词条、批量处理、查看人物列传墙及手动整理。",
         ]
         yield event.plain_result("\n".join(lines))
+
+    @filter.command("我的群年报", alias={"群年报"})
+    async def annual_report_command(self, event: AstrMessageEvent, period: str = ""):
+        """生成个人/全群阶段时光机（季度/年度群聊年报长图卡片）并直发群内。"""
+        umo = getattr(event, "unified_msg_origin", None)
+        if not umo:
+            yield event.plain_result("无法获取会话标识")
+            return
+        scope_ok, scope_reason = await self._check_group_scope(umo)
+        if not scope_ok:
+            yield event.plain_result(scope_reason)
+            return
+        raw_msg = str(getattr(event, "message_str", "") or "").lstrip("/")
+        is_group_alias = raw_msg.startswith("群年报")
+        tail = ""
+        for prefix in ("我的群年报", "群年报"):
+            if prefix in raw_msg:
+                tail = raw_msg.partition(prefix)[2].strip()
+                break
+        parsed = parse_annual_report_args(
+            tail or period, is_group_alias=is_group_alias
+        )
+        actor_id = self._sender_id(event) or ""
+        if not actor_id:
+            yield event.plain_result("无法识别调用者身份")
+            return
+        mentioned = self._extract_at_sender(event)
+        target_uid = actor_id
+        if mentioned and mentioned != actor_id:
+            if self._cfg("bio_admin_only", True) and not self._is_admin(event):
+                yield event.plain_result("查询其他成员的群年报需要管理员权限")
+                return
+            target_uid = mentioned
+            parsed["mode"] = "personal"
+        sender_name = ""
+        name_getter = getattr(event, "get_sender_name", None)
+        if callable(name_getter):
+            try:
+                sender_name = str(name_getter() or "")
+            except Exception:
+                sender_name = ""
+        group_name = "群聊"
+        g_getter = getattr(event, "get_group_name", None)
+        if callable(g_getter):
+            try:
+                group_name = str(g_getter() or "群聊")
+            except Exception:
+                group_name = "群聊"
+        self._spawn_bg(
+            self._annual_report_run(
+                event,
+                umo,
+                actor_id=target_uid,
+                actor_name=sender_name if target_uid == actor_id else target_uid,
+                mode=parsed["mode"],
+                period=parsed["period"],
+                group_name=group_name,
+                theme=parsed["theme"],
+                prefer_context=True,
+            ),
+            label=f"annual_report:{umo}",
+        )
+        yield event.plain_result(f"正在生成{parsed['period_label']}长图卡片，请稍候…")
+
+    async def _annual_report_run(
+        self,
+        event,
+        umo: str,
+        *,
+        actor_id: str,
+        actor_name: str,
+        mode: str,
+        period: str,
+        group_name: str,
+        theme: str | None,
+        prefer_context: bool = True,
+    ) -> None:
+        async def _work():
+            text, image_path = await build_annual_report(
+                self,
+                umo,
+                actor_id=actor_id,
+                actor_name=actor_name,
+                mode=mode,
+                period=period,
+                group_name=group_name,
+                theme=theme,
+            )
+            await deliver_text(
+                self.context,
+                event,
+                umo,
+                text,
+                image_path,
+                prefer_context=prefer_context,
+                use_forward_nodes=bool(self._cfg("use_forward_nodes", True)),
+                max_chars=int(self._cfg("max_reply_chars", 1500)),
+                node_name="群聊时光机",
+            )
+
+        await self._run_locked(event, umo, _work(), prefer_context=prefer_context)
 
     @filter.command("群史记")
     async def chronicle_command(self, event: AstrMessageEvent, days: str | None = None):
@@ -2878,16 +2996,28 @@ class GroupChroniclePlugin(Star):
         if not ranking:
             yield event.plain_result("暂无足够数据计算影响力")
             return
-        lines = [
-            f"{i}. {r.get('sender_name') or r.get('sender_id') or '?'} "
-            f"({r.get('score', 0)})"
-            for i, r in enumerate(ranking, 1)
-        ]
+        lines = []
+        for i, r in enumerate(ranking, 1):
+            base = f"{i}. {r.get('sender_name') or r.get('sender_id') or '?'} ({r.get('score', 0)})"
+            bd = r.get("breakdown")
+            if isinstance(bd, dict) and bd:
+                parts = []
+                for keys, label in (
+                    (("lm", "activity"), "活跃"),
+                    (("sl", "social"), "社交"),
+                    (("ra", "relation"), "关系"),
+                ):
+                    val = next((bd[k] for k in keys if k in bd and bd[k] is not None), None)
+                    if val is not None:
+                        parts.append(f"{label} {val}")
+                if parts:
+                    base += " · " + " / ".join(parts)
+            lines.append(base)
         yield event.plain_result("本周影响力榜：\n" + "\n".join(lines))
 
     @filter.command("史记列表")
     async def chronicle_list_command(self, event: AstrMessageEvent):
-        """查看本群已生成的史记列表。"""
+        """查看本群已生成的史记列表（含周/月/年卷标识与一句话摘要）。"""
         umo = getattr(event, "unified_msg_origin", None)
         if not umo:
             yield event.plain_result("无法获取会话标识")
@@ -2896,18 +3026,57 @@ class GroupChroniclePlugin(Star):
         if not entries:
             yield event.plain_result("暂无史记")
             return
-        lines = [
-            f"{i}. {e.get('iso_year')}-W{int(e.get('iso_week', 0)):02d} "
-            f"({datetime.fromtimestamp(e.get('created_at', 0)):%Y-%m-%d})"
-            for i, e in enumerate(entries, 1)
-        ]
+        lines = []
+        for i, e in enumerate(entries, 1):
+            period_days = int(e.get("period_days") or 0)
+            vol_tag = (
+                {7: "周卷", 30: "月卷", 90: "季卷", 365: "年卷"}.get(
+                    period_days, f"{period_days}天卷"
+                )
+                if period_days
+                else "周卷"
+            )
+            ver = int(e.get("version") or 1)
+            ver_suffix = f" v{ver}" if ver > 1 else ""
+            raw_summary = str(e.get("summary") or "").strip()
+            if not raw_summary:
+                heading_fallback = ""
+                for ln in str(e.get("chronicle_text") or "").splitlines():
+                    stripped = ln.strip()
+                    if not stripped:
+                        continue
+                    cleaned = stripped.lstrip("#>-*• ").strip()
+                    if (
+                        not cleaned
+                        or cleaned.startswith("覆盖 ")
+                        or cleaned.startswith("——")
+                    ):
+                        continue
+                    if stripped.startswith("#"):
+                        if not heading_fallback:
+                            heading_fallback = cleaned
+                        continue
+                    raw_summary = cleaned
+                    break
+                if not raw_summary:
+                    raw_summary = heading_fallback
+            snippet = (
+                f" — {raw_summary[:38]}{'…' if len(raw_summary) > 38 else ''}"
+                if raw_summary
+                else ""
+            )
+            lines.append(
+                f"{i}. {e.get('iso_year')}-W{int(e.get('iso_week', 0)):02d} "
+                f"({datetime.fromtimestamp(e.get('created_at', 0)):%Y-%m-%d}) "
+                f"[{vol_tag}{ver_suffix}]{snippet}"
+            )
         yield event.plain_result("史记列表：\n" + "\n".join(lines))
 
     @filter.command("史记查看")
     async def chronicle_view_command(
         self, event: AstrMessageEvent, idx: str | None = None
     ):
-        """查看指定序号的史记正文 (默认最新一条)。"""
+        """查看指定序号的史记正文 (默认最新一条；长文本走合并转发防刷屏)。"""
         umo = getattr(event, "unified_msg_origin", None)
         if not umo:
             yield event.plain_result("无法获取会话标识")
@@ -2927,7 +3096,31 @@ class GroupChroniclePlugin(Star):
                 return
             except Exception:
                 logger.warning("Stored image delivery failed; falling back to text")
-        for segment in split_text(text, int(self._cfg("max_reply_chars", 1500))):
+        max_chars = int(self._cfg("max_reply_chars", 1500))
+        use_forward = bool(self._cfg("use_forward_nodes", True))
+        if len(text) > max_chars and use_forward:
+            if not await asyncio.to_thread(self._entry_public, umo, entry):
+                yield event.plain_result("该卷内容已隐藏或修订，请重新查看。")
+                return
+
+            async def _view_guard():
+                return await asyncio.to_thread(self._entry_public, umo, entry)
+
+            delivered = await deliver_text(
+                self.context,
+                event,
+                umo,
+                text,
+                None,
+                prefer_context=False,
+                use_forward_nodes=True,
+                max_chars=max_chars,
+                node_name="史记查看",
+                guard=_view_guard,
+            )
+            if delivered:
+                return
+        for segment in split_text(text, max_chars):
             if not await asyncio.to_thread(self._entry_public, umo, entry):
                 yield event.plain_result("该卷内容已隐藏或修订，请重新查看。")
                 return
@@ -3032,15 +3225,21 @@ class GroupChroniclePlugin(Star):
 
                 return await asyncio.to_thread(_check_bio_state)
 
+            bio_group_name = await asyncio.to_thread(self._group_name_readonly, umo)
+            bio_image_path = None
+            if targets and await still_public():
+                bio_image_path = await self._render_bio_card(text, bio_group_name)
+
             await deliver_text(
                 self.context,
                 event,
                 umo,
                 text,
-                None,
+                bio_image_path,
                 prefer_context=prefer_context,
                 use_forward_nodes=bool(self._cfg("use_forward_nodes", True)),
                 max_chars=int(self._cfg("max_reply_chars", 1500)),
+                node_name="人物传记",
                 guard=still_public,
             )
             return
@@ -3151,17 +3350,55 @@ class GroupChroniclePlugin(Star):
             else:
                 name, bio = res
             parts.append(f"## 人物传记：{name}\n{bio}")
+        bio_body = "\n\n".join(parts)
+        bio_group_name = "群聊"
+        g_getter = getattr(event, "get_group_name", None) if event is not None else None
+        if callable(g_getter):
+            try:
+                bio_group_name = str(g_getter() or "群聊")
+            except Exception:
+                bio_group_name = "群聊"
+        bio_image_path = await self._render_bio_card(bio_body, bio_group_name)
         await deliver_text(
             self.context,
             event,
             umo,
-            "\n\n".join(parts),
-            None,
+            bio_body,
+            bio_image_path,
             prefer_context=prefer_context,
             use_forward_nodes=bool(self._cfg("use_forward_nodes", True)),
             max_chars=int(self._cfg("max_reply_chars", 1500)),
+            node_name="人物传记",
         )
         logger.info(f"[群史记] 人物传已发送 umo={umo} members={len(parts)}")
+
+    async def _render_bio_card(self, text: str, group_name: str) -> str | None:
+        """Render biography markdown into a card image using configured theme (degrades to None)."""
+        try:
+            render_mode = str(self._cfg("render_mode", "t2i")).strip() or "t2i"
+            if render_mode == "off":
+                return None
+            fallback_pw = bool(self._cfg("render_fallback_playwright", True))
+            t2i_scale = str(self._cfg("t2i_scale", "device")).strip() or "device"
+            render_theme = normalize_render_theme(
+                self._cfg("render_theme", "classic_scroll")
+            )
+            _t, image_path = await render_text_or_image(
+                text,
+                group_name,
+                os.path.join(self.data_dir, "images"),
+                render_mode=render_mode,
+                html_render_func=getattr(self, "html_render", None),
+                enable_cache=bool(self._cfg("enable_render_cache", True)),
+                render_fallback_playwright=fallback_pw,
+                options={"scale": t2i_scale},
+                theme=render_theme,
+                title_suffix="人物传",
+            )
+            return image_path
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"渲染人物传卡片图失败，降级为纯文本: {exc}")
+            return None
 
     # ------------------------------------------------------------------
     # 史记续写 (基于最新一条史记 + 新消息)

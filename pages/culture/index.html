@@ -29,6 +29,18 @@
       <svg class="gc-tab-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
       <span data-series-text="待审与纠正">待审与纠正</span>
     </button>
+    <button data-tab="editions" type="button">
+      <svg class="gc-tab-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="13" y2="17"/></svg>
+      <span data-series-text="史记卷册">史记卷册</span>
+    </button>
+    <button data-tab="events" type="button">
+      <svg class="gc-tab-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+      <span data-series-text="大事审核">大事审核</span>
+    </button>
+    <button data-tab="members" type="button">
+      <svg class="gc-tab-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+      <span data-series-text="人物列传">人物列传</span>
+    </button>
     <button data-tab="progress" type="button">
       <svg class="gc-tab-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
       <span data-series-text="整理进度">整理进度</span>
@@ -130,12 +142,123 @@
         </select>
       </label>
     </div>
+    <div id="culture-batch-bar" class="gc-batch-bar card">
+      <div class="gc-batch-top">
+        <label class="gc-check-inline">
+          <input id="culture-select-all" type="checkbox">
+          <span data-series-text="全选本页">全选本页</span>
+        </label>
+        <span id="culture-selected-count" class="muted tabular-nums">已选 0 项</span>
+        <input id="batch-note" class="grow" maxlength="1000" placeholder="填写批量审核理由，或点选下方快捷理由" data-series-placeholder="填写批量审核理由，或点选下方快捷理由">
+      </div>
+      <div class="gc-reason-chips" data-reason-target="batch-note" aria-label="快捷处理理由">
+        <button type="button" class="gc-reason-chip" data-reason="证据充分，符合群内语境">证据充分</button>
+        <button type="button" class="gc-reason-chip" data-reason="群内共识，审核通过">群内共识</button>
+        <button type="button" class="gc-reason-chip" data-reason="证据不足，暂不收录">信息不足</button>
+        <button type="button" class="gc-reason-chip" data-reason="与已有词条重复">重复词条</button>
+        <button type="button" class="gc-reason-chip" data-reason="涉及成员隐私，执行隐藏">涉及隐私</button>
+      </div>
+      <div class="actions gc-batch-actions">
+        <button type="button" class="primary" data-culture-batch="approve" data-series-text="批量通过">批量通过</button>
+        <button type="button" data-culture-batch="reject" data-series-text="批量驳回">批量驳回</button>
+        <button type="button" class="danger" data-culture-batch="hide" data-series-text="批量隐藏">批量隐藏</button>
+      </div>
+    </div>
     <div id="review-entries" class="grid gc-dict-grid"></div>
     <div class="pagination">
       <button id="review-prev" type="button" data-series-text="上一页">上一页</button>
       <span id="review-count" class="gc-page-num tabular-nums"></span>
       <button id="review-next" type="button" data-series-text="下一页">下一页</button>
     </div>
+  </section>
+
+  <section id="editions" hidden>
+    <div class="gc-section-bar">
+      <div class="gc-section-title">
+        <h2 data-series-text="群史卷册阅览与对比">群史卷册阅览与对比</h2>
+        <span id="editions-count" class="muted tabular-nums"></span>
+      </div>
+    </div>
+    <div class="toolbar gc-toolbar gc-compare-bar">
+      <label class="grow">
+        <span data-series-text="基准卷册（较新）">基准卷册（较新）</span>
+        <select id="compare-left"></select>
+      </label>
+      <label class="grow">
+        <span data-series-text="对比卷册（较旧）">对比卷册（较旧）</span>
+        <select id="compare-right"></select>
+      </label>
+      <button id="compare-btn" type="button" class="primary" data-series-text="对比变化">对比变化</button>
+      <button id="compare-clear" type="button" data-series-text="收起对比">收起对比</button>
+    </div>
+    <div id="editions-comparison" hidden class="card gc-compare-result"></div>
+    <div id="editions-list" class="grid gc-dict-grid"></div>
+  </section>
+
+  <section id="events" hidden>
+    <div class="gc-section-bar">
+      <div class="gc-section-title">
+        <h2 data-series-text="大事审核与隐私管理">大事审核与隐私管理</h2>
+        <span id="events-counts" class="muted tabular-nums"></span>
+      </div>
+      <label class="gc-inline-select">
+        <span data-series-text="筛选">筛选</span>
+        <select id="events-status">
+          <option value="pending" data-series-text="待审核">待审核</option>
+          <option value="approved" data-series-text="已通过">已通过</option>
+          <option value="rejected" data-series-text="已驳回">已驳回</option>
+          <option value="merged" data-series-text="已合并">已合并</option>
+          <option value="" data-series-text="全部">全部</option>
+        </select>
+      </label>
+    </div>
+    <div id="events-batch-bar" class="gc-batch-bar card">
+      <div class="gc-batch-top">
+        <label class="gc-check-inline">
+          <input id="events-select-all" type="checkbox">
+          <span data-series-text="全选事件">全选事件</span>
+        </label>
+        <span id="events-selected-count" class="muted tabular-nums">已选 0 项</span>
+        <input id="events-batch-note" class="grow" maxlength="1000" placeholder="填写事件审核理由，或点选下方快捷理由" data-series-placeholder="填写事件审核理由，或点选下方快捷理由">
+      </div>
+      <div class="gc-reason-chips" data-reason-target="events-batch-note" aria-label="快捷事件理由">
+        <button type="button" class="gc-reason-chip" data-reason="事实清晰，重要度合理">事实清晰</button>
+        <button type="button" class="gc-reason-chip" data-reason="日常琐事，暂不入史">琐事驳回</button>
+        <button type="button" class="gc-reason-chip" data-reason="与既有大事重复">重复事件</button>
+        <button type="button" class="gc-reason-chip" data-reason="涉及敏感隐私，执行隐藏">隐私隐藏</button>
+        <button type="button" class="gc-reason-chip" data-reason="管理员复核通过">复核通过</button>
+      </div>
+      <div class="actions gc-batch-actions">
+        <button type="button" class="primary" data-event-batch="approve" data-series-text="批量通过">批量通过</button>
+        <button type="button" data-event-batch="reject" data-series-text="批量驳回">批量驳回</button>
+        <button type="button" class="danger" data-event-batch="hide" data-series-text="批量隐藏">批量隐藏</button>
+      </div>
+    </div>
+    <div id="events-list" class="grid gc-dict-grid"></div>
+    <div class="gc-subpanels">
+      <section class="card gc-subpanel">
+        <h3 data-series-text="更正请求待办">更正请求待办</h3>
+        <div id="events-corrections" class="gc-stack"></div>
+      </section>
+      <section class="card gc-subpanel">
+        <h3 data-series-text="隐私隐藏名单管理">隐私隐藏名单管理</h3>
+        <div id="events-hidden-panel" class="gc-stack"></div>
+      </section>
+    </div>
+  </section>
+
+  <section id="members" hidden>
+    <div class="gc-section-bar">
+      <div class="gc-section-title">
+        <h2 data-series-text="人物列传墙与等级一览">人物列传墙与等级一览</h2>
+        <span id="members-summary" class="muted tabular-nums"></span>
+      </div>
+      <label class="gc-inline-select">
+        <span data-series-text="筛选成员">筛选成员</span>
+        <input id="members-filter" type="search" maxlength="80" placeholder="按昵称、别称或等级过滤" data-series-placeholder="按昵称、别称或等级过滤">
+      </label>
+    </div>
+    <div id="members-list" class="grid gc-dict-grid"></div>
   </section>
 
   <section id="progress" hidden>
@@ -202,6 +325,13 @@
           <span data-series-text="处理理由">处理理由</span>
           <input id="action-note" maxlength="1000" placeholder="说明依据、修订原因或审核结论" data-series-placeholder="说明依据、修订原因或审核结论">
         </label>
+        <div class="gc-reason-chips" data-reason-target="action-note" aria-label="快捷处理理由">
+          <button type="button" class="gc-reason-chip" data-reason="证据充分，符合群内语境">证据充分</button>
+          <button type="button" class="gc-reason-chip" data-reason="已核对修订内容，准予公开">核对通过</button>
+          <button type="button" class="gc-reason-chip" data-reason="证据不足，暂不收录">信息不足</button>
+          <button type="button" class="gc-reason-chip" data-reason="与已有词条重复">重复词条</button>
+          <button type="button" class="gc-reason-chip" data-reason="涉及成员隐私，执行隐藏">涉及隐私</button>
+        </div>
         <div class="actions">
           <button type="button" data-action="approve" class="primary" data-series-text="审核通过">审核通过</button>
           <button type="button" data-action="edit" data-series-text="保存修订并待审">保存修订并待审</button>

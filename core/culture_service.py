@@ -1005,11 +1005,11 @@ class CultureService:
             return result.get("reason") or result["note"]
         lines = []
 
+        tz = self.history._series_tz()
+
         def when(value):
             return (
-                datetime.fromtimestamp(value, timezone.utc).isoformat(
-                    timespec="minutes"
-                )
+                datetime.fromtimestamp(value, tz).strftime("%Y-%m-%d %H:%M")
                 if value
                 else "未知"
             )

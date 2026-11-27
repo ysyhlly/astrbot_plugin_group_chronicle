@@ -822,7 +822,40 @@ async def command_reply(plugin, event, supplied=None):
     except sqlite3.Error:
         logger.error("Lifetime command storage operation failed", exc_info=True)
         reply = "档案存储暂不可用，请管理员检查日志；未完成的事务不会写入一半。"
-    for part in split_text(reply, plugin._cfg("max_reply_chars", 1500)):
+    max_chars = int(plugin._cfg("max_reply_chars", 1500))
+    use_forward = bool(plugin._cfg("use_forward_nodes", True))
+    is_events_cmd = bool(
+        re.search(
+            r"(?:^|\s)/*群大事(?=\s|$)",
+            str(getattr(event, "message_str", "")),
+        )
+    )
+    if is_events_cmd and use_forward and len(reply) > max_chars:
+        from . import deliver as _deliver_mod
+
+        if _deliver_mod._build_forward_nodes(["probe"], "群大事记", "0") is not None:
+
+            async def _events_guard():
+                return (
+                    await asyncio.to_thread(plugin.history.store.revision, umo)
+                    == revision
+                )
+
+            delivered = await deliver_text(
+                plugin.context,
+                event,
+                umo,
+                reply,
+                None,
+                prefer_context=False,
+                use_forward_nodes=True,
+                max_chars=max_chars,
+                node_name="群大事记",
+                guard=_events_guard if guarded else None,
+            )
+            if delivered:
+                return
+    for part in split_text(reply, max_chars):
         if (
             guarded
             and await asyncio.to_thread(plugin.history.store.revision, umo) != revision

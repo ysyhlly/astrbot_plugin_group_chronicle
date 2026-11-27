@@ -2,44 +2,128 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>{{ group_name }}·群史记</title>
+<title>{{ group_name }}·{{ title_suffix }}</title>
 <style>
   /* ============================================================
-     群史记 · 魔法少女·魔女审判 夏目安安 主题
-     夜空紫渐变 + 星光 ✦✧★☾ + 魔法阵角饰 + 粉金点缀
-     纯 CSS 装饰（无外部图片/字体, 兼容 T2I 与 Playwright）
+     群史记 · 三套可选渲染主题（纯 CSS 装饰，无外部依赖，兼容 T2I 与 Playwright）
+     1. classic_scroll  古籍米色（默认，宣纸米色 + 朱砂印章 + 墨韵书卷）
+     2. dark_grimoire   深紫典雅（夜空深紫 #171034 + 星金 + 玫粉星纹）
+     3. modern_card     清爽现代（素白卡片 + 黛青强调 + 清晰几何层级）
      ============================================================ */
-  :root {
-    --night-1: #171034;       /* 夜空深紫 */
-    --night-2: #2a1b52;
-    --night-3: #43276f;
-    --ink: #f6ecff;           /* 正文亮色 */
-    --ink-soft: #d8c8f0;      /* 次级文字 */
-    --pink: #ff8ac2;          /* 魔女粉 */
-    --pink-soft: #ffb3d9;
-    --gold: #ffd97a;          /* 星金 */
+  :root,
+  body[data-theme="classic_scroll"] {
+    --bg-canvas: linear-gradient(160deg, #f8f2e4 0%, #f3ead6 55%, #ece0c8 100%);
+    --bg-radial-1: rgba(158, 43, 37, 0.08);
+    --bg-radial-2: rgba(176, 134, 62, 0.12);
+    --bg-radial-3: rgba(120, 88, 42, 0.06);
+    --ink: #2c261f;
+    --ink-soft: #6d6153;
+    --accent: #9e2b25;
+    --accent-soft: #7f211c;
+    --gold: #a57728;
+    --card-border: rgba(158, 43, 37, 0.24);
+    --card-bg: rgba(255, 252, 245, 0.86);
+    --panel-dark: #efe6d3;
+    --code-bg: rgba(158, 43, 37, 0.08);
+    --code-fg: #7f211c;
+    --quote-bg: rgba(158, 43, 37, 0.06);
+    --quote-border: #9e2b25;
+    --quote-fg: #5c2a24;
+    --glow: rgba(158, 43, 37, 0.16);
+    --heading-fg: #2b1d17;
+    --h2-fg: #4a231c;
+    --h3-fg: #5d3b27;
+    --strong-fg: #1d150f;
+    --seal-bg: radial-gradient(circle at 30% 30%, #b93830, #8a1f1a);
+    --seal-fg: #fff9f2;
+    --seal-ring: rgba(243, 214, 152, 0.85);
+    --title-fg: #7f211c;
+    --pill-bg: rgba(158, 43, 37, 0.09);
+    --pill-fg: #7f211c;
+    --sheet-font: "Noto Serif SC", "Source Han Serif SC", "Noto Serif CJK SC", "Songti SC", "SimSun", serif;
+  }
+
+  body[data-theme="dark_grimoire"] {
+    --bg-canvas: linear-gradient(160deg, #171034 0%, #2a1b52 55%, #43276f 100%);
+    --bg-radial-1: rgba(255, 138, 194, 0.18);
+    --bg-radial-2: rgba(255, 217, 122, 0.12);
+    --bg-radial-3: rgba(255, 179, 217, 0.10);
+    --ink: #f6ecff;
+    --ink-soft: #d8c8f0;
+    --accent: #ff8ac2;
+    --accent-soft: #ffb3d9;
+    --gold: #ffd97a;
     --card-border: rgba(255, 138, 194, 0.35);
     --card-bg: rgba(255, 255, 255, 0.06);
-    --panel-dark: #221543;    /* 深紫面板 (代码块) */
-    --glow-pink: rgba(255, 138, 194, 0.22);
+    --panel-dark: #221543;
+    --code-bg: rgba(255, 138, 194, 0.16);
+    --code-fg: #ffb3d9;
+    --quote-bg: rgba(255, 138, 194, 0.10);
+    --quote-border: #ff8ac2;
+    --quote-fg: #ffb3d9;
+    --glow: rgba(255, 138, 194, 0.22);
+    --heading-fg: #fff3fb;
+    --h2-fg: #ffe6f4;
+    --h3-fg: #f0e3ff;
+    --strong-fg: #ffffff;
+    --seal-bg: radial-gradient(circle at 30% 30%, rgba(255, 138, 194, 0.9), rgba(196, 68, 148, 0.95));
+    --seal-fg: #fff6fc;
+    --seal-ring: rgba(255, 217, 122, 0.8);
+    --title-fg: #ffd97a;
+    --pill-bg: rgba(255, 138, 194, 0.12);
+    --pill-fg: #ffb3d9;
+    --sheet-font: "Noto Serif SC", "Source Han Serif SC", "Noto Serif CJK SC", "Songti SC", "SimSun", serif;
   }
+
+  body[data-theme="modern_card"] {
+    --bg-canvas: linear-gradient(155deg, #f3f6f4 0%, #eaf0ec 55%, #e5edf2 100%);
+    --bg-radial-1: rgba(36, 98, 70, 0.10);
+    --bg-radial-2: rgba(45, 106, 135, 0.10);
+    --bg-radial-3: rgba(36, 98, 70, 0.05);
+    --ink: #1e2c24;
+    --ink-soft: #52645a;
+    --accent: #246246;
+    --accent-soft: #2d6a87;
+    --gold: #246246;
+    --card-border: rgba(36, 98, 70, 0.18);
+    --card-bg: #ffffff;
+    --panel-dark: #f2f6f3;
+    --code-bg: #e5f0ea;
+    --code-fg: #1d5139;
+    --quote-bg: #eff6f2;
+    --quote-border: #246246;
+    --quote-fg: #244736;
+    --glow: rgba(36, 98, 70, 0.14);
+    --heading-fg: #14261c;
+    --h2-fg: #1c3a2b;
+    --h3-fg: #264d3b;
+    --strong-fg: #102018;
+    --seal-bg: linear-gradient(135deg, #246246, #2d6a87);
+    --seal-fg: #ffffff;
+    --seal-ring: rgba(255, 255, 255, 0.65);
+    --title-fg: #18422f;
+    --pill-bg: #e3f0e7;
+    --pill-fg: #246246;
+    --sheet-font: "PingFang SC", "Noto Sans SC", "Source Han Sans SC", "Microsoft YaHei", system-ui, sans-serif;
+  }
+
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; }
   body {
     width: 1280px;
     min-height: 1400px;
     color: var(--ink);
-    font-family: "Noto Serif SC", "Source Han Serif SC", "Noto Serif CJK SC", "Songti SC", "SimSun", serif;
+    font-family: var(--sheet-font);
     font-size: 19px;
     font-weight: 500;
     line-height: 1.9;
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
     background:
-      radial-gradient(1100px 560px at 88% -8%, rgba(255, 138, 194, 0.18), transparent 62%),
-      radial-gradient(900px 500px at -8% 108%, rgba(255, 217, 122, 0.12), transparent 60%),
-      radial-gradient(700px 420px at 50% 120%, rgba(255, 179, 217, 0.10), transparent 65%),
-      linear-gradient(160deg, var(--night-1) 0%, var(--night-2) 55%, var(--night-3) 100%);
+      radial-gradient(1100px 560px at 88% -8%, var(--bg-radial-1), transparent 62%),
+      radial-gradient(900px 500px at -8% 108%, var(--bg-radial-2), transparent 60%),
+      radial-gradient(700px 420px at 50% 120%, var(--bg-radial-3), transparent 65%),
+      var(--bg-canvas);
   }
   .chronicle-sheet {
     position: relative;
@@ -48,17 +132,18 @@
     overflow: hidden;
   }
 
-  /* ---------- 夜空星光 (纯 unicode 装饰) ---------- */
-  .sky-star { position: absolute; color: var(--gold); opacity: 0.85; line-height: 1; pointer-events: none; }
-  .sky-star.s1 { top: 40px; left: 120px; font-size: 26px; }
-  .sky-star.s2 { top: 110px; left: 330px; font-size: 14px; color: var(--pink-soft); }
+  /* ---------- 角饰与星纹 ---------- */
+  .sky-star { position: absolute; color: var(--gold); opacity: 0.55; line-height: 1; pointer-events: none; }
+  .sky-star.s1 { top: 40px; left: 120px; font-size: 24px; }
+  .sky-star.s2 { top: 110px; left: 330px; font-size: 14px; color: var(--accent-soft); }
   .sky-star.s3 { top: 28px; right: 250px; font-size: 18px; }
-  .sky-star.s4 { top: 120px; right: 92px; font-size: 12px; color: var(--pink-soft); }
+  .sky-star.s4 { top: 120px; right: 92px; font-size: 12px; color: var(--accent-soft); }
   .sky-star.s5 { top: 200px; left: 56px; font-size: 12px; }
-  .sky-star.s6 { top: 186px; right: 330px; font-size: 22px; }
+  .sky-star.s6 { top: 186px; right: 330px; font-size: 20px; }
+  body[data-theme="modern_card"] .sky-star,
+  body[data-theme="modern_card"] .magic-circle { opacity: 0.22; }
 
-  /* ---------- 四角魔法阵 (同心环) ---------- */
-  .magic-circle { position: absolute; border-radius: 50%; opacity: 0.5; pointer-events: none; }
+  .magic-circle { position: absolute; border-radius: 50%; opacity: 0.42; pointer-events: none; }
   .magic-circle.tl { top: -70px; left: -70px; width: 220px; height: 220px; }
   .magic-circle.tr { top: -70px; right: -70px; width: 220px; height: 220px; }
   .magic-circle.bl { bottom: -80px; left: -80px; width: 240px; height: 240px; }
@@ -68,79 +153,84 @@
     border: 1px solid var(--card-border);
   }
   .magic-circle .ring.r2 { inset: 14px; border-style: dashed; opacity: 0.8; }
-  .magic-circle .ring.r3 { inset: 30px; border: 1px solid rgba(255, 217, 122, 0.35); }
+  .magic-circle .ring.r3 { inset: 30px; border: 1px solid var(--card-border); opacity: 0.55; }
   .magic-circle .glyph {
     position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-    color: var(--pink-soft); font-size: 22px; opacity: 0.8;
+    color: var(--accent-soft); font-size: 20px; opacity: 0.7;
   }
 
   /* ---------- 卷首 ---------- */
   header.chronicle-header {
     position: relative;
     text-align: center;
-    padding: 22px 0 30px;
+    padding: 20px 0 28px;
     margin-bottom: 34px;
-    border-bottom: 1px solid rgba(255, 138, 194, 0.28);
+    border-bottom: 1px solid var(--card-border);
   }
   .crescent {
     display: inline-block;
     color: var(--gold);
-    font-size: 34px;
+    font-size: 30px;
     line-height: 1;
-    text-shadow: 0 0 18px rgba(255, 217, 122, 0.45);
   }
   .seal {
     position: relative;
     display: inline-flex; align-items: center; justify-content: center;
-    width: 76px; height: 76px;
+    width: 74px; height: 74px;
     margin: 12px auto 16px;
     border-radius: 50%;
-    background: radial-gradient(circle at 30% 30%, rgba(255, 138, 194, 0.9), rgba(196, 68, 148, 0.95));
-    border: 2px solid rgba(255, 217, 122, 0.8);
-    box-shadow: 0 0 26px var(--glow-pink), inset 0 0 14px rgba(23, 16, 52, 0.55);
-    color: #fff6fc;
+    background: var(--seal-bg);
+    border: 2px solid var(--seal-ring);
+    box-shadow: 0 6px 24px var(--glow);
+    color: var(--seal-fg);
     font-family: "Noto Serif SC", "Songti SC", serif;
-    font-size: 34px;
+    font-size: 32px;
     font-weight: 800;
-    transform: rotate(-6deg);
+    transform: rotate(-5deg);
+  }
+  body[data-theme="modern_card"] .seal {
+    border-radius: 20px;
+    transform: none;
   }
   .seal::after {
     content: "";
     position: absolute; inset: 6px;
-    border-radius: 50%;
-    border: 1px dashed rgba(255, 217, 122, 0.55);
+    border-radius: inherit;
+    border: 1px dashed var(--seal-ring);
+    opacity: 0.65;
   }
   .chronicle-title {
     margin: 6px 0 12px;
-    font-size: 56px;
+    font-size: 52px;
     font-weight: 800;
-    letter-spacing: 10px;
+    letter-spacing: 8px;
     line-height: 1.25;
-    background: linear-gradient(180deg, var(--gold) 8%, #ffb8d6 55%, var(--pink) 100%);
+    color: var(--title-fg);
+  }
+  body[data-theme="dark_grimoire"] .chronicle-title {
+    background: linear-gradient(180deg, #ffd97a 8%, #ffb8d6 55%, #ff8ac2 100%);
     -webkit-background-clip: text;
     background-clip: text;
-    color: var(--gold);
     filter: drop-shadow(0 4px 18px rgba(255, 138, 194, 0.35));
   }
-  .chronicle-title .group { font-size: 44px; }
-  .chronicle-title .dot { color: var(--pink-soft); font-size: 40px; padding: 0 12px; }
+  .chronicle-title .group { font-size: 42px; }
+  .chronicle-title .dot { color: var(--accent-soft); font-size: 38px; padding: 0 12px; }
   .chronicle-epigraph {
     margin: 0 0 18px;
     color: var(--ink-soft);
     font-size: 15px;
-    letter-spacing: 4px;
+    letter-spacing: 3px;
   }
-  .chronicle-epigraph .spark { color: var(--gold); }
   .date-pill {
     display: inline-block;
     padding: 5px 22px;
     border: 1px solid var(--card-border);
     border-radius: 999px;
-    background: rgba(255, 138, 194, 0.12);
-    color: var(--pink-soft);
+    background: var(--pill-bg);
+    color: var(--pill-fg);
     font-family: "Noto Sans SC", "Source Han Sans SC", "Microsoft YaHei", sans-serif;
     font-size: 15px;
-    letter-spacing: 3px;
+    letter-spacing: 2px;
   }
 
   /* ---------- 正文 (markdown 渲染结果) ---------- */
@@ -150,102 +240,100 @@
     border: 1px solid var(--card-border);
     border-radius: 22px;
     padding: 42px 52px;
-    box-shadow: 0 0 40px rgba(255, 138, 194, 0.10), inset 0 0 60px rgba(23, 16, 52, 0.35);
+    box-shadow: 0 10px 36px var(--glow);
   }
   .chronicle-content h1 {
     font-size: 30px;
     font-weight: 800;
-    letter-spacing: 3px;
-    color: #fff3fb;
+    letter-spacing: 2px;
+    color: var(--heading-fg);
     margin: 34px 0 16px;
     padding-bottom: 12px;
     line-height: 1.5;
-    background: linear-gradient(90deg, var(--pink), rgba(255, 138, 194, 0));
-    background-size: 100% 2px;
-    background-repeat: no-repeat;
-    background-position: left bottom;
+    border-bottom: 2px solid var(--card-border);
   }
   .chronicle-content h1::before { content: "✦ "; color: var(--gold); }
   .chronicle-content h2 {
     font-size: 25px;
     font-weight: 700;
-    color: #ffe6f4;
-    letter-spacing: 2px;
+    color: var(--h2-fg);
+    letter-spacing: 1.5px;
     margin: 30px 0 14px;
     padding-left: 16px;
-    border-left: 4px solid var(--pink);
+    border-left: 4px solid var(--accent);
     line-height: 1.5;
   }
   .chronicle-content h2::before { content: "✧ "; color: var(--gold); }
   .chronicle-content h3 {
     font-size: 21px;
     font-weight: 700;
-    color: #f0e3ff;
+    color: var(--h3-fg);
     margin: 26px 0 12px;
     padding-bottom: 6px;
-    border-bottom: 1px dashed rgba(255, 217, 122, 0.45);
+    border-bottom: 1px dashed var(--card-border);
     line-height: 1.5;
   }
   .chronicle-content p { margin: 0 0 14px; text-indent: 2em; color: var(--ink); }
+  body[data-theme="modern_card"] .chronicle-content p { text-indent: 0; }
   .chronicle-content ul { margin: 0 0 16px; padding-left: 1.9em; list-style: none; }
   .chronicle-content li { position: relative; margin-bottom: 7px; color: var(--ink); }
   .chronicle-content li::before {
-    content: "✧";
-    color: var(--gold);
-    font-size: 13px;
+    content: "◆";
+    color: var(--accent);
+    font-size: 11px;
     position: absolute;
-    left: -1.9em;
-    top: 0.28em;
+    left: -1.7em;
+    top: 0.38em;
   }
-  .chronicle-content strong { color: #ffffff; font-weight: 800; }
+  .chronicle-content strong { color: var(--strong-fg); font-weight: 800; }
   .chronicle-content code {
     font-family: "Noto Sans Mono CJK SC", "Sarasa Mono SC", Consolas, monospace;
     font-size: 16px;
-    background: rgba(255, 138, 194, 0.16);
-    color: var(--pink-soft);
+    background: var(--code-bg);
+    color: var(--code-fg);
     padding: 2px 7px;
     border-radius: 6px;
-    border: 1px solid rgba(255, 138, 194, 0.22);
+    border: 1px solid var(--card-border);
   }
   .chronicle-content pre {
     background: var(--panel-dark);
-    border: 1px solid rgba(255, 179, 217, 0.18);
-    border-left: 4px solid var(--pink);
+    border: 1px solid var(--card-border);
+    border-left: 4px solid var(--accent);
     padding: 18px 22px;
     margin: 16px 0 22px;
     border-radius: 14px;
     overflow-x: hidden;
-    box-shadow: inset 0 0 26px rgba(23, 16, 52, 0.6);
   }
   .chronicle-content pre code {
     background: transparent;
     border: none;
     padding: 0;
-    color: #e8dcff;
+    color: var(--ink);
     white-space: pre-wrap;
     word-break: break-all;
   }
-  /* 引用 → 咒术卡 (spell card): 粉色描边 + 柔光 */
+  /* 引用 → 摘要/金句卡 (spell-card 兼容类名) */
   .chronicle-content blockquote.spell-card {
     position: relative;
     margin: 20px 0 22px;
     padding: 16px 24px;
-    border: 1px solid var(--pink);
-    border-radius: 16px;
-    background: rgba(255, 138, 194, 0.10);
-    box-shadow: 0 0 26px var(--glow-pink), inset 0 0 20px rgba(255, 138, 194, 0.06);
+    border: 1px solid var(--quote-border);
+    border-left: 4px solid var(--quote-border);
+    border-radius: 14px;
+    background: var(--quote-bg);
+    box-shadow: 0 4px 18px var(--glow);
   }
   .chronicle-content blockquote.spell-card::before {
     content: "✧";
     position: absolute;
-    top: 10px; left: 12px;
+    top: 10px; left: 10px;
     color: var(--gold);
-    font-size: 14px;
+    font-size: 13px;
   }
   .chronicle-content blockquote.spell-card p {
     text-indent: 0;
     margin: 0;
-    color: var(--pink-soft);
+    color: var(--quote-fg);
     font-size: 18px;
   }
 
@@ -254,11 +342,11 @@
     position: relative;
     margin-top: 40px;
     padding-top: 20px;
-    border-top: 1px solid rgba(255, 138, 194, 0.25);
+    border-top: 1px solid var(--card-border);
     text-align: center;
     color: var(--ink-soft);
     font-size: 14px;
-    letter-spacing: 4px;
+    letter-spacing: 3px;
   }
   .footer-ring {
     position: relative;
@@ -274,15 +362,14 @@
     content: "";
     position: absolute; inset: 6px;
     border-radius: 50%;
-    border: 1px dashed rgba(255, 217, 122, 0.5);
+    border: 1px dashed var(--card-border);
   }
-  .footer-line { margin: 2px 0; }
-  .footer-note { font-size: 13px; opacity: 0.75; letter-spacing: 2px; }
+  .footer-line { margin: 2px 0; font-weight: 600; }
+  .footer-note { font-size: 13px; opacity: 0.8; letter-spacing: 2px; }
 </style>
 </head>
-<body>
+<body data-theme="{{ theme }}">
 <div class="chronicle-sheet">
-  <!-- 夜空星光 -->
   <span class="sky-star s1">✦</span>
   <span class="sky-star s2">✧</span>
   <span class="sky-star s3">★</span>
@@ -290,7 +377,6 @@
   <span class="sky-star s5">✦</span>
   <span class="sky-star s6">✦</span>
 
-  <!-- 四角魔法阵 -->
   <div class="magic-circle tl"><div class="ring"></div><div class="ring r2"></div><div class="ring r3"></div><span class="glyph">✧</span></div>
   <div class="magic-circle tr"><div class="ring"></div><div class="ring r2"></div><div class="ring r3"></div><span class="glyph">✦</span></div>
   <div class="magic-circle bl"><div class="ring"></div><div class="ring r2"></div><div class="ring r3"></div><span class="glyph">✧</span></div>
@@ -298,9 +384,9 @@
 
   <header class="chronicle-header">
     <div><span class="crescent">☾</span></div>
-    <div class="seal">史</div>
-    <h1 class="chronicle-title"><span class="group">{{ group_name }}</span><span class="dot">·</span>群史记</h1>
-    <p class="chronicle-epigraph">✦ 月之魔女在此开庭 —— 群间旧事，尽录于卷 ✦</p>
+    <div class="seal">{{ seal_char }}</div>
+    <h1 class="chronicle-title"><span class="group">{{ group_name }}</span><span class="dot">·</span>{{ title_suffix }}</h1>
+    <p class="chronicle-epigraph">{{ epigraph }}</p>
     <div class="date-pill">✦ {{ generated_at }} ✦</div>
   </header>
 
@@ -310,7 +396,7 @@
 
   <footer class="chronicle-footer">
     <div class="footer-ring">☾</div>
-    <div class="footer-line">夏目安安 · 魔女审判记录</div>
+    <div class="footer-line">{{ footer_title }}</div>
     <div class="footer-note">史官谨记 · 谨录群聊旧事，勒石为记</div>
   </footer>
 </div>

@@ -1235,6 +1235,235 @@ summary:focus-visible {
   border-top: 1px dashed var(--gc-line);
 }
 
+/* Wave 2 Unified Chronicle Workbench Styles */
+.gc-page .series-tabs {
+  flex-wrap: wrap;
+}
+
+.gc-entry-title-group {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.gc-select-wrap {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  padding-top: 2px;
+  cursor: pointer;
+}
+
+.gc-select-wrap input[type="checkbox"],
+.gc-check-inline input[type="checkbox"] {
+  width: 17px;
+  height: 17px;
+  min-height: 17px;
+  padding: 0;
+  margin: 0;
+  accent-color: var(--gc-accent);
+  cursor: pointer;
+}
+
+.gc-batch-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 14px;
+  padding: 12px 14px;
+  background: var(--gc-subtle);
+}
+
+.gc-batch-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.gc-check-inline {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--gc-ink);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.gc-reason-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 0 2px;
+}
+
+.gc-reason-chip {
+  min-height: 28px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 500;
+  background: var(--gc-surface);
+  color: var(--gc-muted);
+  border: 1px solid var(--gc-line);
+}
+
+.gc-reason-chip:hover:not(:disabled) {
+  background: var(--gc-accent-soft);
+  color: var(--gc-accent);
+  border-color: color-mix(in srgb, var(--gc-accent) 30%, transparent);
+}
+
+.gc-batch-actions {
+  margin: 0;
+}
+
+.gc-compare-result {
+  margin-bottom: 14px;
+  border-left: 3px solid var(--gc-accent);
+  background: var(--gc-accent-soft);
+}
+
+.gc-meta-line {
+  font-size: 12px;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.gc-edition-details {
+  margin-top: 4px;
+  border-top: 1px dashed var(--gc-line);
+  padding-top: 8px;
+}
+
+.gc-edition-details > summary {
+  cursor: pointer;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--gc-accent);
+}
+
+.gc-edition-text {
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--gc-subtle);
+  border: 1px solid var(--gc-line);
+  font-family: var(--gc-font);
+  font-size: 12.5px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.gc-bio-excerpt {
+  margin: 8px 0 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.gc-inline-merge {
+  width: 100%;
+}
+
+.gc-inline-merge > summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--gc-muted);
+  font-weight: 600;
+}
+
+.gc-inline-merge-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+.gc-inline-merge-row input {
+  flex: 1 1 130px;
+  min-width: 0;
+  min-height: 34px;
+  padding: 4px 10px;
+  font-size: 12.5px;
+}
+
+.gc-inline-merge-row button {
+  min-height: 34px;
+  padding: 4px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+}
+
+.gc-subpanels {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 18px;
+}
+
+.gc-subpanel h3 {
+  margin-top: 0;
+}
+
+.gc-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.gc-subitem {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--gc-subtle);
+  border: 1px solid var(--gc-line);
+  font-size: 12.5px;
+}
+
+.gc-subitem-main {
+  flex: 1 1 160px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.gc-subitem-main p {
+  margin: 2px 0;
+}
+
+@media (max-width: 768px) {
+  .gc-page .series-tabs {
+    gap: 4px;
+  }
+
+  .gc-page .series-tabs button {
+    padding: 5px 8px;
+    font-size: 12px;
+  }
+
+  .gc-subpanels {
+    grid-template-columns: 1fr;
+  }
+
+  .gc-batch-top input {
+    width: 100%;
+    flex: 1 1 100%;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .entry.gc-dict-card,
   .gc-drawer-backdrop,

@@ -1077,6 +1077,83 @@ class ArchiveStore:
                 )
             ]
 
+    def list_members(self, umo, *, include_hidden=False):
+        """List archived members for one group."""
+        with self.connection() as db:
+            sql = "SELECT * FROM members WHERE umo=?"
+            if not include_hidden:
+                sql += " AND hidden=0"
+            sql += " ORDER BY last_seen DESC, uid ASC"
+            return [
+                {**dict(r), "aliases": json.loads(r["aliases"])}
+                for r in db.execute(sql, (umo,))
+            ]
+
+    def hidden_event_ids(self, umo):
+        """Return sorted event IDs explicitly hidden in this group."""
+        with self.connection() as db:
+            return [
+                int(r[0])
+                for r in db.execute(
+                    "SELECT DISTINCT event_id FROM hides WHERE umo=? ORDER BY event_id DESC",
+                    (umo,),
+                )
+            ]
+
+    def resolve_correction(self, umo, correction_id, actor, note=""):
+        """Mark one correction request resolved with an audit revision."""
+        with self.connection(write=True) as db:
+            row = db.execute(
+                "SELECT * FROM corrections WHERE umo=? AND id=?",
+                (umo, int(correction_id)),
+            ).fetchone()
+            if not row:
+                raise ValueError("更正请求不存在")
+            db.execute(
+                "UPDATE corrections SET resolved=1 WHERE umo=? AND id=?",
+                (umo, int(correction_id)),
+            )
+            db.execute(
+                "INSERT INTO revisions(umo,entity,entity_id,before_data,actor,note,created) VALUES(?,?,?,?,?,?,?)",
+                (
+                    umo,
+                    "correction_resolve",
+                    str(correction_id),
+                    encode(dict(row)),
+                    str(actor or "admin"),
+                    str(note or "管理员已处理更正请求")[:1000],
+                    time.time(),
+                ),
+            )
+            self._bump(db, umo)
+
+    def admin_hide_event(self, umo, event_id, actor, note=""):
+        """Allow an administrator to hide an event in this group with audit trail."""
+        eid = int(event_id)
+        with self.connection(write=True) as db:
+            row = db.execute(
+                "SELECT id FROM events WHERE umo=? AND id=?", (umo, eid)
+            ).fetchone()
+            if not row:
+                raise ValueError("本群没有该事件")
+            db.execute(
+                "INSERT OR IGNORE INTO hides VALUES(?,?,?)",
+                (umo, str(actor or "admin"), eid),
+            )
+            db.execute(
+                "INSERT INTO revisions(umo,entity,entity_id,before_data,actor,note,created) VALUES(?,?,?,?,?,?,?)",
+                (
+                    umo,
+                    "privacy_hide_event",
+                    str(eid),
+                    encode({"actor": str(actor or "admin"), "event_id": eid, "hidden": 0}),
+                    str(actor or "admin"),
+                    str(note or "管理员隐藏事件")[:1000],
+                    time.time(),
+                ),
+            )
+            self._bump(db, umo, invalidate=True, privacy=True)
+
     def members_by_uids(self, umo, uids):
         """Batch-load basic member rows for a set of UIDs in one read lock."""
         clean = sorted({str(u) for u in uids if str(u)})

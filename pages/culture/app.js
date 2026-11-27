@@ -1,9 +1,12 @@
 import {confirmAction,getSharedScope,msg,setSharedScope,setText} from './series-ui.js';
 
 const $=id=>document.getElementById(id);
+const ALL_TABS=['library','review','editions','events','members','progress'];
 const states={approved:'已公开',pending:'待审核',disputed:'待纠正',rejected:'已驳回',hidden:'已隐藏',merged:'已合并'};
+const eventStates={approved:'已通过',pending:'待审核',rejected:'已驳回',merged:'已合并'};
 const actions={approve:'审核通过',edit:'修订',reject:'驳回',hide:'隐藏',restore:'撤销隐藏',correct:'提出纠正',merge:'合并',evidence:'追加证据'};
 let epoch=0,detailEpoch=0,page=1,reviewPage=1,selected=null,mergeTarget=null,busy=false,currentTab='library',lastTrigger=null,overviewEnabled=false;
+let selectedCultureIds=new Set(),selectedEventIds=new Set(),cachedMembers=[],cachedMembersHidden=0,cachedEditions=[];
 
 const el=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=String(text);if(cls)n.className=cls;return n;};
 const date=t=>t?new Date(t*1000).toLocaleString('zh-CN'):'未知';
@@ -63,15 +66,54 @@ function makeEmptyCard(title,subtitle){
   return box;
 }
 
-function entryCard(e){
+function syncCultureBatchCount(){
+  const cnt=$('culture-selected-count');
+  if(cnt)cnt.textContent=`已选 ${selectedCultureIds.size} 项`;
+  const allCb=$('culture-select-all');
+  const cbs=[...document.querySelectorAll('#review-entries .gc-select-cb')];
+  if(allCb){
+    allCb.checked=cbs.length>0&&cbs.every(cb=>cb.checked);
+    allCb.indeterminate=cbs.some(cb=>cb.checked)&&!allCb.checked;
+  }
+}
+
+function syncEventBatchCount(){
+  const cnt=$('events-selected-count');
+  if(cnt)cnt.textContent=`已选 ${selectedEventIds.size} 项`;
+  const allCb=$('events-select-all');
+  const cbs=[...document.querySelectorAll('#events-list .gc-event-cb')];
+  if(allCb){
+    allCb.checked=cbs.length>0&&cbs.every(cb=>cb.checked);
+    allCb.indeterminate=cbs.some(cb=>cb.checked)&&!allCb.checked;
+  }
+}
+
+function entryCard(e,{selectable=false}={}){
   const box=el('article',undefined,'card entry gc-dict-card');
   box.dataset.status=e.status||'hidden';
 
   const head=el('div',undefined,'entry-head');
+  const titleWrap=el('div',undefined,'gc-entry-title-group');
+  if(selectable&&!e.unavailable){
+    const wrap=el('label',undefined,'gc-select-wrap');
+    const cb=document.createElement('input');
+    cb.type='checkbox';
+    cb.className='gc-select-cb';
+    cb.dataset.entryId=String(e.id);
+    cb.setAttribute('aria-label',`选择词条 #${e.id} ${e.name}`);
+    cb.checked=selectedCultureIds.has(e.id);
+    cb.onchange=()=>{
+      if(cb.checked)selectedCultureIds.add(e.id);else selectedCultureIds.delete(e.id);
+      syncCultureBatchCount();
+    };
+    wrap.append(cb);
+    titleWrap.append(wrap);
+  }
   const title=el('h3',undefined,'entry-title');
   title.append(el('span',`#${e.id}`,'entry-id'),document.createTextNode(' '),el('span',e.name,'entry-name'));
+  titleWrap.append(title);
   const badge=el('span',states[e.status]||e.status,statusClass(e.status));
-  head.append(title,badge);
+  head.append(titleWrap,badge);
   box.append(head);
 
   box.append(el('p',e.unavailable?'来源不可用或条目已隐藏，解释暂停展示。':e.meaning,'entry-meaning'));
@@ -127,8 +169,8 @@ function entryCard(e){
   return box;
 }
 
-function renderCards(container,items){
-  container.replaceChildren(...items.map(entryCard));
+function renderCards(container,items,{selectable=false}={}){
+  container.replaceChildren(...items.map(item=>entryCard(item,{selectable})));
   if(!items.length){
     container.append(makeEmptyCard('暂无符合条件的词条','完成群文化整理或调整筛选条件后，词条会以词典卡片形式呈现在这里。'));
   }
@@ -138,18 +180,295 @@ async function loadList(){
   if(!$('scope').value)return;
   const ticket=++epoch;
   const review=currentTab==='review';
+  if(review)selectedCultureIds.clear();
   const d=await request('list',{
     query:review?'':$('query').value.trim(),
     status:review?$('review-status').value:$('status').value,
     page:review?reviewPage:page,
   });
   if(ticket!==epoch)return;
-  renderCards($(review?'review-entries':'entries'),d.entries);
+  renderCards($(review?'review-entries':'entries'),d.entries,{selectable:review});
+  if(review)syncCultureBatchCount();
   const p=review?reviewPage:page;
   $(review?'review-count':'count').textContent=`共 ${d.total} 条 · 第 ${p} 页`;
   $(review?'review-prev':'prev').disabled=p<=1;
   $(review?'review-next':'next').disabled=p*20>=d.total;
   if(!review)$('page-number').textContent=String(page);
+}
+
+function renderEditionComparison(comp){
+  const box=$('editions-comparison');
+  if(!box)return;
+  if(!comp){box.hidden=true;box.replaceChildren();return;}
+  box.hidden=false;
+  box.replaceChildren();
+  const fmtDiff=n=>n>0?`+${n}`:String(n);
+  box.append(
+    el('h3',`卷册对比：#${comp.left_id} vs #${comp.right_id}`),
+    el('p',`字数变化：${fmtDiff(comp.char_diff)} 字 · 事件变化：${fmtDiff(comp.event_diff)} 条 · 消息变化：${fmtDiff(comp.msg_diff)} 条`,'tabular-nums'),
+    el('p',`新增事件 ID：${comp.added_event_ids.length?comp.added_event_ids.map(id=>`#${id}`).join('、'):'无'}`,'muted'),
+    el('p',`减少事件 ID：${comp.removed_event_ids.length?comp.removed_event_ids.map(id=>`#${id}`).join('、'):'无'}`,'muted'),
+  );
+}
+
+async function loadEditions({reportId=null,compareId=null}={}){
+  if(!$('scope').value)return;
+  const ticket=++epoch;
+  const params={};
+  if(reportId!==null&&compareId!==null){params.report_id=reportId;params.compare_id=compareId;}
+  const d=await request('editions',params);
+  if(ticket!==epoch)return;
+  cachedEditions=Array.isArray(d.editions)?d.editions:[];
+  const cnt=$('editions-count');
+  if(cnt)cnt.textContent=`共 ${d.total||cachedEditions.length} 卷`;
+
+  const leftSel=$('compare-left'),rightSel=$('compare-right');
+  if(leftSel&&rightSel){
+    const prevLeft=leftSel.value,prevRight=rightSel.value;
+    const makeOpts=()=>cachedEditions.map(ed=>{
+      const opt=el('option',`#${ed.report_id} · ${ed.period_label} · ${ed.iso_year}-W${String(ed.iso_week).padStart(2,'0')} v${ed.version}`);
+      opt.value=String(ed.report_id);
+      return opt;
+    });
+    leftSel.replaceChildren(...makeOpts());
+    rightSel.replaceChildren(...makeOpts());
+    if(cachedEditions.length>=1){
+      leftSel.value=cachedEditions.some(e=>String(e.report_id)===prevLeft)?prevLeft:String(cachedEditions[0].report_id);
+      const fallbackRight=cachedEditions.length>=2?String(cachedEditions[1].report_id):String(cachedEditions[0].report_id);
+      rightSel.value=cachedEditions.some(e=>String(e.report_id)===prevRight)?prevRight:fallbackRight;
+    }
+    const cmpBtn=$('compare-btn');
+    if(cmpBtn)cmpBtn.disabled=cachedEditions.length<2;
+  }
+
+  renderEditionComparison(d.comparison||null);
+  const list=$('editions-list');
+  if(!list)return;
+  list.replaceChildren();
+  if(!cachedEditions.length){
+    list.append(makeEmptyCard('暂无群史卷册','发送「群史记」或等待定时编纂后，历期周卷、月卷与年卷会呈现在这里。'));
+    return;
+  }
+  for(const ed of cachedEditions){
+    const card=el('article',undefined,'card entry gc-dict-card');
+    const head=el('div',undefined,'entry-head');
+    const title=el('h3',undefined,'entry-title');
+    title.append(
+      el('span',`#${ed.report_id}`,'entry-id'),
+      document.createTextNode(' '),
+      el('span',`${ed.iso_year}-W${String(ed.iso_week).padStart(2,'0')} v${ed.version}`,'entry-name'),
+    );
+    const badge=el('span',ed.period_label||'周卷','badge badge--approved');
+    head.append(title,badge);
+    card.append(head);
+    card.append(el('p',ed.summary||'（无摘要）','entry-meaning'));
+    const meta=el('p',`${shortDate(ed.created_at)} · ${ed.event_count} 条事件 · ${ed.msg_count} 条消息 · ${ed.char_count} 字`,'muted gc-meta-line tabular-nums');
+    card.append(meta);
+    const details=el('details',undefined,'gc-edition-details');
+    details.append(el('summary','展开卷册正文'));
+    const pre=el('pre',ed.chronicle_text||'（空）','gc-edition-text');
+    details.append(pre);
+    card.append(details);
+    list.append(card);
+  }
+}
+
+async function runEventAction(payload,successText){
+  if(busy||!$('scope').value)return;
+  busy=true;
+  try{
+    const res=await request('event_action',payload);
+    notice(successText||`操作完成（成功 ${res?.succeeded?.length??1} 项）。`);
+    await loadEvents();
+  }finally{busy=false;}
+}
+
+async function loadEvents(){
+  if(!$('scope').value)return;
+  const ticket=++epoch;
+  selectedEventIds.clear();
+  const st=$('events-status')?.value??'pending';
+  const d=await request('events_list',{status:st||null});
+  if(ticket!==epoch)return;
+  const counts=d.counts||{};
+  const cntEl=$('events-counts');
+  if(cntEl){
+    cntEl.textContent=`待审 ${counts.pending||0} · 已过 ${counts.approved||0} · 更正 ${counts.corrections||0} · 隐藏成员 ${counts.hidden_members||0}`;
+  }
+
+  const list=$('events-list');
+  list.replaceChildren();
+  const events=Array.isArray(d.events)?d.events:[];
+  if(!events.length){
+    list.append(makeEmptyCard('当前筛选下暂无大事记录','切换状态筛选或等待群史后台抽取后再查看。'));
+  }else{
+    for(const ev of events){
+      const card=el('article',undefined,'card entry gc-dict-card');
+      card.dataset.status=ev.status||'pending';
+      const head=el('div',undefined,'entry-head');
+      const titleWrap=el('div',undefined,'gc-entry-title-group');
+      if(!ev.hidden){
+        const wrap=el('label',undefined,'gc-select-wrap');
+        const cb=document.createElement('input');
+        cb.type='checkbox';
+        cb.className='gc-event-cb';
+        cb.dataset.eventId=String(ev.id);
+        cb.setAttribute('aria-label',`选择事件 #${ev.id}`);
+        cb.onchange=()=>{
+          if(cb.checked)selectedEventIds.add(ev.id);else selectedEventIds.delete(ev.id);
+          syncEventBatchCount();
+        };
+        wrap.append(cb);
+        titleWrap.append(wrap);
+      }
+      const title=el('h3',undefined,'entry-title');
+      title.append(el('span',`#${ev.id}`,'entry-id'),document.createTextNode(' '),el('span',ev.title,'entry-name'));
+      titleWrap.append(title);
+      const badgeLabel=ev.hidden?'已隐藏':(eventStates[ev.status]||ev.status);
+      const badgeCls=ev.hidden?'badge badge--hidden':statusClass(ev.status);
+      head.append(titleWrap,el('span',badgeLabel,badgeCls));
+      card.append(head);
+
+      card.append(el('p',ev.detail||'','entry-meaning'));
+      const parts=(ev.participants||[]).map(p=>`${p.name}(${p.role===3||p.role==='core'?'核心':(p.role===2?'主要':'参与')})`).join('、');
+      card.append(el('p',`${shortDate(ev.event_at)} · 重要度 ${ev.importance} · ${ev.kind||'事件'}${parts?` · ${parts}`:''}`,'muted gc-meta-line'));
+      if(ev.review_note)card.append(el('p',`审核记录：${ev.review_note}`,'muted gc-meta-line'));
+
+      const foot=el('div',undefined,'entry-foot');
+      if(ev.hidden&&ev.can_restore){
+        const btn=el('button','撤销隐藏','entry-open-btn');
+        btn.type='button';
+        btn.onclick=run(()=>runEventAction({action:'restore_event',event_id:ev.id,note:'管理员面板撤销事件隐藏'},`已撤销事件 #${ev.id} 的隐私隐藏。`));
+        foot.append(el('span','隐私隐藏保护中','entry-usage muted'),btn);
+      }else if(!ev.hidden){
+        const mergeDetails=el('details',undefined,'gc-inline-merge');
+        mergeDetails.append(el('summary','合并到其他事件'));
+        const row=el('div',undefined,'gc-inline-merge-row');
+        const targetInput=document.createElement('input');
+        targetInput.type='number';
+        targetInput.min='1';
+        targetInput.placeholder='保留的目标事件 ID';
+        const mergeBtn=el('button','确认合并');
+        mergeBtn.type='button';
+        mergeBtn.onclick=run(async()=>{
+          const tid=Number(targetInput.value);
+          if(!Number.isInteger(tid)||tid<=0||tid===ev.id)throw Error('请填写另一个有效的目标事件 ID。');
+          await runEventAction({action:'merge',event_id:ev.id,target_event_id:tid,note:`管理员面板合并至 #${tid}`},`已将事件 #${ev.id} 合并至 #${tid}。`);
+        });
+        row.append(targetInput,mergeBtn);
+        mergeDetails.append(row);
+        foot.append(mergeDetails);
+      }
+      if(foot.childElementCount)card.append(foot);
+      list.append(card);
+    }
+  }
+  syncEventBatchCount();
+
+  const corrBox=$('events-corrections');
+  corrBox.replaceChildren();
+  const corrs=Array.isArray(d.corrections)?d.corrections:[];
+  if(!corrs.length){
+    corrBox.append(el('p','当前没有待处理的更正请求。','muted'));
+  }else{
+    for(const c of corrs){
+      const row=el('div',undefined,'gc-subitem');
+      const info=el('div',undefined,'gc-subitem-main');
+      info.append(
+        el('p',`#${c.id} · 事件 #${c.event_id} · 提交人 ${c.reporter}`),
+        el('p',c.content,'muted'),
+      );
+      const btn=el('button','标记已处理','entry-open-btn');
+      btn.type='button';
+      btn.onclick=run(()=>runEventAction({action:'resolve_correction',correction_id:c.id,note:'管理员面板已核对处理'},`更正请求 #${c.id} 已标记为已处理。`));
+      row.append(info,btn);
+      corrBox.append(row);
+    }
+  }
+
+  const hidBox=$('events-hidden-panel');
+  hidBox.replaceChildren();
+  const hiddenMembers=Array.isArray(d.hidden_members)?d.hidden_members:[];
+  const hiddenEventIds=Array.isArray(d.hidden_event_ids)?d.hidden_event_ids:[];
+  if(!hiddenMembers.length&&!hiddenEventIds.length){
+    hidBox.append(el('p','当前没有已隐藏的成员档案或事件。','muted'));
+  }else{
+    for(const m of hiddenMembers){
+      const row=el('div',undefined,'gc-subitem');
+      row.append(el('span',`成员档案：${m.name}（${m.uid}）`,'gc-subitem-main'));
+      const btn=el('button','恢复公开','entry-open-btn');
+      btn.type='button';
+      btn.onclick=run(()=>runEventAction({action:'restore_member',uid:m.uid,note:'管理员面板恢复成员公开档案'},`已恢复成员 ${m.name} 的公开档案。`));
+      row.append(btn);
+      hidBox.append(row);
+    }
+    for(const eid of hiddenEventIds){
+      const row=el('div',undefined,'gc-subitem');
+      row.append(el('span',`隐藏事件：#${eid}`,'gc-subitem-main'));
+      const btn=el('button','撤销隐藏','entry-open-btn');
+      btn.type='button';
+      btn.onclick=run(()=>runEventAction({action:'restore_event',event_id:eid,note:'管理员面板撤销事件隐藏'},`已撤销事件 #${eid} 的隐藏状态。`));
+      row.append(btn);
+      hidBox.append(row);
+    }
+  }
+}
+
+function renderMembersWall(){
+  const list=$('members-list');
+  if(!list)return;
+  const kw=($('members-filter')?.value||'').trim().toLowerCase();
+  const filtered=cachedMembers.filter(m=>{
+    if(!kw)return true;
+    const hay=[m.name,m.uid,m.grade,...(m.aliases||[])].join(' ').toLowerCase();
+    return hay.includes(kw);
+  });
+  const sumEl=$('members-summary');
+  if(sumEl){
+    const liezhuan=cachedMembers.filter(m=>m.grade==='列传').length;
+    const xiaozhuan=cachedMembers.filter(m=>m.grade==='小传').length;
+    const hiddenHint=cachedMembersHidden?` · 已隐私隐藏 ${cachedMembersHidden} 人`:'';
+    sumEl.textContent=`共 ${cachedMembers.length} 人（列传 ${liezhuan} · 小传 ${xiaozhuan}）${hiddenHint}`;
+  }
+  list.replaceChildren();
+  if(!filtered.length){
+    list.append(makeEmptyCard('暂无匹配的人物档案','完成长期群史建档或清空筛选条件后，人物列传墙会呈现在这里。'));
+    return;
+  }
+  for(const m of filtered){
+    const card=el('article',undefined,'card entry gc-dict-card');
+    const head=el('div',undefined,'entry-head');
+    const title=el('h3',undefined,'entry-title');
+    title.append(el('span',m.name,'entry-name'),el('span',m.uid,'entry-id'));
+    const gradeCls=m.grade==='列传'?'badge badge--approved':(m.grade==='小传'?'badge badge--pending':'badge badge--hidden');
+    head.append(title,el('span',m.grade||'小记',gradeCls));
+    card.append(head);
+
+    card.append(el('p',`积分 ${m.points} · 事件 ${m.events} 次（核心大事 ${m.major_core}） · 跨度 ${Math.round(m.span_days||0)} 天`,'muted gc-meta-line tabular-nums'));
+    if(Array.isArray(m.aliases)&&m.aliases.length){
+      const aliases=el('div',undefined,'entry-aliases');
+      for(const a of m.aliases)aliases.append(el('span',a,'alias-chip'));
+      card.append(aliases);
+    }
+    card.append(el('p',`最早现身：${shortDate(m.first_seen)} · 最近留存：${shortDate(m.last_seen)}`,'muted gc-meta-line'));
+    if(m.biography_excerpt){
+      const details=el('details',undefined,'gc-edition-details');
+      details.append(el('summary','查看已缓存人物传摘录'));
+      details.append(el('p',m.biography_excerpt,'gc-bio-excerpt'));
+      card.append(details);
+    }
+    list.append(card);
+  }
+}
+
+async function loadMembers(){
+  if(!$('scope').value)return;
+  const ticket=++epoch;
+  const d=await request('members_wall');
+  if(ticket!==epoch)return;
+  cachedMembers=Array.isArray(d.members)?d.members:[];
+  cachedMembersHidden=Number(d.hidden_count||0);
+  renderMembersWall();
 }
 
 function renderQuotaGrid(quota){
@@ -220,18 +539,33 @@ async function loadProgress(){
 }
 
 function clearScopeContent(){
-  for(const id of ['entries','review-entries','count','review-count','page-number','progress-content'])$(id).replaceChildren();
-  for(const id of ['prev','next','review-prev','review-next','pause','resume','run-once']){
+  selectedCultureIds.clear();
+  selectedEventIds.clear();
+  cachedMembers=[];
+  cachedEditions=[];
+  for(const id of ['entries','review-entries','count','review-count','page-number','progress-content','editions-list','editions-count','editions-comparison','events-list','events-counts','events-corrections','events-hidden-panel','members-list','members-summary']){
+    const n=$(id);
+    if(n)n.replaceChildren();
+  }
+  const cmp=$('editions-comparison');
+  if(cmp)cmp.hidden=true;
+  for(const id of ['prev','next','review-prev','review-next','pause','resume','run-once','compare-btn']){
     const n=$(id);
     if(n)n.disabled=true;
   }
+  syncCultureBatchCount();
+  syncEventBatchCount();
 }
 
 async function refresh(){
   ++epoch;
   closeDetail();
   if(!$('scope').value){clearScopeContent();return;}
-  if(currentTab==='progress')await loadProgress();else await loadList();
+  if(currentTab==='progress')await loadProgress();
+  else if(currentTab==='editions')await loadEditions();
+  else if(currentTab==='events')await loadEvents();
+  else if(currentTab==='members')await loadMembers();
+  else await loadList();
 }
 
 function addSection(box,title,text){
@@ -355,9 +689,12 @@ async function moderate(action,extra={}){
 function run(fn){return ()=>Promise.resolve().then(fn).catch(e=>notice(e.message,true));}
 
 function switchTab(tabName){
-  const target=['library','review','progress'].includes(tabName)?tabName:'library';
+  const target=ALL_TABS.includes(tabName)?tabName:'library';
   currentTab=target;
-  for(const tab of ['library','review','progress'])$(tab).hidden=tab!==currentTab;
+  for(const tab of ALL_TABS){
+    const node=$(tab);
+    if(node)node.hidden=tab!==currentTab;
+  }
   document.querySelectorAll('[data-tab]').forEach(n=>n.setAttribute('aria-current',n.dataset.tab===currentTab?'page':'false'));
 }
 
@@ -365,6 +702,97 @@ document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=run(async()=>{
   switchTab(b.dataset.tab);
   await refresh();
 }));
+
+// Quick reason chips fill their bound note input
+document.querySelectorAll('.gc-reason-chips .gc-reason-chip').forEach(chip=>{
+  chip.onclick=()=>{
+    const targetId=chip.closest('.gc-reason-chips')?.dataset.reasonTarget;
+    const input=targetId?$(targetId):null;
+    if(input){
+      input.value=chip.dataset.reason||chip.textContent.trim();
+      input.focus();
+    }
+  };
+});
+
+// Culture review batch select & actions
+const cultureSelectAll=$('culture-select-all');
+if(cultureSelectAll){
+  cultureSelectAll.onchange=()=>{
+    const checked=cultureSelectAll.checked;
+    document.querySelectorAll('#review-entries .gc-select-cb').forEach(cb=>{
+      cb.checked=checked;
+      const eid=Number(cb.dataset.entryId);
+      if(checked)selectedCultureIds.add(eid);else selectedCultureIds.delete(eid);
+    });
+    syncCultureBatchCount();
+  };
+}
+
+document.querySelectorAll('[data-culture-batch]').forEach(btn=>{
+  btn.onclick=run(async()=>{
+    if(busy||!$('scope').value)return;
+    const ids=[...selectedCultureIds];
+    if(!ids.length)throw Error('请先勾选至少一条待审词条。');
+    const note=($('batch-note')?.value||'').trim();
+    if(!note)throw Error('请填写或点选批量处理理由。');
+    const act=btn.dataset.cultureBatch;
+    busy=true;
+    try{
+      const res=await request('batch_action',{action:act,ids,note});
+      const okCount=res?.succeeded?.length||0;
+      const failCount=res?.failed?.length||0;
+      notice(`批量${actions[act]||act}完成：成功 ${okCount} 条${failCount?`，失败 ${failCount} 条`:''}。`,failCount>0&&okCount===0);
+      await loadList();
+    }finally{busy=false;}
+  });
+});
+
+// Editions compare controls
+const cmpBtnEl=$('compare-btn');
+if(cmpBtnEl){
+  cmpBtnEl.onclick=run(async()=>{
+    const leftId=Number($('compare-left')?.value);
+    const rightId=Number($('compare-right')?.value);
+    if(!Number.isInteger(leftId)||!Number.isInteger(rightId)||leftId<=0||rightId<=0)throw Error('请选择两卷用于对比。');
+    await loadEditions({reportId:leftId,compareId:rightId});
+  });
+}
+const cmpClearEl=$('compare-clear');
+if(cmpClearEl){
+  cmpClearEl.onclick=()=>renderEditionComparison(null);
+}
+
+// Events filter & batch controls
+const eventsStatusEl=$('events-status');
+if(eventsStatusEl)eventsStatusEl.onchange=run(loadEvents);
+
+const eventsSelectAll=$('events-select-all');
+if(eventsSelectAll){
+  eventsSelectAll.onchange=()=>{
+    const checked=eventsSelectAll.checked;
+    document.querySelectorAll('#events-list .gc-event-cb').forEach(cb=>{
+      cb.checked=checked;
+      const eid=Number(cb.dataset.eventId);
+      if(checked)selectedEventIds.add(eid);else selectedEventIds.delete(eid);
+    });
+    syncEventBatchCount();
+  };
+}
+
+document.querySelectorAll('[data-event-batch]').forEach(btn=>{
+  btn.onclick=run(async()=>{
+    const ids=[...selectedEventIds];
+    if(!ids.length)throw Error('请先勾选至少一条大事记录。');
+    const note=($('events-batch-note')?.value||'').trim()||`管理员面板批量${btn.textContent.trim()}`;
+    const act=btn.dataset.eventBatch;
+    await runEventAction({action:act,ids,note},`事件批量${actions[act]||act}已完成（共处理 ${ids.length} 条）。`);
+  });
+});
+
+// Members wall client-side search filter
+const membersFilterEl=$('members-filter');
+if(membersFilterEl)membersFilterEl.oninput=()=>renderMembersWall();
 
 $('search').onclick=run(async()=>{page=1;await refresh();});
 $('query').onkeydown=e=>{if(e.key==='Enter')$('search').click();};

@@ -230,6 +230,7 @@ class CultureWeb:
             "status",
             "page",
             "id",
+            "ids",
             "revision",
             "action",
             "note",
@@ -238,6 +239,12 @@ class CultureWeb:
             "target_revision",
             "batches",
             "verification_extra_quota",
+            "event_id",
+            "target_event_id",
+            "uid",
+            "correction_id",
+            "report_id",
+            "compare_id",
         }:
             raise ValueError("未知请求字段")
         umo = body.get("scope")
@@ -444,4 +451,317 @@ class CultureWeb:
                 target_id=body.get("target_id"),
                 target_revision=body.get("target_revision"),
             )
+        if op == "batch_action":
+            action_name = body.get("action")
+            if action_name not in {"approve", "reject", "hide"}:
+                raise ValueError("批量操作仅支持 approve / reject / hide")
+            raw_ids = body.get("ids")
+            if (
+                not isinstance(raw_ids, list)
+                or not raw_ids
+                or len(raw_ids) > 50
+                or any(type(i) is not int or i <= 0 for i in raw_ids)
+            ):
+                raise ValueError("请提供 1~50 条有效的词条 ID")
+            raw_note = body.get("note", "")
+            if not isinstance(raw_note, str) or not raw_note.strip() or len(raw_note) > 1000:
+                raise ValueError("请填写不超过1000字的批量处理理由")
+            succeeded = []
+            failed = []
+            for eid in list(dict.fromkeys(raw_ids)):
+                try:
+                    entry = await asyncio.to_thread(self.service.store.entry, umo, eid)
+                    if not entry:
+                        failed.append({"id": eid, "error": "词条不存在"})
+                        continue
+                    res = await self.service.action(
+                        umo,
+                        action_name,
+                        actor,
+                        admin=True,
+                        entry_id=entry["id"],
+                        revision=entry["revision"],
+                        note=raw_note.strip(),
+                    )
+                    succeeded.append(res)
+                except (ValueError, PermissionError) as exc:
+                    failed.append({"id": eid, "error": str(exc)})
+            return {
+                "ok": True,
+                "action": action_name,
+                "succeeded": succeeded,
+                "failed": failed,
+            }
+        if op == "editions":
+            report_id = body.get("report_id")
+            compare_id = body.get("compare_id")
+
+            def _load_editions():
+                reports = self.service.history.store.reports(umo, include_bios=False)
+                out = []
+                by_id = {}
+                for r in reports:
+                    text = str(r.get("chronicle_text") or "")
+                    period_days = int(r.get("period_days") or 0)
+                    period_label = (
+                        {7: "周卷", 30: "月卷", 90: "季卷", 365: "年卷"}.get(
+                            period_days, f"{period_days}天卷"
+                        )
+                        if period_days
+                        else "周卷"
+                    )
+                    summary = str(r.get("summary") or "").strip()
+                    if not summary:
+                        for ln in text.splitlines():
+                            s = ln.strip().lstrip("#>-*• ").strip()
+                            if s and not s.startswith("覆盖 ") and not s.startswith("——"):
+                                summary = s[:90]
+                                break
+                    item = {
+                        "report_id": r.get("report_id"),
+                        "iso_year": r.get("iso_year"),
+                        "iso_week": r.get("iso_week"),
+                        "period_days": period_days or 7,
+                        "period_label": period_label,
+                        "version": int(r.get("version") or 1),
+                        "group_name": str(r.get("group_name") or "群聊"),
+                        "created_at": float(r.get("created_at") or 0),
+                        "event_count": int(r.get("event_count") or 0),
+                        "msg_count": int(r.get("msg_count") or 0),
+                        "char_count": len(text),
+                        "summary": summary,
+                        "event_ids": list(r.get("event_ids") or []),
+                        "chronicle_text": text,
+                    }
+                    out.append(item)
+                    by_id[item["report_id"]] = item
+                comparison = None
+                if report_id is not None and compare_id is not None:
+                    left = by_id.get(report_id)
+                    right = by_id.get(compare_id)
+                    if left and right:
+                        left_ids = set(left.get("event_ids") or [])
+                        right_ids = set(right.get("event_ids") or [])
+                        comparison = {
+                            "left_id": left["report_id"],
+                            "right_id": right["report_id"],
+                            "char_diff": left["char_count"] - right["char_count"],
+                            "event_diff": left["event_count"] - right["event_count"],
+                            "msg_diff": left["msg_count"] - right["msg_count"],
+                            "added_event_ids": sorted(left_ids - right_ids),
+                            "removed_event_ids": sorted(right_ids - left_ids),
+                        }
+                return out, comparison
+
+            editions, comparison = await asyncio.to_thread(_load_editions)
+            return {
+                "editions": editions[:50],
+                "total": len(editions),
+                "comparison": comparison,
+            }
+        if op == "events_list":
+            status = body.get("status") or None
+            if status not in {None, "approved", "pending", "rejected", "merged"}:
+                raise ValueError("事件状态无效")
+
+            def _load_events():
+                store = self.service.history.store
+                all_events = store.events(umo, status=None, public=False)
+                public_ids = {
+                    e["id"]
+                    for e in store.events(umo, status=None, public=True)
+                }
+                explicit_hidden_ids = set(store.hidden_event_ids(umo))
+                counts = {
+                    "approved": 0,
+                    "pending": 0,
+                    "rejected": 0,
+                    "merged": 0,
+                }
+                rows_out = []
+                for ev in reversed(all_events):
+                    st = ev.get("status", "pending")
+                    if st in counts:
+                        counts[st] += 1
+                    if status and st != status:
+                        continue
+                    is_hidden = ev["id"] not in public_ids
+                    is_explicit_hidden = ev["id"] in explicit_hidden_ids
+                    if is_hidden:
+                        rows_out.append(
+                            {
+                                "id": ev["id"],
+                                "status": st,
+                                "hidden": True,
+                                "can_restore": is_explicit_hidden,
+                                "title": "已隐藏（隐私保护中）",
+                                "detail": "该事件因隐私隐藏或涉及已隐藏成员，暂不展示详情。",
+                                "kind": ev.get("kind", ""),
+                                "importance": int(ev.get("importance", 1)),
+                                "event_at": float(ev.get("event_at") or 0),
+                                "participants": [],
+                                "risk": bool(ev.get("risk", False)),
+                            }
+                        )
+                    else:
+                        rows_out.append(
+                            {
+                                "id": ev["id"],
+                                "status": st,
+                                "hidden": False,
+                                "can_restore": False,
+                                "title": ev.get("title", ""),
+                                "detail": ev.get("detail", ""),
+                                "kind": ev.get("kind", ""),
+                                "importance": int(ev.get("importance", 1)),
+                                "positive": bool(ev.get("positive", True)),
+                                "risk": bool(ev.get("risk", False)),
+                                "event_at": float(ev.get("event_at") or 0),
+                                "date_basis": ev.get("date_basis", "source"),
+                                "participants": ev.get("participants", []),
+                                "unknown_participants": ev.get("unknown_participants", []),
+                                "followups": ev.get("followups", []),
+                                "review_note": ev.get("review_note", ""),
+                            }
+                        )
+                corrections = store.corrections(umo)
+                hidden_members = [
+                    {
+                        "uid": m["uid"],
+                        "name": m["name"],
+                        "first_seen": float(m.get("first_seen") or 0),
+                    }
+                    for m in store.hidden(umo)
+                ]
+                counts["corrections"] = len(corrections)
+                counts["hidden_members"] = len(hidden_members)
+                counts["hidden_events"] = len(explicit_hidden_ids)
+                return {
+                    "events": rows_out[:100],
+                    "total": len(rows_out),
+                    "corrections": corrections[:50],
+                    "hidden_members": hidden_members,
+                    "hidden_event_ids": sorted(explicit_hidden_ids, reverse=True),
+                    "counts": counts,
+                }
+
+            return await asyncio.to_thread(_load_events)
+        if op == "event_action":
+            action_name = body.get("action")
+            raw_note = body.get("note", "")
+            note = (
+                raw_note.strip()[:1000]
+                if isinstance(raw_note, str) and raw_note.strip()
+                else f"管理员面板:{action_name}"
+            )
+            store = self.service.history.store
+            if action_name in {"approve", "reject", "hide"}:
+                raw_ids = body.get("ids")
+                if raw_ids is None and body.get("event_id") is not None:
+                    raw_ids = [body.get("event_id")]
+                if (
+                    not isinstance(raw_ids, list)
+                    or not raw_ids
+                    or len(raw_ids) > 50
+                    or any(type(i) is not int or i <= 0 for i in raw_ids)
+                ):
+                    raise ValueError("请提供 1~50 条有效的事件 ID")
+
+                def _run_event_batch():
+                    ok_ids = []
+                    errs = []
+                    for eid in list(dict.fromkeys(raw_ids)):
+                        try:
+                            if action_name == "hide":
+                                store.admin_hide_event(umo, eid, actor, note=note)
+                            else:
+                                store.review(umo, eid, action_name, actor, note=note)
+                            ok_ids.append(eid)
+                        except (ValueError, RuntimeError) as exc:
+                            errs.append({"id": eid, "error": str(exc)})
+                    return ok_ids, errs
+
+                ok_ids, errs = await asyncio.to_thread(_run_event_batch)
+                self.service.history.cancel_operations(umo)
+                return {"ok": True, "action": action_name, "succeeded": ok_ids, "failed": errs}
+            if action_name == "merge":
+                eid = body.get("event_id")
+                tid = body.get("target_event_id")
+                if type(eid) is not int or type(tid) is not int or eid <= 0 or tid <= 0:
+                    raise ValueError("请提供有效的保留事件 ID 与被合并事件 ID")
+                await asyncio.to_thread(
+                    store.review, umo, eid, "merge", actor, note=note, target=tid
+                )
+                self.service.history.cancel_operations(umo)
+                return {"ok": True, "action": "merge", "event_id": eid, "target_event_id": tid}
+            if action_name == "restore_event":
+                eid = body.get("event_id")
+                if type(eid) is not int or eid <= 0:
+                    raise ValueError("请提供有效的事件 ID")
+                res = await asyncio.to_thread(
+                    store.restore, umo, actor, eid, actor=actor, admin=True, note=note
+                )
+                self.service.history.cancel_operations(umo)
+                return {"ok": True, "action": "restore_event", **res}
+            if action_name == "restore_member":
+                uid = str(body.get("uid") or "").strip()
+                if not uid:
+                    raise ValueError("请提供要恢复的成员 ID")
+                res = await asyncio.to_thread(
+                    store.restore, umo, uid, None, actor=actor, admin=True, note=note
+                )
+                self.service.history.cancel_operations(umo)
+                return {"ok": True, "action": "restore_member", **res}
+            if action_name == "resolve_correction":
+                cid = body.get("correction_id")
+                if type(cid) is not int or cid <= 0:
+                    raise ValueError("请提供有效的更正请求 ID")
+                await asyncio.to_thread(
+                    store.resolve_correction, umo, cid, actor, note=note
+                )
+                return {"ok": True, "action": "resolve_correction", "correction_id": cid}
+            raise ValueError("未知事件操作")
+        if op == "members_wall":
+
+            def _load_members():
+                store = self.service.history.store
+                rules = self.service.history.rules()
+                visible_members = store.list_members(umo, include_hidden=False)
+                hidden_count = len(store.hidden(umo))
+                # Map latest cached biography per member_id
+                bio_map: dict[str, str] = {}
+                for rep in store.reports(umo, include_bios=True):
+                    if rep.get("report_kind") == "biography":
+                        mid = str(rep.get("member_id") or "")
+                        if mid and mid not in bio_map:
+                            bio_map[mid] = str(rep.get("chronicle_text") or "")[:600]
+                rows_out = []
+                for m in visible_members:
+                    uid = str(m["uid"])
+                    grd = store.grade(umo, uid, rules)
+                    rows_out.append(
+                        {
+                            "uid": uid,
+                            "name": m["name"],
+                            "aliases": list(m.get("aliases") or [])[:6],
+                            "first_seen": float(m.get("first_seen") or 0),
+                            "last_seen": float(m.get("last_seen") or 0),
+                            "grade": grd["grade"],
+                            "points": int(grd["points"]),
+                            "events": int(grd["events"]),
+                            "major_core": int(grd["major_core"]),
+                            "span_days": float(grd["span_days"]),
+                            "biography_excerpt": bio_map.get(uid, ""),
+                        }
+                    )
+                rows_out.sort(
+                    key=lambda x: (-x["points"], -x["events"], x["first_seen"], x["uid"])
+                )
+                return {
+                    "members": rows_out[:120],
+                    "total": len(rows_out),
+                    "hidden_count": hidden_count,
+                }
+
+            return await asyncio.to_thread(_load_members)
         raise ValueError("未知文化操作")

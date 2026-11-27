@@ -693,6 +693,7 @@ def test_bio_only_with_target(monkeypatch):
     monkeypatch.setattr(main_module, "gather_evidence", amock(evidence))
     monkeypatch.setattr(main_module, "generate_biography", amock("张三的传记正文"))
     monkeypatch.setattr(main_module, "resolve_system_prompt", amock(None))
+    monkeypatch.setattr(main_module, "render_text_or_image", _identity_render)
     event = FakeEvent(umo="default:GroupMessage:g1")
 
     run(plugin._bio_only(event, "default:GroupMessage:g1", "123"))

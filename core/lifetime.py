@@ -1760,6 +1760,7 @@ class HistoryService:
         now = datetime.now()
         year, week = now.isocalendar()[:2]
         period = f"window:{days}"
+        render_theme = str(self.plugin._cfg("render_theme", "classic_scroll") or "classic_scroll")
         key_parts = [
             period,
             days,
@@ -1773,6 +1774,7 @@ class HistoryService:
             privacy,
             self.plugin._cfg("render_mode", "t2i"),
             self.plugin._cfg("t2i_scale", "device"),
+            render_theme,
         ]
         if golden_quotes:
             key_parts.append(("quotes", golden_quotes))
@@ -1943,6 +1945,7 @@ class HistoryService:
                 ),
                 options={"scale": self.plugin._cfg("t2i_scale", "device")},
                 enable_cache=self.plugin._cfg("enable_render_cache", True),
+                theme=render_theme,
             )
         except Exception:
             logger.warning(

@@ -36,6 +36,56 @@ RENDER_MODE_T2I = "t2i"
 RENDER_MODE_PLAYWRIGHT = "playwright"
 RENDER_MODE_OFF = "off"
 
+#: 渲染主题常量 (render_theme 配置可选值)
+RENDER_THEME_CLASSIC = "classic_scroll"
+RENDER_THEME_GRIMOIRE = "dark_grimoire"
+RENDER_THEME_MODERN = "modern_card"
+RENDER_THEMES = (
+    RENDER_THEME_CLASSIC,
+    RENDER_THEME_GRIMOIRE,
+    RENDER_THEME_MODERN,
+)
+_THEME_ALIASES = {
+    "classic_scroll": RENDER_THEME_CLASSIC,
+    "classic": RENDER_THEME_CLASSIC,
+    "古籍": RENDER_THEME_CLASSIC,
+    "古籍米色": RENDER_THEME_CLASSIC,
+    "宣纸": RENDER_THEME_CLASSIC,
+    "dark_grimoire": RENDER_THEME_GRIMOIRE,
+    "grimoire": RENDER_THEME_GRIMOIRE,
+    "dark": RENDER_THEME_GRIMOIRE,
+    "深紫": RENDER_THEME_GRIMOIRE,
+    "深紫典雅": RENDER_THEME_GRIMOIRE,
+    "典雅": RENDER_THEME_GRIMOIRE,
+    "modern_card": RENDER_THEME_MODERN,
+    "modern": RENDER_THEME_MODERN,
+    "现代": RENDER_THEME_MODERN,
+    "清爽": RENDER_THEME_MODERN,
+    "清爽现代": RENDER_THEME_MODERN,
+}
+_THEME_META = {
+    RENDER_THEME_CLASSIC: {
+        "epigraph": "✦ 岁序更迭，群间旧事，皆录于卷 ✦",
+        "footer_title": "群史记 · 古籍书卷",
+    },
+    RENDER_THEME_GRIMOIRE: {
+        "epigraph": "✦ 星辉映卷，群间旧事，尽录于册 ✦",
+        "footer_title": "群史记 · 典雅夜卷",
+    },
+    RENDER_THEME_MODERN: {
+        "epigraph": "✦ 记录群聊高光时刻与共同记忆 ✦",
+        "footer_title": "群史记 · 群间史馆",
+    },
+}
+
+
+def normalize_render_theme(theme: str | None, default: str = RENDER_THEME_CLASSIC) -> str:
+    """Normalize a render theme name or Chinese alias to one of the 3 built-in themes."""
+    raw = str(theme or "").strip().lower()
+    if not raw:
+        return default if default in RENDER_THEMES else RENDER_THEME_CLASSIC
+    return _THEME_ALIASES.get(raw, default if default in RENDER_THEMES else RENDER_THEME_CLASSIC)
+
 #: T2I 默认截图选项 (对齐 AstrBot html_render 的 options, 即 Playwright screenshot API)
 _T2I_DEFAULT_OPTIONS: dict = {
     "type": "png",
@@ -252,22 +302,40 @@ def _inline(escaped: str) -> str:
 
 
 def render_html(
-    markdown_text: str, group_name: str, generated_at: str | None = None
+    markdown_text: str,
+    group_name: str,
+    generated_at: str | None = None,
+    *,
+    theme: str | None = None,
+    title_suffix: str = "群史记",
+    epigraph: str | None = None,
+    footer_title: str | None = None,
+    seal_char: str | None = None,
 ) -> str:
     """
     用 Jinja2 渲染 templates/chronicle.html；jinja2 缺失或渲染失败时，
     退化为对同一模板文件做字符串替换（内容已转义，不会注入）。
 
-    generated_at 缺省时使用当前日期 (YYYY年MM月DD日)。
+    支持三套内置主题：classic_scroll（古籍米色）/ dark_grimoire（深紫典雅）/
+    modern_card（清爽现代）。
     """
     content_html = markdown_to_html(markdown_text)
-    # 渲染层美化: 把 markdown 引用段落 (<p>&gt; ...</p>) 提升为咒术卡
+    # 渲染层美化: 把 markdown 引用段落 (<p>&gt; ...</p>) 提升为摘要/金句卡
     # blockquote (不改动 markdown_to_html 契约)
     content_html = _QUOTE_P_RE.sub(
         lambda m: f'<blockquote class="spell-card"><p>{m.group(1)}</p></blockquote>',
         content_html,
     )
     generated_at = generated_at or datetime.now().strftime("%Y年%m月%d日")
+    resolved_theme = normalize_render_theme(theme)
+    meta = _THEME_META[resolved_theme]
+    resolved_suffix = str(title_suffix or "群史记").strip() or "群史记"
+    resolved_epigraph = str(epigraph or meta["epigraph"])
+    resolved_footer = str(footer_title or meta["footer_title"])
+    resolved_seal = str(
+        seal_char
+        or ("传" if "传" in resolved_suffix else ("年" if "年" in resolved_suffix or "季" in resolved_suffix else "史"))
+    )[:2]
     try:
         from jinja2 import Environment, FileSystemLoader, select_autoescape
 
@@ -276,21 +344,55 @@ def render_html(
             autoescape=select_autoescape(enabled_extensions=("html",), default=True),
         )
         return env.get_template("chronicle.html").render(
-            group_name=group_name, content=content_html, generated_at=generated_at
+            group_name=group_name,
+            content=content_html,
+            generated_at=generated_at,
+            theme=resolved_theme,
+            title_suffix=resolved_suffix,
+            epigraph=resolved_epigraph,
+            footer_title=resolved_footer,
+            seal_char=resolved_seal,
         )
     except Exception as exc:  # noqa: BLE001 — 渲染失败必须降级，不能阻断调用方
         logger.warning(f"jinja2 模板渲染失败，使用降级模板: {exc}")
-        return _render_html_fallback(content_html, group_name, generated_at)
+        return _render_html_fallback(
+            content_html,
+            group_name,
+            generated_at,
+            theme=resolved_theme,
+            title_suffix=resolved_suffix,
+            epigraph=resolved_epigraph,
+            footer_title=resolved_footer,
+            seal_char=resolved_seal,
+        )
 
 
-def _render_html_fallback(content_html: str, group_name: str, generated_at: str) -> str:
+def _render_html_fallback(
+    content_html: str,
+    group_name: str,
+    generated_at: str,
+    *,
+    theme: str = RENDER_THEME_CLASSIC,
+    title_suffix: str = "群史记",
+    epigraph: str = "",
+    footer_title: str = "",
+    seal_char: str = "史",
+) -> str:
     """jinja2 不可用时的兜底：读同一模板文件做占位符替换。"""
+    meta = _THEME_META.get(theme, _THEME_META[RENDER_THEME_CLASSIC])
+    epigraph = epigraph or meta["epigraph"]
+    footer_title = footer_title or meta["footer_title"]
     try:
         with open(_TEMPLATE_PATH, encoding="utf-8") as f:
             tmpl = f.read()
         return (
             tmpl.replace("{{ group_name }}", html.escape(group_name))
             .replace("{{ generated_at }}", html.escape(generated_at))
+            .replace("{{ theme }}", html.escape(theme))
+            .replace("{{ title_suffix }}", html.escape(title_suffix))
+            .replace("{{ epigraph }}", html.escape(epigraph))
+            .replace("{{ footer_title }}", html.escape(footer_title))
+            .replace("{{ seal_char }}", html.escape(seal_char))
             .replace("{{ content|safe }}", content_html)
         )
     except OSError:
@@ -305,7 +407,7 @@ def _render_html_fallback(content_html: str, group_name: str, generated_at: str)
             "pre{background:#221543;padding:12px;border-left:4px solid #ff8ac2}"
             "blockquote{color:#ffb3d9;border-left:3px solid #ff8ac2;padding-left:12px}"
             "</style>"
-            f"</head><body><h1>{html.escape(group_name)}·群史记</h1>{content_html}</body></html>"
+            f"</head><body data-theme='{html.escape(theme)}'><h1>{html.escape(group_name)}·{html.escape(title_suffix)}</h1>{content_html}</body></html>"
         )
 
 
@@ -326,7 +428,12 @@ def _get_playwright_semaphore() -> asyncio.Semaphore:
 
 
 async def render_chronicle_image(
-    markdown_text: str, group_name: str, out_dir: str
+    markdown_text: str,
+    group_name: str,
+    out_dir: str,
+    *,
+    theme: str | None = None,
+    title_suffix: str = "群史记",
 ) -> str | None:
     """
     将 markdown 内容渲染为 PNG 图片并返回路径；任何失败返回 None（纯文本降级）。
@@ -346,7 +453,9 @@ async def render_chronicle_image(
     out_path: str | None = None
     browser = None
     try:
-        html_content = render_html(markdown_text, group_name)
+        html_content = render_html(
+            markdown_text, group_name, theme=theme, title_suffix=title_suffix
+        )
         os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, f"chronicle_{int(time.time())}.png")
         suffix = 1
@@ -391,6 +500,8 @@ async def render_text_or_image(
     html_render_func=None,
     render_fallback_playwright: bool = True,
     options: dict | None = None,
+    theme: str | None = None,
+    title_suffix: str = "群史记",
 ) -> tuple[str, str | None]:
     """
     便捷包装：返回 (text, image_path_or_None)。图片渲染失败时 image 为 None，
@@ -402,13 +513,24 @@ async def render_text_or_image(
         失败且 render_fallback_playwright=True 时回退本地 Playwright 渲染。
       - "playwright": 直接走本地 Playwright 渲染 (html_render 不参与)。
 
-    enable_cache=True (默认) 时按 hash(markdown+group) 缓存图片路径:
+    enable_cache=True (默认) 时按 hash(markdown+group+theme+title_suffix) 缓存图片路径:
     相同内容再次渲染直接复用已有文件, t2i 与 playwright 结果共用同一缓存键。
     """
     mode = str(render_mode or RENDER_MODE_T2I)
+    resolved_theme = normalize_render_theme(theme)
+    resolved_suffix = str(title_suffix or "群史记").strip() or "群史记"
     key = _render_cache_key(text, group_name) if enable_cache else None
     if key is not None:
-        key += ":" + mode + ":" + str((options or {}).get("scale", "device"))
+        key += (
+            ":"
+            + mode
+            + ":"
+            + str((options or {}).get("scale", "device"))
+            + ":"
+            + resolved_theme
+            + ":"
+            + resolved_suffix
+        )
     if key is not None and mode != RENDER_MODE_OFF:
         cached = _RENDER_CACHE.get(key)
         if cached and os.path.exists(cached):
@@ -418,14 +540,18 @@ async def render_text_or_image(
     if mode not in (RENDER_MODE_OFF, RENDER_MODE_PLAYWRIGHT):
         # t2i (未知模式按 t2i 处理): 具备 html_render 能力时优先
         if callable(html_render_func):
-            html_content = render_html(text, group_name)
+            html_content = render_html(
+                text, group_name, theme=resolved_theme, title_suffix=resolved_suffix
+            )
             image_path = await render_via_t2i(
                 html_render_func, html_content, out_dir, options=options
             )
         if not image_path and not render_fallback_playwright:
             return text, None
     if image_path is None and mode != RENDER_MODE_OFF:
-        image_path = await render_chronicle_image(text, group_name, out_dir)
+        image_path = await render_chronicle_image(
+            text, group_name, out_dir, theme=resolved_theme, title_suffix=resolved_suffix
+        )
     if image_path and key is not None:
         _RENDER_CACHE[key] = image_path
     return text, image_path

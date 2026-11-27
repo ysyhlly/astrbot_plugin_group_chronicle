@@ -930,3 +930,207 @@ async def history_page(context, umo, after, high, limit):
             }
         )
     return result
+
+
+async def query_memory_highlights(
+    context: Any,
+    umo: str,
+    member_id: str = "",
+    *,
+    since_ts: float = 0.0,
+    limit: int = 8,
+    max_msgs: int = 600,
+) -> dict[str, Any]:
+    """Read-only, gracefully-degrading memory & co-occurrence summary for annual reports.
+
+    Uses only public LM/Dynamics Memory hooks via detect_lm/ensure_ready/get_engine/
+    get_conversation_manager; never touches disk DB files directly and never raises.
+    """
+    empty: dict[str, Any] = {
+        "available": False,
+        "topics": [],
+        "co_members": [],
+        "message_count": 0,
+        "active_days": 0,
+        "sample_quotes": [],
+    }
+    try:
+        plugin = detect_lm(context)
+        if plugin is None or not await ensure_ready(plugin):
+            return empty
+        engine = get_engine(plugin)
+        conv_manager = get_conversation_manager(plugin)
+        topics: list[str] = []
+        seen_topics: set[str] = set()
+
+        # 1. Read memory summaries / episodic topics safely
+        if engine is not None:
+            raw_mems: Any = None
+            for method_name, kwargs_list in (
+                (
+                    "get_recent_memories",
+                    [
+                        {"session_id": umo, "limit": max(limit * 2, 16)},
+                        {"umo": umo, "limit": max(limit * 2, 16)},
+                        {"limit": max(limit * 2, 16)},
+                    ],
+                ),
+                (
+                    "retrieve",
+                    [
+                        {"query": str(member_id or "群聊回顾"), "session_id": umo, "top_k": limit},
+                        {"query": str(member_id or "群聊回顾"), "umo": umo, "limit": limit},
+                    ],
+                ),
+            ):
+                fn = getattr(engine, method_name, None)
+                if not callable(fn):
+                    continue
+                for kw in kwargs_list:
+                    try:
+                        res = fn(**kw)
+                        if hasattr(res, "__await__"):
+                            res = await res
+                        if res:
+                            raw_mems = res
+                            break
+                    except TypeError:
+                        continue
+                    except Exception:
+                        break
+                if raw_mems:
+                    break
+
+            mem_list = []
+            if isinstance(raw_mems, dict):
+                for k in ("memories", "items", "results", "episodes"):
+                    if isinstance(raw_mems.get(k), list):
+                        mem_list = raw_mems[k]
+                        break
+            elif isinstance(raw_mems, (list, tuple)):
+                mem_list = list(raw_mems)
+
+            for m in mem_list:
+                if isinstance(m, dict):
+                    txt = str(
+                        m.get("summary")
+                        or m.get("text")
+                        or m.get("content")
+                        or m.get("topic")
+                        or ""
+                    ).strip()
+                    ts = float(m.get("timestamp") or m.get("created_at") or 0.0)
+                else:
+                    txt = str(
+                        getattr(m, "summary", None)
+                        or getattr(m, "text", None)
+                        or getattr(m, "content", None)
+                        or ""
+                    ).strip()
+                    ts = float(
+                        getattr(m, "timestamp", 0.0)
+                        or getattr(m, "created_at", 0.0)
+                        or 0.0
+                    )
+                if not txt or (since_ts > 0 and ts > 0 and ts < since_ts):
+                    continue
+                clean_txt = " ".join(txt.split())[:120]
+                if clean_txt and clean_txt not in seen_topics:
+                    seen_topics.add(clean_txt)
+                    topics.append(clean_txt)
+                if len(topics) >= limit:
+                    break
+
+        # 2. Read recent messages for activity stats, co-occurring peers, and quote samples
+        msgs: list[Any] = []
+        if conv_manager is not None:
+            for method_name in ("get_recent_messages", "get_messages", "fetch_messages"):
+                fn = getattr(conv_manager, method_name, None)
+                if not callable(fn):
+                    continue
+                for args, kw in (
+                    ((umo,), {"limit": max_msgs}),
+                    ((), {"session_id": umo, "limit": max_msgs}),
+                    ((umo, max_msgs), {}),
+                ):
+                    try:
+                        res = fn(*args, **kw)
+                        if hasattr(res, "__await__"):
+                            res = await res
+                        if isinstance(res, list):
+                            msgs = res
+                            break
+                    except TypeError:
+                        continue
+                    except Exception:
+                        break
+                if msgs:
+                    break
+
+        from collections import Counter
+        from datetime import date
+
+        target_uid = str(member_id or "").strip()
+        msg_count = 0
+        days_set: set[Any] = set()
+        co_counts: Counter[str] = Counter()
+        names_map: dict[str, str] = {}
+        quote_samples: list[dict[str, str]] = []
+        window_rows: list[tuple[str, str, float, str]] = []
+
+        for m in msgs:
+            if isinstance(m, dict):
+                role = str(m.get("role") or "user")
+                uid = str(m.get("sender_id") or m.get("uid") or "").strip()
+                name = str(m.get("sender_name") or m.get("name") or uid).strip()
+                ts = float(m.get("timestamp") or m.get("ts") or 0.0)
+                content = str(m.get("content") or "").strip()
+            else:
+                role = str(getattr(m, "role", "user") or "user")
+                uid = str(getattr(m, "sender_id", "") or "").strip()
+                name = str(getattr(m, "sender_name", "") or uid).strip()
+                ts = float(getattr(m, "timestamp", 0.0) or 0.0)
+                content = str(getattr(m, "content", "") or "").strip()
+            if role != "user" or not uid:
+                continue
+            if since_ts > 0 and ts > 0 and ts < since_ts:
+                continue
+            if name:
+                names_map[uid] = name
+            window_rows.append((uid, name, ts, content))
+
+        for idx, (uid, _name, ts, content) in enumerate(window_rows):
+            if target_uid and uid != target_uid:
+                continue
+            msg_count += 1
+            if ts > 0:
+                try:
+                    days_set.add(date.fromtimestamp(ts))
+                except Exception:
+                    pass
+            if content:
+                quote_samples.append({"content": content})
+            if target_uid:
+                # Neighboring messages within 5 minutes indicate direct conversational co-occurrence
+                for j in range(max(0, idx - 3), min(len(window_rows), idx + 4)):
+                    other_uid, _other_name, other_ts, _ = window_rows[j]
+                    if other_uid and other_uid != target_uid:
+                        if ts <= 0 or other_ts <= 0 or abs(other_ts - ts) <= 300:
+                            co_counts[other_uid] += 1
+            else:
+                co_counts[uid] += 1
+
+        co_members = [
+            {"uid": uid, "name": names_map.get(uid, uid), "interactions": int(cnt)}
+            for uid, cnt in co_counts.most_common(10)
+        ]
+        return {
+            "available": True,
+            "topics": topics[:limit],
+            "co_members": co_members,
+            "message_count": msg_count,
+            "active_days": len(days_set),
+            "sample_quotes": quote_samples[:200],
+        }
+    except Exception:
+        return empty
