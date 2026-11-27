@@ -54,6 +54,7 @@ from importlib import import_module, reload
 from typing import Any
 
 from apscheduler.triggers.cron import CronTrigger
+
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.event.filter import PermissionType
