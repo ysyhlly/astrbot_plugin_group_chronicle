@@ -514,11 +514,15 @@ class GroupChroniclePlugin(Star):
                 or getattr(self, "culture", None) is None
             ):
                 return {
+                    "umo": clean_umo,
                     "enabled": False,
                     "supported": False,
+                    "writable": False,
+                    "mode": "unavailable",
                     "persona_id": persona_id,
                     "activity_today": 0,
                     "summary": "群文化服务未就绪",
+                    "detail": "群文化服务未就绪",
                     "version": 0,
                 }
             history_allowed = await self.history.allowed(clean_umo)
@@ -530,6 +534,7 @@ class GroupChroniclePlugin(Star):
 
             def _read_scope():
                 state = self.culture.store.state(clean_umo)
+                history_paused = self.history.store.is_group_paused(clean_umo)
                 entries, _ = self.culture.store.entries(clean_umo, limit=1000)
                 snapshot = (
                     self.culture._privacy_snapshot(
@@ -561,70 +566,99 @@ class GroupChroniclePlugin(Star):
                     ).fetchone()
                     if row:
                         activity_today += int(row[0] or 0)
-                return state, approved, pending, activity_today
+                return state, history_paused, approved, pending, activity_today
 
-            state, approved, pending, activity_today = await asyncio.to_thread(
-                _read_scope
-            )
+            (
+                state,
+                history_paused,
+                approved,
+                pending,
+                activity_today,
+            ) = await asyncio.to_thread(_read_scope)
             paused = bool(state.get("paused", 0))
             version = int(state.get("revision", 0))
             if self._is_excluded_by_core(clean_umo):
+                summary = "主控排除（群文化与史记采集已静默跳过）"
                 return {
+                    "umo": clean_umo,
                     "enabled": False,
                     "supported": False,
+                    "writable": False,
+                    "mode": "excluded_by_core",
                     "excluded_by_core": True,
                     "persona_id": persona_id,
                     "activity_today": activity_today,
-                    "summary": "主控排除（群文化与史记采集已静默跳过）",
+                    "summary": summary,
+                    "detail": summary,
                     "version": version,
                 }
             if not history_allowed:
+                summary = "不在允许群范围"
                 return {
+                    "umo": clean_umo,
                     "enabled": False,
                     "supported": False,
+                    "writable": False,
+                    "mode": "out_of_scope",
                     "excluded_by_core": False,
                     "persona_id": persona_id,
                     "activity_today": activity_today,
-                    "summary": "不在允许群范围",
+                    "summary": summary,
+                    "detail": summary,
                     "version": version,
                 }
             if not culture_global:
+                summary = "全局群文化整理未开启"
                 return {
+                    "umo": clean_umo,
                     "enabled": False,
                     "supported": False,
+                    "writable": False,
+                    "mode": "culture_disabled",
                     "persona_id": persona_id,
                     "activity_today": activity_today,
-                    "summary": "全局群文化整理未开启",
+                    "summary": summary,
+                    "detail": summary,
                     "version": version,
                 }
-            enabled = not paused
+            enabled = not (paused or history_paused)
             summary = (
                 f"已暂停整理 · 已公开 {approved} / 待核 {pending}"
-                if paused
+                if not enabled
                 else f"运行中 · 已公开 {approved} / 待核 {pending}"
             )
             return {
+                "umo": clean_umo,
                 "enabled": enabled,
                 "supported": True,
+                "writable": True,
+                "mode": "history+culture",
+                "history_paused": history_paused,
+                "culture_paused": paused,
                 "persona_id": persona_id,
                 "activity_today": activity_today,
                 "summary": summary,
+                "detail": summary,
                 "version": version,
             }
         except Exception:
             return {
+                "umo": str(umo or "").strip(),
                 "enabled": None,
                 "supported": False,
+                "writable": False,
+                "mode": "error",
                 "persona_id": "",
                 "activity_today": None,
                 "summary": "状态读取失败",
+                "detail": "状态读取失败",
                 "version": 0,
             }
 
     async def set_series_scope_enabled(
         self, umo: str, enabled: bool, expected_version: Any = None
     ) -> dict[str, Any]:
-        """Safely toggle per-group culture pause/resume without bypassing allowlist."""
+        """Atomically toggle per-group lifetime history & culture pause/resume with optimistic locking."""
         try:
             clean_umo = str(umo or "").strip()
             if (
@@ -635,17 +669,21 @@ class GroupChroniclePlugin(Star):
             ):
                 return {
                     "ok": False,
+                    "umo": clean_umo,
                     "enabled": False,
                     "version": 0,
+                    "reason": "not_ready",
                     "summary": "群文化服务未就绪",
                 }
             if self._is_excluded_by_core(clean_umo):
                 state = await asyncio.to_thread(self.culture.store.state, clean_umo)
                 return {
                     "ok": False,
+                    "umo": clean_umo,
                     "enabled": False,
                     "excluded_by_core": True,
                     "version": int(state.get("revision", 0)),
+                    "reason": "excluded_by_core",
                     "summary": "主控排除（当前群已被主控排除）",
                 }
             if not await self.history.allowed(clean_umo) or not bool(
@@ -654,8 +692,10 @@ class GroupChroniclePlugin(Star):
                 state = await asyncio.to_thread(self.culture.store.state, clean_umo)
                 return {
                     "ok": False,
+                    "umo": clean_umo,
                     "enabled": False,
                     "version": int(state.get("revision", 0)),
+                    "reason": "scope_or_culture_disabled",
                     "summary": "当前群不在允许范围或全局群文化未启用",
                 }
             target_paused = 0 if bool(enabled) else 1
@@ -666,17 +706,36 @@ class GroupChroniclePlugin(Star):
                         "SELECT revision, paused FROM culture_groups WHERE umo=?",
                         (clean_umo,),
                     ).fetchone()
+                    g_row = db.execute(
+                        "SELECT paused FROM groups WHERE umo=?",
+                        (clean_umo,),
+                    ).fetchone()
                     cur_rev = int(row["revision"]) if row else 0
                     cur_paused = bool(row["paused"]) if row else False
+                    cur_hist_paused = bool(g_row["paused"]) if g_row else False
                     if expected_version is not None and str(cur_rev) != str(
                         expected_version
                     ):
-                        return False, True, not cur_paused, cur_rev
+                        return (
+                            False,
+                            True,
+                            not (cur_paused or cur_hist_paused),
+                            cur_rev,
+                        )
                     self.culture.store.bump(db, clean_umo)
                     db.execute(
                         "UPDATE culture_groups SET paused=? WHERE umo=?",
                         (target_paused, clean_umo),
                     )
+                    db.execute(
+                        "INSERT OR IGNORE INTO groups(umo) VALUES(?)",
+                        (clean_umo,),
+                    )
+                    db.execute(
+                        "UPDATE groups SET paused=? WHERE umo=?",
+                        (target_paused, clean_umo),
+                    )
+                    self.history.store._bump(db, clean_umo)
                     after = db.execute(
                         "SELECT revision, paused FROM culture_groups WHERE umo=?",
                         (clean_umo,),
@@ -693,6 +752,8 @@ class GroupChroniclePlugin(Star):
                 return {
                     "ok": False,
                     "conflict": True,
+                    "reason": "version_conflict",
+                    "umo": clean_umo,
                     "enabled": now_enabled,
                     "version": new_rev,
                     "summary": "状态已变更，请刷新重试",
@@ -709,17 +770,80 @@ class GroupChroniclePlugin(Star):
                 pass
             return {
                 "ok": ok,
+                "umo": clean_umo,
                 "enabled": now_enabled,
+                "history_paused": not now_enabled,
+                "culture_paused": not now_enabled,
                 "version": new_rev,
+                "reason": "",
                 "summary": "运行中" if now_enabled else "已暂停整理",
             }
         except Exception:
             return {
                 "ok": False,
+                "umo": str(umo or "").strip(),
                 "enabled": False,
                 "version": 0,
+                "reason": "toggle_failed",
                 "summary": "切换群文化状态失败",
             }
+
+    def activate_series_runtime(self) -> dict[str, Any]:
+        """Enable lifetime history & culture runtime gates for Setup Wizard step 4."""
+        if self._terminating or getattr(self, "history", None) is None:
+            return {
+                "ok": False,
+                "plugin_id": "astrbot_plugin_group_chronicle",
+                "ready": False,
+                "history_enabled": False,
+                "culture_enabled": False,
+                "changed": False,
+                "reason": "not_ready",
+            }
+        changed = False
+        try:
+            if not bool(self._cfg("history_enabled", True)):
+                self.config["history_enabled"] = True
+                changed = True
+            if not bool(self._cfg("culture_enabled", False)):
+                self.config["culture_enabled"] = True
+                changed = True
+            save_fn = getattr(self.config, "save_config", None)
+            if changed and callable(save_fn):
+                save_fn()
+        except Exception as exc:
+            logger.warning("activate_series_runtime failed to persist config: %s", exc)
+            return {
+                "ok": False,
+                "plugin_id": "astrbot_plugin_group_chronicle",
+                "ready": True,
+                "history_enabled": bool(self._cfg("history_enabled", True)),
+                "culture_enabled": bool(self._cfg("culture_enabled", False)),
+                "changed": changed,
+                "reason": f"config_error:{type(exc).__name__}",
+            }
+        try:
+            mod = self._series_panels_mod()
+            if mod is not None and callable(
+                getattr(mod, "invalidate_summary_cache", None)
+            ):
+                mod.invalidate_summary_cache("astrbot_plugin_group_chronicle")
+        except Exception:
+            pass
+        try:
+            asyncio.get_running_loop()
+            self._spawn_bg(self.history.run_cycle(), label="series-runtime-activate")
+        except RuntimeError:
+            pass
+        return {
+            "ok": True,
+            "plugin_id": "astrbot_plugin_group_chronicle",
+            "ready": True,
+            "history_enabled": bool(self._cfg("history_enabled", True)),
+            "culture_enabled": bool(self._cfg("culture_enabled", False)),
+            "changed": changed,
+            "reason": "",
+        }
 
     async def series_search_items(
         self, query: str, scope: str = "", limit: int = 8
@@ -1125,17 +1249,73 @@ class GroupChroniclePlugin(Star):
         }
 
     async def get_culture_context(
-        self, *, scope, member, query="", kind="search", limit=3
-    ):
-        """Read-only v1 public interface. Consumers must revalidate before sending."""
-        result = await self.culture.query(scope, member, query, kind, limit)
-        privacy = await asyncio.to_thread(self.history.privacy_key, scope)
+        self,
+        umo: str | None = None,
+        query: str = "",
+        limit: int = 6,
+        *,
+        scope: str | None = None,
+        member: str | None = None,
+        kind: str = "search",
+    ) -> dict[str, Any]:
+        """Read-only v1 public interface returning approved, verified group slang entries.
+
+        Supports both series callers ``get_culture_context(umo, query="", limit=6)``
+        and v1 receipt callers ``get_culture_context(scope=..., member=..., query=..., kind=..., limit=...)``.
+        """
+        resolved_scope = str(scope if scope is not None else (umo or "")).strip()
+        resolved_member = str(member if member is not None else "system").strip() or "system"
+        clean_query = str(query or "").strip()[:160]
+        try:
+            bound = max(1, min(int(limit or 6), 20))
+        except (TypeError, ValueError):
+            bound = 6
+        if (
+            self._terminating
+            or not resolved_scope
+            or getattr(self, "culture", None) is None
+            or getattr(self, "history", None) is None
+        ):
+            return {
+                "schema_version": 1,
+                "available": False,
+                "scope": resolved_scope,
+                "reason": "群文化服务未就绪",
+                "entries": [],
+                "terms": [],
+                "summary": "",
+            }
+        result = await self.culture.query(
+            resolved_scope, resolved_member, clean_query, kind, bound
+        )
+        privacy = await asyncio.to_thread(self.history.privacy_key, resolved_scope)
+        entries = list(result.get("entries") or [])
+        terms = [
+            {
+                "id": e["id"],
+                "name": e["name"],
+                "meaning": e["meaning"],
+                "usage": e.get("usage", ""),
+                "aliases": [
+                    a["name"]
+                    for a in e.get("aliases", [])
+                    if isinstance(a, dict) and a.get("name")
+                ],
+            }
+            for e in entries
+        ]
+        summary = "；".join(
+            f"「{t['name']}」：{t['meaning']}" for t in terms if t["name"] and t["meaning"]
+        )
+        result["scope"] = resolved_scope
+        result["terms"] = terms
+        result["summary"] = summary
         result["receipt"] = {
             "schema_version": 1,
-            "scope": scope,
-            "member": member,
+            "scope": resolved_scope,
+            "member": resolved_member,
             "privacy": privacy,
-            "entries": [(e["id"], e["revision"]) for e in result["entries"]],
+            "entries": [(e["id"], e["revision"]) for e in entries],
         }
         return result
 
@@ -1202,8 +1382,29 @@ class GroupChroniclePlugin(Star):
     @filter.command("文化隐藏")
     async def culture_hide(self, event: AstrMessageEvent, entry_id: str = ""):
         try:
+            tail = (
+                str(getattr(event, "message_str", ""))
+                .lstrip("/")
+                .partition("文化隐藏")[2]
+                .strip()
+            )
             yield event.plain_result(
-                await self.culture.command(event, "文化隐藏", entry_id)
+                await self.culture.command(event, "文化隐藏", tail or entry_id)
+            )
+        except (ValueError, PermissionError) as exc:
+            yield event.plain_result(str(exc))
+
+    @filter.command("文化恢复")
+    async def culture_restore(self, event: AstrMessageEvent, entry_id: str = ""):
+        try:
+            tail = (
+                str(getattr(event, "message_str", ""))
+                .lstrip("/")
+                .partition("文化恢复")[2]
+                .strip()
+            )
+            yield event.plain_result(
+                await self.culture.command(event, "文化恢复", tail or entry_id)
             )
         except (ValueError, PermissionError) as exc:
             yield event.plain_result(str(exc))
@@ -1665,6 +1866,7 @@ class GroupChroniclePlugin(Star):
                 style=style,
                 skip_check=skip_check,
                 topic=topic,
+                progress=progress,
             )
             if skipped:
                 raise _SkipWeek()
@@ -1911,14 +2113,25 @@ class GroupChroniclePlugin(Star):
         }
 
     def _llm_provider_id(self) -> str | None:
-        """插件配置的 LLM Provider ID; 空字符串时只读继承 Chat Dynamics 默认回复模型。"""
+        """插件配置的 LLM Provider ID; 空字符串时只读继承 Chat Dynamics 共享模型配置。"""
         pid = str(self._cfg("llm_provider_id", "") or "").strip()
         if not pid:
             mod = self._series_panels_mod()
-            if mod is not None and callable(getattr(mod, "resolve_series_provider", None)):
-                pid = mod.resolve_series_provider(
-                    getattr(self, "context", None), "", role="reply"
-                )
+            ctx = getattr(self, "context", None)
+            if mod is not None and callable(
+                getattr(mod, "get_series_shared_config", None)
+            ):
+                shared = mod.get_series_shared_config(ctx)
+                if isinstance(shared, dict):
+                    pid = str(
+                        shared.get("reply_provider")
+                        or shared.get("light_analysis_provider")
+                        or ""
+                    ).strip()
+            if not pid and mod is not None and callable(
+                getattr(mod, "resolve_series_provider", None)
+            ):
+                pid = mod.resolve_series_provider(ctx, "", role="reply")
         return pid or None
 
     async def _check_group_scope(self, umo: str) -> tuple[bool, str]:
@@ -2016,6 +2229,38 @@ class GroupChroniclePlugin(Star):
     # ------------------------------------------------------------------
     # 命令处理器
     # ------------------------------------------------------------------
+
+    @filter.command("史记帮助", alias={"群史记帮助"})
+    async def chronicle_help_command(self, event: AstrMessageEvent):
+        """输出分级帮助：区分「群友常用指令」与「管理员审核/运维指令」。"""
+        lines = [
+            "📜 群史记 · 分级指令帮助",
+            "",
+            "【群友常用指令】",
+            "• 群史记 [天数|月|年] [风格=正史|八卦|文言] [强制] —— 生成或查看本群史记",
+            "• 史记列表 / 史记查看 [序号] / 史记对比 —— 回看与对比往期卷册",
+            "• 史记导出 [序号] / 史记网页 [序号] —— 导出 Markdown 或网页文件",
+            "• 群大事 [全部|月|年|天数] —— 查看已入史的本群大事记",
+            "• 人物等级 [@成员] / 人物传 [@成员] / 影响力榜 —— 查看贡献等级、传记与排行",
+            "• 记一笔 标题｜经过与结果｜日期=YYYY-MM-DD —— 提交群大事线索（支持 @参与者）",
+            "• 史记更正 <事件ID> <建议> —— 向管理员提交事件更正请求",
+            "• 群文化 [关键词] / 梗溯源 <词或ID> / 文化纠正 <ID> <说明> —— 查询群梗与黑话",
+            "• 史记隐藏 [事件ID] [全局] / 史记恢复 [事件ID] [全局] —— 预览确认隐藏与可审计恢复",
+            "• 文化隐藏 <ID> [全局] / 文化恢复 <ID> [全局] —— 预览确认隐藏文化词条与可审计恢复",
+            "  （注：隐藏默认仅作用于本插件，加「全局」可同步静音/解除群间记忆与群间学习）",
+            "• 史记选题 / 史记选票 <1-3> —— 参与本周选题投票（需开启 enable_vote）",
+            "",
+            "【管理员审核 / 运维指令】",
+            "• 史记待审 [事件ID] —— 私发待审事件与更正请求详情（不公开到群内）",
+            "• 史记确认 <ID> / 史记驳回 <ID> [理由] —— 审核入史或驳回候选事件",
+            "• 史记合并 <保留ID> <被合并ID> —— 将重复/续记事件并入同一事件",
+            "• 史记修订 <ID> 新经过｜说明=理由 [｜重要度=1~3｜核心=UID] —— 审计修订事件",
+            "• 史记恢复 @成员 [全局] / 文化恢复 <ID> [全局] —— 管理员可恢复任意已隐藏记录",
+            "• 史记进度 / 史记sid —— 查看回溯水位、每日额度与当前群 UMO 标识",
+            "• 史记周推 / 史记续写 / 史记选题公布 / 宇宙史记 —— 定时推送、续写与跨群综合",
+            "• 文化工作台：在 AstrBot 面板打开「群文化沿革」WebUI 可审核、撤销隐藏与手动整理 1 批。",
+        ]
+        yield event.plain_result("\n".join(lines))
 
     @filter.command("群史记")
     async def chronicle_command(self, event: AstrMessageEvent, days: str | None = None):
@@ -2966,6 +3211,7 @@ class GroupChroniclePlugin(Star):
                 True,
                 str(prev.get("group_name") or "群聊"),
                 skip_check=True,
+                progress=self._make_progress(umo),
             )
             if skipped:
                 await self._reply(
@@ -3155,6 +3401,11 @@ class GroupChroniclePlugin(Star):
 
     async def _weekly_push_one(self, umo: str) -> None:
         """单群推送: 与命令路径共用生成逻辑, 但跳过时静默、发送走 context。"""
+        if getattr(self, "history", None) is not None and await asyncio.to_thread(
+            self.history.store.is_group_paused, umo
+        ):
+            logger.info(f"群 {umo} 已按群暂停，跳过每周史记推送")
+            return
         lock = self._gen_locks.setdefault(umo, asyncio.Lock())
         async with lock:
             started = time.monotonic()

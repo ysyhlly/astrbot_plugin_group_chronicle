@@ -1189,6 +1189,50 @@ summary:focus-visible {
   .gc-drawer-scroll {
     padding: 14px 14px max(28px, env(safe-area-inset-bottom));
   }
+
+  .gc-quota-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.gc-quota-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 10px 0 14px;
+}
+
+.gc-quota-card {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--gc-subtle);
+  border: 1px solid var(--gc-line);
+  min-width: 0;
+}
+
+.gc-quota-label {
+  font-size: 11.5px;
+  color: var(--gc-muted);
+}
+
+.gc-quota-value {
+  font-size: 15px;
+  font-weight: 650;
+  color: var(--gc-ink);
+}
+
+.gc-quota-sub {
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+
+.gc-restore-panel {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--gc-line);
 }
 
 @media (prefers-reduced-motion: reduce) {

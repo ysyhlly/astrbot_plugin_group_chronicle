@@ -2,8 +2,8 @@ import {confirmAction,getSharedScope,msg,setSharedScope,setText} from './series-
 
 const $=id=>document.getElementById(id);
 const states={approved:'已公开',pending:'待审核',disputed:'待纠正',rejected:'已驳回',hidden:'已隐藏',merged:'已合并'};
-const actions={approve:'审核通过',edit:'修订',reject:'驳回',hide:'隐藏',correct:'提出纠正',merge:'合并',evidence:'追加证据'};
-let epoch=0,detailEpoch=0,page=1,reviewPage=1,selected=null,mergeTarget=null,busy=false,currentTab='library',lastTrigger=null;
+const actions={approve:'审核通过',edit:'修订',reject:'驳回',hide:'隐藏',restore:'撤销隐藏',correct:'提出纠正',merge:'合并',evidence:'追加证据'};
+let epoch=0,detailEpoch=0,page=1,reviewPage=1,selected=null,mergeTarget=null,busy=false,currentTab='library',lastTrigger=null,overviewEnabled=false;
 
 const el=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=String(text);if(cls)n.className=cls;return n;};
 const date=t=>t?new Date(t*1000).toLocaleString('zh-CN'):'未知';
@@ -115,6 +115,14 @@ function entryCard(e){
     btn.onclick=()=>showDetail(e.id,btn).catch(err=>notice(err.message,true));
     foot.append(btn);
     box.append(foot);
+  }else if(e.status==='hidden'&&e.can_restore){
+    const foot=el('div',undefined,'entry-foot');
+    foot.append(el('span','隐私隐藏中，支持审计恢复','entry-usage muted'));
+    const btn=el('button','撤销隐藏/恢复公开','entry-open-btn');
+    btn.type='button';
+    btn.onclick=()=>showDetail(e.id,btn).catch(err=>notice(err.message,true));
+    foot.append(btn);
+    box.append(foot);
   }
   return box;
 }
@@ -144,6 +152,38 @@ async function loadList(){
   if(!review)$('page-number').textContent=String(page);
 }
 
+function renderQuotaGrid(quota){
+  if(!quota||typeof quota!=='object')return null;
+  const grid=el('div',undefined,'gc-quota-grid');
+  const cards=[
+    {
+      label:'今日总抽取额度',
+      value:`已用 ${quota.total_used} / ${quota.daily_limit}`,
+      sub:`剩余 ${quota.total_remaining} 次（${quota.day||'今日'}）`,
+    },
+    {
+      label:'群史抽取',
+      value:`已用 ${quota.history_used} 次`,
+      sub:`今日可用剩余 ${quota.history_remaining}（保底预留 ${quota.history_reserved}）`,
+    },
+    {
+      label:'文化整理',
+      value:`已用 ${quota.culture_used} / ${quota.culture_limit}`,
+      sub:`今日文化剩余 ${quota.culture_remaining} 次`,
+    },
+  ];
+  for(const c of cards){
+    const card=el('div',undefined,'gc-quota-card');
+    card.append(
+      el('span',c.label,'gc-quota-label'),
+      el('strong',c.value,'gc-quota-value tabular-nums'),
+      el('span',c.sub,'gc-quota-sub muted tabular-nums'),
+    );
+    grid.append(card);
+  }
+  return grid;
+}
+
 async function loadProgress(){
   if(!$('scope').value)return;
   const ticket=++epoch;
@@ -153,6 +193,8 @@ async function loadProgress(){
   box.replaceChildren();
   const statusPill=el('p',d.state.paused?'本群已暂停整理':'本群未暂停；按全局开关及允许范围运行',`gc-progress-status${d.state.paused?' is-paused':''}`);
   box.append(statusPill);
+  const quotaGrid=renderQuotaGrid(d.quota);
+  if(quotaGrid)box.append(quotaGrid);
   const j=d.job;
   if(!j){
     box.append(el('p','尚未开始。请确认全局开关、长期群史范围和记忆来源。','muted'));
@@ -173,11 +215,16 @@ async function loadProgress(){
   if(d.error||j?.error)box.append(el('p',d.error||j.error,'danger'));
   $('pause').disabled=Boolean(d.state.paused);
   $('resume').disabled=!d.state.paused;
+  const runOnceBtn=$('run-once');
+  if(runOnceBtn)runOnceBtn.disabled=!overviewEnabled||Boolean(d.state.paused);
 }
 
 function clearScopeContent(){
   for(const id of ['entries','review-entries','count','review-count','page-number','progress-content'])$(id).replaceChildren();
-  for(const id of ['prev','next','review-prev','review-next','pause','resume'])$(id).disabled=true;
+  for(const id of ['prev','next','review-prev','review-next','pause','resume','run-once']){
+    const n=$(id);
+    if(n)n.disabled=true;
+  }
 }
 
 async function refresh(){
@@ -218,9 +265,14 @@ async function showDetail(id,triggerEl=null){
 
   const box=$('detail-body');
   box.replaceChildren();
+  const canRestore=Boolean(selected.unavailable&&selected.status==='hidden'&&selected.can_restore);
+  const restorePanel=$('restore-panel');
+  if(restorePanel)restorePanel.hidden=!canRestore;
   $('moderation').hidden=Boolean(selected.unavailable)||selected.status==='merged';
   if(selected.unavailable){
-    box.append(el('p','资料已不可用，请刷新词库。'));
+    box.append(el('p',canRestore?'该词条当前处于隐私隐藏状态；为保护隐私暂不展示原文。确认后可在下方撤销隐藏并恢复公开。':'资料已不可用，请刷新词库。'));
+    const restoreNote=$('restore-note');
+    if(restoreNote)restoreNote.value='';
     const scroll=$('detail-scroll');
     if(scroll)scroll.scrollTop=0;
     $('detail').focus({preventScroll:true});
@@ -401,6 +453,63 @@ for(const action of ['pause','resume']){
   });
 }
 
+const runOnceBtnEl=$('run-once');
+if(runOnceBtnEl){
+  runOnceBtnEl.onclick=run(async()=>{
+    if(busy||!$('scope').value)return;
+    const scope=$('scope').value,ticket=epoch;
+    const current=()=>scope===$('scope').value&&ticket===epoch&&currentTab==='progress';
+    busy=true;
+    runOnceBtnEl.disabled=true;
+    notice('正在手动整理/重试 1 批，请稍候…');
+    try{
+      const res=await request('run_once',{batches:1,verification_extra_quota:0});
+      if(!current())return;
+      const steps=Array.isArray(res?.steps)?res.steps:[];
+      const advanced=steps.some(s=>s&&s.advanced);
+      const stepErr=steps.find(s=>s&&s.error)?.error||'';
+      if(advanced){
+        notice(`已完成 1 批整理（今日总额度 ${res.used_before} → ${res.used_after}）。`);
+      }else if(stepErr){
+        notice(`本批整理未推进：${stepErr}`,true);
+      }else{
+        notice(`暂无可推进的新批次或今日额度已满（当前已用 ${res.used_after}/${res.restored_limit}）。`);
+      }
+      await loadProgress();
+    }catch(e){if(current())throw e;}
+    finally{
+      busy=false;
+      if(current())runOnceBtnEl.disabled=!overviewEnabled||$('pause').disabled;
+    }
+  });
+}
+
+const restoreBtnEl=$('restore-entry');
+if(restoreBtnEl){
+  restoreBtnEl.onclick=run(async()=>{
+    if(busy||!selected)return;
+    const item=selected,scope=$('scope').value,tab=currentTab;
+    const note=($('restore-note')?.value||'').trim()||'管理员撤销隐藏恢复公开';
+    let ticket=epoch,detailTicket=detailEpoch;
+    const current=()=>scope===$('scope').value&&tab===currentTab&&ticket===epoch&&detailTicket===detailEpoch;
+    busy=true;
+    try{
+      await request('action',{id:item.id,revision:item.revision,action:'restore',note});
+      if(!current())return;
+      const loading=refresh();
+      ticket=epoch;
+      detailTicket=detailEpoch;
+      await loading;
+      if(!current())return;
+      const detail=showDetail(item.id);
+      detailTicket=detailEpoch;
+      await detail;
+      if(current())notice('撤销隐藏已保存，词条已恢复。');
+    }catch(e){if(current())throw e;}
+    finally{busy=false;}
+  });
+}
+
 document.querySelectorAll('[data-action]').forEach(b=>b.onclick=run(async()=>{
   const action=b.dataset.action;
   const patch={meaning:$('edit-meaning').value,usage:$('edit-usage').value,origin_text:$('edit-origin').value};
@@ -429,7 +538,11 @@ try{
   const bridge=(window.DynamicsPanelBridge || window.AstrBotPluginPage);
   if(bridge?.ready)await bridge.ready();
   const overview=await api('culture_overview');
-  const connText=`${overview.enabled?'文化整理已启用':'文化整理未启用'} · 记忆${overview.memory} · ${overview.learning?'学习线索已接入':'学习线索可选，未接入'} · 共用每日 ${overview.daily_limit} 次抽取额度`;
+  overviewEnabled=Boolean(overview.enabled);
+  const quotaHint=overview.quota
+    ?`今日已用 ${overview.quota.total_used}/${overview.quota.daily_limit}（剩余 ${overview.quota.total_remaining}）`
+    :`共用每日 ${overview.daily_limit} 次抽取额度`;
+  const connText=`${overview.enabled?'文化整理已启用':'文化整理未启用'} · 记忆${overview.memory} · ${overview.learning?'学习线索已接入':'学习线索可选，未接入'} · ${quotaHint}`;
   $('connection').textContent=connText;
   $('connection').title=connText;
   const placeholder=el('option');

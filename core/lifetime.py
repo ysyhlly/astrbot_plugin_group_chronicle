@@ -38,6 +38,7 @@ from astrbot.api import logger
 from . import lm_bridge
 from .archive_store import ArchiveStore, EditionStore, encode, private_text
 from .generation import CHRONICLE_STYLE_INSTRUCTIONS
+from .influence import relation_pairs
 from .llm_call import (
     budget_busy_retry_after,
     call_llm,
@@ -45,6 +46,7 @@ from .llm_call import (
     is_budget_busy_error,
 )
 from .persona import resolve_system_prompt
+from .quotes import extract_quotes
 from .render import render_text_or_image
 
 
@@ -616,6 +618,7 @@ class HistoryService:
         self.operations = {}
         self._poison_counts = {}
         self._cycle_turn = 0
+        self.pending_hides = {}
 
     def _series_tz(self):
         return resolve_series_timezone(getattr(self.plugin, "context", None))
@@ -943,6 +946,8 @@ class HistoryService:
         umo = observation["umo"]
         if not await self.allowed(umo, cfg):
             return
+        if await asyncio.to_thread(self.store.is_group_paused, umo):
+            return
         if observation.get("self_id"):
             self.bot_ids.setdefault(umo.split(":", 1)[0], set()).add(
                 observation["self_id"]
@@ -1197,6 +1202,8 @@ class HistoryService:
         """
         lock = self.fact_locks.setdefault(umo, asyncio.Lock())
         if lock.locked() or not await self.allowed(umo):
+            return False
+        if await asyncio.to_thread(self.store.is_group_paused, umo):
             return False
         async with lock:
             task = asyncio.current_task()
@@ -1606,6 +1613,7 @@ class HistoryService:
         style=None,
         skip_check=True,
         topic=None,
+        progress=None,
     ):
         """Compose and persist an edition from admitted facts only.
 
@@ -1618,12 +1626,24 @@ class HistoryService:
             style: Optional prose style.
             skip_check: Suppress already delivered unchanged weekly output.
             topic: Optional writing topic.
+            progress: Optional async/sync callback receiving staged progress text.
 
         Returns:
             Text and optional image path, plus a cache-reuse flag.
         """
+        async def _emit_progress(message: str) -> None:
+            if progress is None:
+                return
+            try:
+                res = progress(message)
+                if inspect.isawaitable(res):
+                    await res
+            except Exception:
+                logger.debug("Lifetime report progress callback failed", exc_info=True)
+
         if not await self.allowed(umo):
             raise ValueError("本群长期记录已停用或不在允许范围")
+        await _emit_progress("⏳ [1/5] 正在读取本群长期档案与入史事件…")
         days = int(days or self.plugin._cfg("chronicle_days", 7))
         since = time.time() - days * 86400
         snapshot = await asyncio.to_thread(self.store.snapshot, umo, since=since)
@@ -1657,33 +1677,110 @@ class HistoryService:
                 }
                 for uid in top_uids
             ]
-            return priv, top_uids, idents
+            hidden_uids = {m["uid"] for m in self.store.hidden(umo)}
+            return priv, top_uids, idents, hidden_uids
 
-        privacy, top, identities = await asyncio.to_thread(_prepare_report_key_inputs)
+        privacy, top, identities, hidden_uids = await asyncio.to_thread(
+            _prepare_report_key_inputs
+        )
+
+        chosen = sorted(
+            facts, key=lambda e: (-e["importance"], e["event_at"], e["id"])
+        )[:60]
+        chosen.sort(key=lambda e: (e["event_at"], e["id"]))
+        material = bounded_facts(chosen, 14000)
+
+        # Integrate golden quotes / approved culture slang / relation arc cleanly
+        # while honoring privacy boundaries and keeping empty enrichments omitted.
+        golden_quotes: list[str] = []
+        if self.plugin._cfg("enable_golden_quotes", True):
+            quote_sources = [
+                {"content": str(s.get("excerpt") or "")}
+                for f in chosen
+                for s in f.get("sources", [])
+                if isinstance(s, dict) and s.get("excerpt")
+            ]
+            golden_quotes = extract_quotes(quote_sources, max_quotes=5)
+
+        culture_slang: list[dict[str, str]] = []
+        if self.plugin._cfg("enable_slang", True) and self.plugin._cfg(
+            "culture_enabled", False
+        ):
+            culture_svc = getattr(self.plugin, "culture", None)
+            if culture_svc is not None:
+                try:
+                    c_res = await culture_svc.query(umo, "system", "", "search", limit=6)
+                    for item in (c_res or {}).get("entries") or []:
+                        name = str(item.get("name") or "").strip()[:60]
+                        meaning = str(item.get("meaning") or "").strip()[:160]
+                        if name and meaning:
+                            culture_slang.append({"name": name, "meaning": meaning})
+                except Exception:
+                    logger.debug(
+                        "Failed to fetch culture slang for lifetime report",
+                        exc_info=True,
+                    )
+
+        relation_arc_section = ""
+        if self.plugin._cfg("enable_relation_arc", True):
+            try:
+                raw_pairs = await relation_pairs(
+                    self.plugin.context, umo, top_k=3, window_days=days
+                )
+                filtered_pairs = [
+                    (str(a), str(b), float(score))
+                    for a, b, score in (raw_pairs or [])
+                    if str(a) not in hidden_uids and str(b) not in hidden_uids
+                ][:3]
+                if filtered_pairs:
+                    pair_uids = {uid for a, b, _ in filtered_pairs for uid in (a, b)}
+                    pair_members = await asyncio.to_thread(
+                        self.store.members_by_uids, umo, pair_uids
+                    )
+
+                    def _rel_label(score: float) -> str:
+                        if score >= 3:
+                            return "紧密互动"
+                        if score >= 1:
+                            return "有来往"
+                        return "偶有交集"
+
+                    rel_lines = ["## 本期关系弧"]
+                    for a, b, score in filtered_pairs:
+                        na = (pair_members.get(a) or {}).get("name") or a
+                        nb = (pair_members.get(b) or {}).get("name") or b
+                        rel_lines.append(f"- {na} ⇄ {nb}（{_rel_label(score)}）")
+                    relation_arc_section = "\n".join(rel_lines)
+            except Exception:
+                logger.debug(
+                    "Failed to compute relation arc for lifetime report",
+                    exc_info=True,
+                )
+
         now = datetime.now()
         year, week = now.isocalendar()[:2]
         period = f"window:{days}"
-        key = (
-            "chronicle:"
-            + hashlib.sha256(
-                encode(
-                    [
-                        period,
-                        days,
-                        facts,
-                        top,
-                        identities,
-                        self.rules(),
-                        style,
-                        sp,
-                        topic,
-                        privacy,
-                        self.plugin._cfg("render_mode", "t2i"),
-                        self.plugin._cfg("t2i_scale", "device"),
-                    ]
-                ).encode()
-            ).hexdigest()
-        )
+        key_parts = [
+            period,
+            days,
+            facts,
+            top,
+            identities,
+            self.rules(),
+            style,
+            sp,
+            topic,
+            privacy,
+            self.plugin._cfg("render_mode", "t2i"),
+            self.plugin._cfg("t2i_scale", "device"),
+        ]
+        if golden_quotes:
+            key_parts.append(("quotes", golden_quotes))
+        if culture_slang:
+            key_parts.append(("slang", culture_slang))
+        if relation_arc_section:
+            key_parts.append(("relation_arc", relation_arc_section))
+        key = "chronicle:" + hashlib.sha256(encode(key_parts).encode()).hexdigest()
         facts_key = key
         cached = await asyncio.to_thread(self.store.cache, umo, key)
         if cached and not force:
@@ -1692,11 +1789,6 @@ class HistoryService:
                 cached.get("image_path"),
                 bool(skip_check and cached.get("delivery_complete")),
             )
-        chosen = sorted(
-            facts, key=lambda e: (-e["importance"], e["event_at"], e["id"])
-        )[:60]
-        chosen.sort(key=lambda e: (e["event_at"], e["id"]))
-        material = bounded_facts(chosen, 14000)
 
         # Resume from persisted prose_ready draft when facts_key & privacy boundary match.
         draft = (
@@ -1717,6 +1809,9 @@ class HistoryService:
             and isinstance(draft.get("prose_text"), str)
             and draft["prose_text"].strip()
         ):
+            await _emit_progress(
+                f"⏳ [2/5] 已加载 {len(facts)} 件入史大事，复用阶段草稿继续整理…"
+            )
             prose_text = draft["prose_text"]
             raw_bios = draft.get("bios")
             if isinstance(raw_bios, dict):
@@ -1726,12 +1821,19 @@ class HistoryService:
                     if isinstance(v, str) and v.strip()
                 }
         else:
+            await _emit_progress(
+                f"⏳ [2/5] 已加载 {len(facts)} 件入史大事（选录 {len(material)} 件），正在撰写群史正文…"
+            )
             report_payload: dict = {
                 "facts": material,
                 "window_days": days,
             }
             if topic:
                 report_payload["topic"] = str(topic)[:300]
+            if golden_quotes:
+                report_payload["golden_quotes"] = golden_quotes
+            if culture_slang:
+                report_payload["culture_slang"] = culture_slang
             prompt = encode_compact(report_payload)
             prose_text = await call_llm(
                 self.plugin.context,
@@ -1753,18 +1855,26 @@ class HistoryService:
                 },
             )
 
+        await _emit_progress("⏳ [3/5] 群史记正文已完成…")
         text = prose_text
         biographies = []
         if top:
             bio_sem = asyncio.Semaphore(2)
             completed_bios: dict[str, str] = dict(cached_bios)
+            total_bios = max(1, len(top))
+            done_bios = 0
 
             async def _gen_one_bio(target_uid: str) -> str:
+                nonlocal done_bios
                 if target_uid in completed_bios:
+                    done_bios += 1
+                    await _emit_progress(f"⏳ [4/5] 人物传记 {done_bios}/{total_bios}…")
                     return completed_bios[target_uid]
                 async with bio_sem:
                     bio_text = await self.biography(umo, target_uid, style=style)
                 completed_bios[target_uid] = bio_text
+                done_bios += 1
+                await _emit_progress(f"⏳ [4/5] 人物传记 {done_bios}/{total_bios}…")
                 return bio_text
 
             results = await asyncio.gather(
@@ -1804,6 +1914,8 @@ class HistoryService:
                 biographies.append(
                     {"sender_id": uid, "sender_name": member["name"], "biography": bio}
                 )
+        if relation_arc_section:
+            text += "\n\n" + relation_arc_section
         cov_text = await asyncio.to_thread(self.coverage, umo)
         text += (
             f"\n\n—— 最近{days}天正式事件 {len(facts)} 件，本篇选录 {len(material)} 件。\n"
@@ -1836,6 +1948,7 @@ class HistoryService:
             logger.warning(
                 "Lifetime edition image rendering failed; text remains available"
             )
+        await _emit_progress("⏳ [5/5] 渲染完成，正在发送…")
         if not await self.allowed(umo):
             raise ValueError("群范围或隐私设置已变化，本次结果未发布")
         if force:

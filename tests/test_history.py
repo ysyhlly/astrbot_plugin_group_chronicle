@@ -909,7 +909,9 @@ def test_personal_hide_invalidates_all_public_editions_and_cache(plugin, monkeyp
     monkeypatch.setattr(lifetime, "call_llm", AsyncMock(return_value="可公开的旧正文"))
     text, _, _ = run(plugin.history.build_report(U, 7, False, "测试"))
     assert run(plugin.history.publishable(U, text))
-    assert "已隐藏" in run(handle_command(plugin.history, Event("史记隐藏")))
+    preview = run(handle_command(plugin.history, Event("史记隐藏")))
+    assert "作用域预览" in preview
+    assert "已隐藏" in run(handle_command(plugin.history, Event("史记隐藏 确认")))
     assert not run(plugin.history.publishable(U, text))
     assert plugin.store.list(U) == []
     assert "已隐藏" in run(plugin.history.biography(U, "1"))
@@ -1098,8 +1100,12 @@ def test_privacy_request_is_immediate_during_model_work(plugin, monkeypatch):
         db = await source(plugin, [message(1)])
         task = asyncio.create_task(plugin.history.process_one(U))
         await asyncio.wait_for(started.wait(), 1)
-        reply = await asyncio.wait_for(
+        preview = await asyncio.wait_for(
             handle_command(plugin.history, Event("史记隐藏")), 1
+        )
+        assert "作用域预览" in preview
+        reply = await asyncio.wait_for(
+            handle_command(plugin.history, Event("史记隐藏 确认")), 1
         )
         assert "已隐藏" in reply
         with pytest.raises(asyncio.CancelledError):
@@ -1120,7 +1126,9 @@ def test_privacy_request_is_immediate_during_model_work(plugin, monkeypatch):
 )
 def test_personal_privacy_requests_work_when_recording_is_disabled(plugin, off):
     plugin.config.update(off)
-    reply = run(handle_command(plugin.history, Event("史记隐藏")))
+    preview = run(handle_command(plugin.history, Event("史记隐藏")))
+    assert "作用域预览" in preview
+    reply = run(handle_command(plugin.history, Event("史记隐藏 确认")))
     assert "已隐藏" in reply
     assert plugin.history.store.member(U, "1")["hidden"] == 1
 

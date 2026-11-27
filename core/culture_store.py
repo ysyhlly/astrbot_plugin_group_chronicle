@@ -424,9 +424,20 @@ class CultureStore:
             if not row or row["revision"] != revision:
                 raise ValueError("词条不存在或已更新，请刷新后重试")
             payload = json.loads(row["payload"])
-            if action not in {"approve", "reject", "edit", "hide", "correct", "merge"}:
+            if action not in {
+                "approve",
+                "reject",
+                "edit",
+                "hide",
+                "restore",
+                "correct",
+                "merge",
+            }:
                 raise ValueError("文化操作无效")
-            if row["status"] in {"hidden", "merged"} and action != "hide":
+            if action == "restore":
+                if row["status"] != "hidden":
+                    raise ValueError("该词条当前未处于隐藏状态")
+            elif row["status"] in {"hidden", "merged"} and action != "hide":
                 raise ValueError("已隐藏或已合并词条不可直接发布或修改")
             self.save_revision(db, row, actor, action, note)
             status = row["status"]
@@ -470,6 +481,41 @@ class CultureStore:
                         "INSERT OR IGNORE INTO culture_exclusions VALUES(?,?,?)",
                         (umo, row["source"], s["id"]),
                     )
+            elif action == "restore":
+                # Recover previous pre-hide status from audit revisions when available.
+                prev_row = db.execute(
+                    "SELECT before_data FROM culture_revisions WHERE umo=? AND entry_id=? AND action='hide' ORDER BY id DESC LIMIT 1",
+                    (umo, int(entry_id)),
+                ).fetchone()
+                restored_status = "pending"
+                if prev_row:
+                    try:
+                        prev_data = json.loads(prev_row["before_data"])
+                        prev_status = str(prev_data.get("status") or "")
+                        if prev_status in {"approved", "pending", "disputed"}:
+                            restored_status = prev_status
+                    except (ValueError, TypeError):
+                        pass
+                status = restored_status
+                # Remove source exclusions that are NOT still referenced by other hidden entries.
+                still_hidden_sources: set[str] = set()
+                for other in db.execute(
+                    "SELECT payload FROM culture_entries WHERE umo=? AND source=? AND status='hidden' AND id!=?",
+                    (umo, row["source"], int(entry_id)),
+                ).fetchall():
+                    try:
+                        other_payload = json.loads(other["payload"])
+                        for s in other_payload.get("sources", []):
+                            still_hidden_sources.add(str(s["id"]))
+                    except (ValueError, TypeError, KeyError):
+                        continue
+                for s in payload.get("sources", []):
+                    sid = str(s["id"])
+                    if sid not in still_hidden_sources:
+                        db.execute(
+                            "DELETE FROM culture_exclusions WHERE umo=? AND source=? AND source_id=?",
+                            (umo, row["source"], sid),
+                        )
             elif action == "merge":
                 target = db.execute(
                     "SELECT * FROM culture_entries WHERE umo=? AND id=?",
@@ -514,3 +560,11 @@ class CultureStore:
                     (umo, entry_id),
                 )
             ]
+
+    def last_hide_actor(self, umo, entry_id):
+        with self.archive.connection() as db:
+            row = db.execute(
+                "SELECT actor FROM culture_revisions WHERE umo=? AND entry_id=? AND action='hide' ORDER BY id DESC LIMIT 1",
+                (umo, int(entry_id)),
+            ).fetchone()
+            return str(row["actor"]) if row and row["actor"] else None

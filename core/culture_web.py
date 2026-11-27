@@ -96,6 +96,31 @@ class CultureWeb:
     async def overview(self):
         return await self.respond(self.overview_data, check_csrf=False)
 
+    def _quota_snapshot(self):
+        day = datetime.now(self.service.history._series_tz()).date().isoformat()
+        raw_limit = self.plugin._cfg("history_daily_limit", 20)
+        daily_limit = max(0, int(20 if raw_limit is None else raw_limit))
+        breakdown = self.service.history.store.quota_breakdown(day)
+        reserved_history = daily_limit // 2 if daily_limit >= 2 else 0
+        culture_limit = max(0, daily_limit - reserved_history)
+        total_used = int(breakdown.get("total", 0))
+        history_used = int(breakdown.get("history", 0))
+        culture_used = int(breakdown.get("culture", 0))
+        total_remaining = max(0, daily_limit - total_used)
+        culture_remaining = min(total_remaining, max(0, culture_limit - culture_used))
+        return {
+            "day": day,
+            "daily_limit": daily_limit,
+            "total_used": total_used,
+            "total_remaining": total_remaining,
+            "history_used": history_used,
+            "history_remaining": total_remaining,
+            "history_reserved": reserved_history,
+            "culture_used": culture_used,
+            "culture_limit": culture_limit,
+            "culture_remaining": culture_remaining,
+        }
+
     async def overview_data(self, body=None, actor=""):
         raw_groups = await asyncio.to_thread(self.service.history.store.groups)
         allowed_umos = [
@@ -107,6 +132,7 @@ class CultureWeb:
                 for umo in allowed_umos
             ]
         )
+        quota = await asyncio.to_thread(self._quota_snapshot)
         try:
             owner = lm_bridge.detect_lm(self.plugin.context)
             memory = (
@@ -131,7 +157,8 @@ class CultureWeb:
             "groups": groups,
             "memory": memory,
             "learning": learning,
-            "daily_limit": self.plugin._cfg("history_daily_limit", 20),
+            "daily_limit": quota["daily_limit"],
+            "quota": quota,
         }
 
     async def handle(self):
@@ -162,6 +189,7 @@ class CultureWeb:
                         "status": "hidden",
                         "name": "已隐藏",
                         "unavailable": True,
+                        "can_restore": bool(item["status"] == "hidden"),
                     }
                 )
             elif id(item) not in valid_ids:
@@ -244,6 +272,10 @@ class CultureWeb:
                         advanced = await self.service.step(
                             umo, "back", verification_extra_quota=extra
                         )
+                        if not advanced and not self.service.errors.get(umo):
+                            advanced = await self.service.step(
+                                umo, "live", verification_extra_quota=extra
+                            )
                         steps.append(
                             {
                                 "advanced": advanced,
@@ -256,12 +288,14 @@ class CultureWeb:
 
                     def _record_verification():
                         after = self.service.history.store.quota(day)
+                        quota_now = self._quota_snapshot()
                         rec = {
                             "steps": steps,
                             "extra_quota": extra,
                             "used_before": before,
                             "used_after": after,
                             "restored_limit": self.plugin.config.get(key, 20),
+                            "quota": quota_now,
                         }
                         with self.service.history.store.connection(write=True) as db:
                             db.execute(
@@ -275,9 +309,13 @@ class CultureWeb:
         if op == "progress":
 
             def _load_progress():
-                return self.service.store.job(umo), self.service.store.state(umo)
+                return (
+                    self.service.store.job(umo),
+                    self.service.store.state(umo),
+                    self._quota_snapshot(),
+                )
 
-            job, state = await asyncio.to_thread(_load_progress)
+            job, state, quota = await asyncio.to_thread(_load_progress)
             if job:
                 job = {
                     key: value
@@ -288,6 +326,7 @@ class CultureWeb:
                 "state": state,
                 "job": job,
                 "error": self.service.errors.get(umo, ""),
+                "quota": quota,
             }
         if op == "list":
             status = body.get("status") or None

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import re
 import sqlite3
@@ -17,13 +18,17 @@ from .deliver import deliver_text, split_text
 from .lifetime import GROUP_PATTERN, KINDS, RISK_WORDS, scope_lists
 
 HISTORY_TIMEZONE = timezone(timedelta(hours=8))
+PRIVACY_CONFIRM_TTL_SEC = 120.0
 
 try:
-    from ..series_panels import resolve_series_timezone
+    from ..series_panels import find_plugin_owner, resolve_series_timezone
 except ImportError:
     try:
-        from series_panels import resolve_series_timezone
+        from series_panels import find_plugin_owner, resolve_series_timezone
     except Exception:  # pragma: no cover - standalone fallback
+        def find_plugin_owner(_context, _identity: str):
+            return None
+
         def resolve_series_timezone(
             _context, explicit_tz: str = "", default_tz: str = "Asia/Shanghai"
         ):
@@ -33,6 +38,55 @@ except ImportError:
 
 def _history_tz(plugin):
     return resolve_series_timezone(getattr(plugin, "context", None))
+
+
+async def sync_series_privacy_mute(
+    context,
+    umo: str,
+    member_id: str,
+    muted: bool,
+    *,
+    actor: str = "",
+    reason: str = "",
+) -> dict:
+    """Dynamically sync global cross-plugin privacy mute via chat_dynamics."""
+    if context is None or not str(umo or "").strip() or not str(member_id or "").strip():
+        return {"ok": False, "reason": "invalid_args"}
+    owner = None
+    try:
+        owner = find_plugin_owner(context, "astrbot_plugin_chat_dynamics")
+    except Exception:
+        owner = None
+    if owner is None:
+        getter = getattr(context, "get_registered_star", None)
+        if callable(getter):
+            try:
+                star = getter("astrbot_plugin_chat_dynamics")
+                if star is not None and getattr(star, "activated", True) is not False:
+                    owner = getattr(star, "star_cls", None) or star
+            except Exception:
+                owner = None
+    setter = getattr(owner, "set_series_privacy_muted", None) if owner is not None else None
+    if not callable(setter):
+        return {"ok": False, "reason": "chat_dynamics_unavailable"}
+    try:
+        res = setter(
+            str(umo).strip(),
+            str(member_id).strip(),
+            bool(muted),
+            scopes=["global"],
+            actor=str(actor or member_id).strip(),
+            reason=str(reason or "").strip(),
+        )
+        if inspect.isawaitable(res):
+            res = await asyncio.wait_for(res, timeout=5.0)
+        if isinstance(res, dict):
+            return {"ok": bool(res.get("ok", True)), **res}
+        return {"ok": bool(res is not False)}
+    except Exception as exc:
+        logger.warning("Failed to sync series privacy mute via chat_dynamics: %s", exc)
+        return {"ok": False, "reason": f"sync_error:{type(exc).__name__}"}
+
 
 COMMANDS = (
     "群大事",
@@ -45,6 +99,7 @@ COMMANDS = (
     "史记修订",
     "史记更正",
     "史记隐藏",
+    "史记恢复",
     "史记进度",
 )
 
@@ -209,7 +264,7 @@ async def handle_command(service, event, supplied=None):
         if not match:
             return "无法识别史记命令。"
         command = match.group(1)
-        privacy_request = command == "史记隐藏"
+        privacy_request = command in ("史记隐藏", "史记恢复")
         if not privacy_request:
             scope_lists(plugin.config)
         if not await service.allowed(umo, recording=not privacy_request):
@@ -367,12 +422,220 @@ async def handle_command(service, event, supplied=None):
                 return f"待审事件 {len(facts)} 件、更正请求 {len(corrections)} 条；本次详情已私发给你（最多各20条，可指定事件ID）。"
             return "审核详情私发失败，未在群内公开；请先确认机器人能向你发送私聊消息。"
         if command == "史记隐藏":
-            if tail and not tail.isdigit():
-                return "用法：史记隐藏（隐藏本人档案）或 史记隐藏 事件ID（隐藏涉及自己的事件）。"
+            pending_map = getattr(service, "pending_hides", None)
+            if pending_map is None:
+                pending_map = {}
+                service.pending_hides = pending_map
+            now_mono = time.monotonic()
+            # Evict expired entries lazily
+            for k in [k for k, v in pending_map.items() if now_mono > float(v.get("expires_at", 0))]:
+                pending_map.pop(k, None)
+
+            tokens = [t for t in re.split(r"\s+", tail) if t]
+            cancel_req = False
+            confirm_req = False
+            global_mute = False
+            event_id = None
+            for tok in tokens:
+                low = tok.lower()
+                if low in ("取消", "cancel"):
+                    cancel_req = True
+                elif low in ("确认", "confirm"):
+                    confirm_req = True
+                elif low in ("全局", "--global", "global"):
+                    global_mute = True
+                elif tok.isdigit() and event_id is None:
+                    event_id = int(tok)
+                else:
+                    return (
+                        "用法：史记隐藏 [事件ID] [全局]（首次发送预览作用域，"
+                        "120 秒内发送「史记隐藏 确认」或再次发送确认执行；加「全局」可同步静音群间记忆与群间学习）。"
+                    )
+
+            pending_key = (umo, actor)
+            if cancel_req:
+                removed = pending_map.pop(pending_key, None)
+                return "已取消史记隐藏操作。" if removed else "当前没有待确认的史记隐藏操作。"
+
+            existing_pending = pending_map.get(pending_key)
+            should_execute = False
+            exec_event_id = event_id
+            exec_global = global_mute
+
+            if confirm_req:
+                if existing_pending is None:
+                    return (
+                        "当前没有待确认的隐藏请求或已超过 120 秒有效期；"
+                        "请先发送「史记隐藏 [事件ID] [全局]」查看作用域预览。"
+                    )
+                if event_id is None and not global_mute:
+                    exec_event_id = existing_pending["event_id"]
+                    exec_global = existing_pending["global_mute"]
+                    should_execute = True
+                elif (
+                    event_id == existing_pending["event_id"]
+                    and global_mute == existing_pending["global_mute"]
+                ):
+                    should_execute = True
+                else:
+                    # Scope changed from pending preview -> require fresh preview confirmation
+                    should_execute = False
+            elif (
+                existing_pending is not None
+                and existing_pending["event_id"] == event_id
+                and existing_pending["global_mute"] == global_mute
+            ):
+                should_execute = True
+
+            if not should_execute:
+                if event_id is not None:
+                    fact_row = await asyncio.to_thread(
+                        store.event, umo, event_id, public=False
+                    )
+                    involved = (
+                        set()
+                        if not fact_row
+                        else {str(p["uid"]) for p in fact_row.get("participants", [])}
+                        | {str(s.get("uid", "")) for s in fact_row.get("sources", [])}
+                    )
+                    if actor not in involved:
+                        return "只能隐藏涉及自己的事件；共同事实的更正请提交管理员审核。"
+                    target_desc = f"本群事件 #{event_id}「{fact_row.get('title', '')}」及其来源摘录"
+                else:
+                    target_desc = "你在本群的「群史记」个人档案及所有涉及你的公开事件（含关联群文化展示）"
+
+                pending_map[pending_key] = {
+                    "event_id": event_id,
+                    "global_mute": global_mute,
+                    "expires_at": now_mono + PRIVACY_CONFIRM_TTL_SEC,
+                }
+                if global_mute:
+                    scope_line = (
+                        "作用域：全局隐私静音（隐藏本群史记档案外，将同步静音「群间记忆」与「群间学习」对你的采集与召回）。"
+                    )
+                else:
+                    global_cmd = (
+                        f"史记隐藏 {event_id} 全局" if event_id is not None else "史记隐藏 全局"
+                    )
+                    scope_line = (
+                        f"作用域：仅本插件（群史记与群文化）。提示：加「全局」可同步静音群间记忆与群间学习（改发「{global_cmd}」）。"
+                    )
+                return (
+                    f"⚠️ 隐藏作用域预览\n"
+                    f"目标：{target_desc}\n"
+                    f"{scope_line}\n"
+                    f"可撤销性：此操作支持审计恢复，可随时使用「史记恢复」撤销。\n"
+                    f"请在 {int(PRIVACY_CONFIRM_TTL_SEC)} 秒内发送「史记隐藏 确认」（或再次发送相同指令）以执行；发送「史记隐藏 取消」可取消。"
+                )
+
+            pending_map.pop(pending_key, None)
             await asyncio.to_thread(store.observe, umo, actor, event.get_sender_name())
-            await asyncio.to_thread(store.hide, umo, actor, int(tail) if tail else None)
+            await asyncio.to_thread(
+                store.hide,
+                umo,
+                actor,
+                exec_event_id,
+                actor=actor,
+                note="本人确认全局隐藏" if exec_global else "本人确认隐藏",
+            )
             service.cancel_operations(umo)
-            return "相关内容已隐藏，相关文章、图片和导出缓存已失效；共同事实的修订可提交管理员审核。"
+            reply_parts = [
+                "相关内容已隐藏，相关文章、图片和导出缓存已失效；共同事实的修订可提交管理员审核。"
+            ]
+            if exec_global:
+                sync_res = await sync_series_privacy_mute(
+                    plugin.context,
+                    umo,
+                    actor,
+                    True,
+                    actor=actor,
+                    reason="group_chronicle:history_hide_global",
+                )
+                if sync_res.get("ok"):
+                    reply_parts.append("已同步开启跨插件全局隐私静音（群间记忆与群间学习已静音）。")
+                else:
+                    reply_parts.append(
+                        "提示：本插件已完成隐藏，但未检测到支持全局隐私静音的对话主控插件，跨插件静音未生效。"
+                    )
+            reply_parts.append(
+                "如需撤销，可随时发送「史记恢复"
+                + (f" {exec_event_id}" if exec_event_id is not None else "")
+                + (" 全局" if exec_global else "")
+                + "」。"
+            )
+            return "\n".join(reply_parts)
+
+        if command == "史记恢复":
+            tokens = [t for t in re.split(r"\s+", tail) if t]
+            global_unmute = False
+            event_id = None
+            explicit_uid = plugin._extract_at_sender(event)
+            for tok in tokens:
+                low = tok.lower()
+                if low in ("全局", "--global", "global"):
+                    global_unmute = True
+                elif re.match(r"^(?:成员|uid)[=＝](.+)$", tok, re.IGNORECASE):
+                    explicit_uid = re.split(r"[=＝]", tok, maxsplit=1)[1].strip()
+                elif tok.isdigit() and event_id is None:
+                    event_id = int(tok)
+                elif tok.startswith("@"):
+                    continue
+                else:
+                    return (
+                        "用法：史记恢复 [事件ID] [全局]（恢复本人隐藏记录；"
+                        "管理员可 @成员 或使用 成员=ID 恢复任意成员记录）。"
+                    )
+            target_uid = str(explicit_uid or actor)
+            if target_uid != actor and not admin:
+                return "仅本人可恢复自己的记录；恢复其他成员记录需要本群管理员或 AstrBot 管理员权限。"
+            note = (
+                f"管理员恢复{'全局' if global_unmute else ''}"
+                if admin and target_uid != actor
+                else f"本人恢复{'全局' if global_unmute else ''}"
+            )
+            res = await asyncio.to_thread(
+                store.restore,
+                umo,
+                target_uid,
+                event_id,
+                actor=actor,
+                admin=admin,
+                note=note,
+            )
+            service.cancel_operations(umo)
+            sync_res = None
+            if global_unmute:
+                sync_res = await sync_series_privacy_mute(
+                    plugin.context,
+                    umo,
+                    target_uid,
+                    False,
+                    actor=actor,
+                    reason="group_chronicle:history_restore_global",
+                )
+            lines = []
+            if res.get("restored"):
+                if event_id is None:
+                    lines.append(
+                        f"已恢复成员 {res.get('name') or target_uid} 的群史档案公开状态（已写入审计日志，缓存已刷新）。"
+                    )
+                else:
+                    lines.append(
+                        f"已恢复事件 #{event_id} 的隐藏状态（已写入审计日志，缓存已刷新）。"
+                    )
+            else:
+                if event_id is None:
+                    lines.append("该成员档案当前未处于隐藏状态。")
+                else:
+                    lines.append(f"事件 #{event_id} 当前未处于隐藏状态。")
+            if global_unmute:
+                if sync_res and sync_res.get("ok"):
+                    lines.append("已同步解除跨插件全局隐私静音（群间记忆与群间学习已恢复）。")
+                else:
+                    lines.append(
+                        "提示：未检测到支持全局隐私静音的对话主控插件，跨插件静音状态未变更。"
+                    )
+            return "\n".join(lines)
         lock = service.fact_locks.setdefault(umo, asyncio.Lock())
         async with lock:
             if not await service.allowed(umo):

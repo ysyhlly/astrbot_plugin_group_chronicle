@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 import re
+import time
 from datetime import datetime, timezone
 
 from . import lm_bridge
@@ -58,6 +59,7 @@ class CultureService:
         self.operations = self.history.operations
         self.locks = {}
         self.errors = {}
+        self.pending_hides = {}
 
     async def allowed(self, umo, *, recording=True):
         return bool(
@@ -520,12 +522,33 @@ class CultureService:
             }
 
         def _load_query_inputs():
-            return self.token(umo), self.store.entries(
+            q = query.strip()
+            bound = max(1, min(int(limit), 20))
+            tok = self.token(umo)
+            matched, count = self.store.entries(
                 umo,
                 status="approved",
-                query=query.strip(),
-                limit=max(1, min(int(limit), 20)),
+                query=q,
+                limit=bound,
             )
+            if q and not matched:
+                # Reverse match for full-sentence queries (e.g. from chat_dynamics / memory):
+                # match approved terms whose name or alias (>=2 chars) appears in the query.
+                q_cf = q.casefold()
+                all_approved, _ = self.store.entries(
+                    umo, status="approved", query="", limit=200
+                )
+                rev_hits = []
+                for cand in all_approved:
+                    names = [cand["name"], *(a["name"] for a in cand.get("aliases", []))]
+                    if any(
+                        len(n.strip()) >= 2 and n.strip().casefold() in q_cf
+                        for n in names
+                    ):
+                        rev_hits.append(cand)
+                matched = rev_hits[:bound]
+                count = len(rev_hits)
+            return tok, (matched, count)
 
         token, (entries, total) = await asyncio.to_thread(_load_query_inputs)
         valid, missing = [], False
@@ -685,7 +708,9 @@ class CultureService:
         admin=False,
     ):
         # Privacy requests remain possible when culture collection is disabled.
-        if not await self.history.allowed(umo, recording=action != "hide"):
+        if not await self.history.allowed(
+            umo, recording=action not in {"hide", "restore"}
+        ):
             raise PermissionError("当前会话不允许此操作")
         if action in {"pause", "resume"}:
             if not admin:
@@ -697,12 +722,17 @@ class CultureService:
         if not item:
             raise ValueError("当前群没有该词条")
         if not admin:
-            if action not in {"hide", "correct"}:
+            if action not in {"hide", "restore", "correct"}:
                 raise PermissionError("需要管理员权限")
-            if action == "hide" and actor not in set(item["subjects"]) | {
-                s["uid"] for s in item["sources"]
-            }:
+            involved = set(item["subjects"]) | {s["uid"] for s in item["sources"]}
+            if action == "hide" and actor not in involved:
                 raise PermissionError("只能隐藏涉及自己的文化词条")
+            if action == "restore":
+                hide_actor = await asyncio.to_thread(
+                    self.store.last_hide_actor, umo, entry_id
+                )
+                if actor not in involved and actor != hide_actor:
+                    raise PermissionError("只能恢复涉及自己或本人隐藏的文化词条")
         if action in {"approve", "edit", "merge"}:
             if action == "merge":
                 target = await asyncio.to_thread(self.store.entry, umo, target_id)
@@ -736,34 +766,228 @@ class CultureService:
         }
 
     async def command(self, event, command, argument=""):
-        from .history_commands import administrator
+        from .history_commands import (
+            PRIVACY_CONFIRM_TTL_SEC,
+            administrator,
+            sync_series_privacy_mute,
+        )
 
         umo, member = str(event.unified_msg_origin), str(event.get_sender_id())
-        if command in {"文化纠正", "文化隐藏"}:
+        is_admin = administrator(self.plugin, event)
+        if command == "文化纠正":
             parts = argument.strip().split(maxsplit=1)
-            if (
-                not parts
-                or not parts[0].isdigit()
-                or (command == "文化纠正" and len(parts) < 2)
-            ):
-                return "用法：/文化纠正 <ID> <说明> 或 /文化隐藏 <ID>"
+            if not parts or not parts[0].isdigit() or len(parts) < 2:
+                return "用法：/文化纠正 <ID> <说明>"
             item = await asyncio.to_thread(self.store.entry, umo, int(parts[0]))
+            if not item:
+                return "当前群没有该词条。"
+            await self.action(
+                umo,
+                "correct",
+                member,
+                entry_id=item["id"],
+                revision=item["revision"],
+                note=parts[1],
+                admin=is_admin,
+            )
+            return "已提交纠正，词条暂停公开并等待审核。"
+
+        if command == "文化隐藏":
+            now_mono = time.monotonic()
+            for k in [
+                k
+                for k, v in self.pending_hides.items()
+                if now_mono > float(v.get("expires_at", 0))
+            ]:
+                self.pending_hides.pop(k, None)
+
+            tokens = [t for t in re.split(r"\s+", argument.strip()) if t]
+            cancel_req = False
+            confirm_req = False
+            global_mute = False
+            entry_id = None
+            for tok in tokens:
+                low = tok.lower()
+                if low in ("取消", "cancel"):
+                    cancel_req = True
+                elif low in ("确认", "confirm"):
+                    confirm_req = True
+                elif low in ("全局", "--global", "global"):
+                    global_mute = True
+                elif tok.isdigit() and entry_id is None:
+                    entry_id = int(tok)
+                else:
+                    return (
+                        "用法：/文化隐藏 <ID> [全局]（首次发送预览作用域，"
+                        "120 秒内发送「/文化隐藏 确认」或再次发送确认执行；加「全局」同步静音群间记忆与群间学习）。"
+                    )
+
+            pending_key = (umo, member)
+            if cancel_req:
+                removed = self.pending_hides.pop(pending_key, None)
+                return "已取消文化隐藏操作。" if removed else "当前没有待确认的文化隐藏操作。"
+
+            existing_pending = self.pending_hides.get(pending_key)
+            should_execute = False
+            exec_entry_id = entry_id
+            exec_global = global_mute
+
+            if confirm_req:
+                if existing_pending is None:
+                    return (
+                        "当前没有待确认的文化隐藏请求或已超过 120 秒有效期；"
+                        "请先发送「/文化隐藏 <ID> [全局]」查看作用域预览。"
+                    )
+                if entry_id is None and not global_mute:
+                    exec_entry_id = existing_pending["entry_id"]
+                    exec_global = existing_pending["global_mute"]
+                    should_execute = True
+                elif (
+                    entry_id == existing_pending["entry_id"]
+                    and global_mute == existing_pending["global_mute"]
+                ):
+                    should_execute = True
+                else:
+                    should_execute = False
+            elif (
+                existing_pending is not None
+                and entry_id is not None
+                and existing_pending["entry_id"] == entry_id
+                and existing_pending["global_mute"] == global_mute
+            ):
+                should_execute = True
+
+            if not should_execute:
+                if entry_id is None:
+                    return (
+                        "用法：/文化隐藏 <ID> [全局]（首次发送预览作用域，"
+                        "120 秒内发送「/文化隐藏 确认」或再次发送确认执行；加「全局」同步静音群间记忆与群间学习）。"
+                    )
+                if not await self.history.allowed(umo, recording=False):
+                    raise PermissionError("当前会话不允许此操作")
+                item = await asyncio.to_thread(self.store.entry, umo, entry_id)
+                if not item:
+                    return "当前群没有该词条。"
+                if not is_admin and member not in set(item["subjects"]) | {
+                    s["uid"] for s in item["sources"]
+                }:
+                    raise PermissionError("只能隐藏涉及自己的文化词条")
+                self.pending_hides[pending_key] = {
+                    "entry_id": entry_id,
+                    "global_mute": global_mute,
+                    "expires_at": now_mono + PRIVACY_CONFIRM_TTL_SEC,
+                }
+                if global_mute:
+                    scope_line = (
+                        "作用域：全局隐私静音（隐藏该词条并屏蔽关联来源外，还将同步静音「群间记忆」与「群间学习」对你的采集与召回）。"
+                    )
+                else:
+                    scope_line = (
+                        f"作用域：仅本插件（群文化沿革）。提示：加「全局」可同步静音群间记忆与群间学习（改发「/文化隐藏 {entry_id} 全局」）。"
+                    )
+                return (
+                    f"⚠️ 文化隐藏作用域预览\n"
+                    f"目标：词条 #{item['id']}「{item['name']}」及其关联原文来源\n"
+                    f"{scope_line}\n"
+                    f"可撤销性：本人与管理员均可随时通过「/文化恢复 {item['id']}」或文化管理面板撤销恢复（写审计日志）。\n"
+                    f"请在 {int(PRIVACY_CONFIRM_TTL_SEC)} 秒内发送「/文化隐藏 确认」（或再次发送相同指令）以执行；发送「/文化隐藏 取消」可取消。"
+                )
+
+            self.pending_hides.pop(pending_key, None)
+            item = await asyncio.to_thread(self.store.entry, umo, exec_entry_id)
+            if not item:
+                return "当前群没有该词条。"
+            await self.action(
+                umo,
+                "hide",
+                member,
+                entry_id=item["id"],
+                revision=item["revision"],
+                note="本人确认全局隐藏" if exec_global else "本人确认隐藏",
+                admin=is_admin,
+            )
+            reply_parts = ["已隐藏相关词条与来源（已写入审计日志）。"]
+            if exec_global:
+                sync_res = await sync_series_privacy_mute(
+                    self.plugin.context,
+                    umo,
+                    member,
+                    True,
+                    actor=member,
+                    reason=f"group_chronicle:culture_hide_global:{item['id']}",
+                )
+                if sync_res.get("ok"):
+                    reply_parts.append("已同步开启跨插件全局隐私静音（群间记忆与群间学习已静音）。")
+                else:
+                    reply_parts.append(
+                        "提示：本词条已完成隐藏，但未检测到支持全局隐私静音的对话主控插件，跨插件静音未生效。"
+                    )
+            reply_parts.append(
+                f"如需撤销，可随时发送「/文化恢复 {item['id']}"
+                + (" 全局" if exec_global else "")
+                + "」。"
+            )
+            return "\n".join(reply_parts)
+
+        if command == "文化恢复":
+            tokens = [t for t in re.split(r"\s+", argument.strip()) if t]
+            global_unmute = False
+            entry_id = None
+            explicit_uid = self.plugin._extract_at_sender(event)
+            for tok in tokens:
+                low = tok.lower()
+                if low in ("全局", "--global", "global"):
+                    global_unmute = True
+                elif re.match(r"^(?:成员|uid)[=＝](.+)$", tok, re.IGNORECASE):
+                    explicit_uid = re.split(r"[=＝]", tok, maxsplit=1)[1].strip()
+                elif tok.isdigit() and entry_id is None:
+                    entry_id = int(tok)
+                elif tok.startswith("@"):
+                    continue
+                else:
+                    return "用法：/文化恢复 <ID> [全局]（本人可恢复涉及自己或本人隐藏的词条；管理员可恢复任意词条）。"
+            if entry_id is None:
+                return "用法：/文化恢复 <ID> [全局]（本人可恢复涉及自己或本人隐藏的词条；管理员可恢复任意词条）。"
+            item = await asyncio.to_thread(self.store.entry, umo, entry_id)
             if not item:
                 return "当前群没有该词条。"
             result = await self.action(
                 umo,
-                "correct" if command == "文化纠正" else "hide",
+                "restore",
                 member,
                 entry_id=item["id"],
                 revision=item["revision"],
-                note=parts[1] if len(parts) > 1 else "本人请求隐藏",
-                admin=administrator(self.plugin, event),
+                note="管理员撤销隐藏恢复" if is_admin else "本人撤销隐藏恢复",
+                admin=is_admin,
             )
-            return (
-                "已提交纠正，词条暂停公开并等待审核。"
-                if result["status"] == "disputed"
-                else "已隐藏相关词条与来源。"
-            )
+            status_label = {
+                "approved": "已公开",
+                "pending": "待审核",
+                "disputed": "待纠正",
+            }.get(result["status"], result["status"])
+            reply_parts = [
+                f"已撤销词条 #{item['id']} 的隐藏并解除来源屏蔽（当前状态：{status_label}，已写入审计日志）。"
+            ]
+            if global_unmute:
+                target_uid = str(explicit_uid or member)
+                if target_uid != member and not is_admin:
+                    reply_parts.append("提示：仅管理员可解除其他成员的全局隐私静音。")
+                else:
+                    sync_res = await sync_series_privacy_mute(
+                        self.plugin.context,
+                        umo,
+                        target_uid,
+                        False,
+                        actor=member,
+                        reason=f"group_chronicle:culture_restore_global:{item['id']}",
+                    )
+                    if sync_res.get("ok"):
+                        reply_parts.append("已同步解除跨插件全局隐私静音（群间记忆与群间学习已恢复）。")
+                    else:
+                        reply_parts.append(
+                            "提示：未检测到支持全局隐私静音的对话主控插件，跨插件静音状态未变更。"
+                        )
+            return "\n".join(reply_parts)
         result = await self.query(
             umo,
             member,

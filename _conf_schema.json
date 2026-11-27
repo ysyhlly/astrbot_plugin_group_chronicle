@@ -193,13 +193,13 @@
         "description": "💬 候选金句",
         "type": "bool",
         "default": true,
-        "hint": "前置条件：仅兼容模式（history_enabled=false）与「史记续写」生效；默认长期群史模式不使用此开关。从群聊消息中挑选金句候选注入生成提示词，供 LLM 酌情引用"
+        "hint": "长期模式（history_enabled=true）从已入史事件来源摘录挑选候选金句；兼容模式（history_enabled=false，前置条件）与「史记续写」从近期聊天消息挑选金句候选注入提示词。"
     },
     "enable_relation_arc": {
         "description": "🕸️ 本周关系弧",
         "type": "bool",
         "default": true,
-        "hint": "前置条件：仅兼容模式（history_enabled=false）生效且需安装 group_relation_analyzer；默认长期群史模式不追加此分节。有关系数据时在史记末尾追加「本周关系弧」，数据缺失自动跳过"
+        "hint": "前置条件：需安装 group_relation_analyzer 或兼容社交关系插件；长期模式（history_enabled=true）与兼容模式（history_enabled=false）均可在史记末尾追加「本期关系弧」（自动过滤隐藏成员），数据缺失自动跳过。"
     },
     "enable_structured": {
         "description": "🧬 结构化输出",
@@ -217,7 +217,7 @@
         "description": "💬 本周黑话",
         "type": "bool",
         "default": true,
-        "hint": "前置条件：仅兼容模式（history_enabled=false）生效；默认长期群史模式请开启 culture_enabled（群文化沿革）。从长期记忆/结构化结果中收集「本周黑话」分节注入提示词；无黑话素材时自动省略"
+        "hint": "长期模式（history_enabled=true）在开启 culture_enabled 时自动融合已审核群文化词条；兼容模式（history_enabled=false，前置条件）从长期记忆/结构化结果收集「本周黑话」注入提示词，无素材自动省略。"
     },
     "enable_vote": {
         "description": "🗳️ 投票选题",

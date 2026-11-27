@@ -201,8 +201,12 @@ def test_p0_2_soft_read_jargon_skips_unscoped_methods_and_passes_scope():
 @pytest.mark.asyncio
 async def test_p0_3_leading_slash_hide_and_revision_guard(plugin):  # noqa: F811
     plugin.history.store.observe(U, "1", "甲", 1700000000.0)
-    reply = await history_commands.handle_command(
+    preview = await history_commands.handle_command(
         plugin.history, Event("/史记隐藏", uid="1")
+    )
+    assert "作用域预览" in preview
+    reply = await history_commands.handle_command(
+        plugin.history, Event("/史记隐藏 确认", uid="1")
     )
     assert "已隐藏" in reply
     assert plugin.history.store.hidden(U)

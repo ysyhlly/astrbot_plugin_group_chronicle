@@ -327,6 +327,10 @@ class ArchiveStore:
                 db.execute(
                     "ALTER TABLE groups ADD COLUMN content_revision INTEGER NOT NULL DEFAULT 0"
                 )
+            if "paused" not in group_columns:
+                db.execute(
+                    "ALTER TABLE groups ADD COLUMN paused INTEGER NOT NULL DEFAULT 0"
+                )
             if "last_event_at" not in {
                 r[1] for r in db.execute("PRAGMA table_info(events)")
             }:
@@ -743,6 +747,24 @@ class ArchiveStore:
         """
         with self.connection() as db:
             return [r[0] for r in db.execute("SELECT umo FROM groups ORDER BY umo")]
+
+    def is_group_paused(self, umo):
+        """Read whether per-group lifetime history ingestion is paused."""
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT paused FROM groups WHERE umo=?", (umo,)
+            ).fetchone()
+            return bool(row and row["paused"])
+
+    def set_group_paused(self, umo, paused):
+        """Pause or resume per-group lifetime history ingestion."""
+        with self.connection(write=True) as db:
+            db.execute("INSERT OR IGNORE INTO groups(umo) VALUES(?)", (umo,))
+            db.execute(
+                "UPDATE groups SET paused=? WHERE umo=?",
+                (1 if paused else 0, umo),
+            )
+            self._bump(db, umo)
 
     def revision(self, umo):
         """Read combined fact revision (compatible with legacy callers).
@@ -1985,14 +2007,18 @@ class ArchiveStore:
                 )
             ]
 
-    def hide(self, umo, uid, event_id=None):
+    def hide(self, umo, uid, event_id=None, *, actor=None, note=""):
         """Immediately hide the requester's profile or an involved event.
 
         Args:
             umo: Group session.
             uid: Verified requesting identity.
             event_id: Optional event in which the requester is involved.
+            actor: Optional audit actor (defaults to uid).
+            note: Optional audit note.
         """
+        audit_actor = str(actor or uid)
+        audit_note = str(note or "privacy_hide")[:1000]
         if event_id is not None:
             fact = self.event(umo, event_id, public=False)
             involved = (
@@ -2008,19 +2034,174 @@ class ArchiveStore:
         with self.connection(write=True) as db:
             if event_id is None:
                 row = db.execute(
-                    "SELECT 1 FROM members WHERE umo=? AND uid=?", (umo, str(uid))
+                    "SELECT hidden FROM members WHERE umo=? AND uid=?", (umo, str(uid))
                 ).fetchone()
+                prev_hidden = int(row["hidden"]) if row else 0
                 if not row:
                     self._observe(db, umo, uid, uid, time.time())
                 db.execute(
                     "UPDATE members SET hidden=1 WHERE umo=? AND uid=?", (umo, str(uid))
+                )
+                db.execute(
+                    "INSERT INTO revisions(umo,entity,entity_id,before_data,actor,note,created) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        umo,
+                        "privacy_hide_member",
+                        str(uid),
+                        encode({"uid": str(uid), "hidden": prev_hidden}),
+                        audit_actor,
+                        audit_note,
+                        time.time(),
+                    ),
                 )
             else:
                 db.execute(
                     "INSERT OR IGNORE INTO hides VALUES(?,?,?)",
                     (umo, str(uid), int(event_id)),
                 )
+                db.execute(
+                    "INSERT INTO revisions(umo,entity,entity_id,before_data,actor,note,created) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        umo,
+                        "privacy_hide_event",
+                        str(event_id),
+                        encode({"uid": str(uid), "event_id": int(event_id), "hidden": 0}),
+                        audit_actor,
+                        audit_note,
+                        time.time(),
+                    ),
+                )
             self._bump(db, umo, invalidate=True, privacy=True)
+
+    def restore(
+        self,
+        umo,
+        uid,
+        event_id=None,
+        *,
+        actor="",
+        admin=False,
+        note="",
+    ):
+        """Auditably restore a hidden member profile or hidden event.
+
+        Args:
+            umo: Group session.
+            uid: Target member ID (or requesting member for event restore).
+            event_id: Optional event ID to unhide; None restores member profile.
+            actor: Verified caller identity recorded in revisions audit log.
+            admin: Whether the caller is a group or AstrBot administrator.
+            note: Audit reason recorded in revisions.
+
+        Returns:
+            Structured status dict describing what was restored.
+        """
+        target_uid = str(uid or "").strip()
+        audit_actor = str(actor or target_uid).strip()
+        audit_note = str(note or ("管理员撤销隐藏恢复" if admin else "本人撤销隐藏恢复"))[:1000]
+        if not admin and (not target_uid or audit_actor != target_uid):
+            raise PermissionError("仅本人可恢复自己的记录；恢复其他成员记录需要管理员权限")
+        with self.connection(write=True) as db:
+            if event_id is None:
+                if not target_uid:
+                    raise ValueError("请指定要恢复的成员")
+                row = db.execute(
+                    "SELECT uid,name,hidden FROM members WHERE umo=? AND uid=?",
+                    (umo, target_uid),
+                ).fetchone()
+                if not row or not row["hidden"]:
+                    return {
+                        "restored": False,
+                        "reason": "not_hidden",
+                        "kind": "member",
+                        "uid": target_uid,
+                    }
+                db.execute(
+                    "UPDATE members SET hidden=0 WHERE umo=? AND uid=?",
+                    (umo, target_uid),
+                )
+                db.execute(
+                    "INSERT INTO revisions(umo,entity,entity_id,before_data,actor,note,created) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        umo,
+                        "privacy_restore_member",
+                        target_uid,
+                        encode({"uid": target_uid, "name": row["name"], "hidden": 1}),
+                        audit_actor,
+                        audit_note,
+                        time.time(),
+                    ),
+                )
+                self._bump(db, umo, invalidate=True, privacy=True)
+                return {
+                    "restored": True,
+                    "kind": "member",
+                    "uid": target_uid,
+                    "name": row["name"],
+                }
+
+            eid = int(event_id)
+            fact = db.execute(
+                "SELECT id FROM events WHERE umo=? AND id=?", (umo, eid)
+            ).fetchone()
+            if not fact:
+                raise ValueError("本群没有该事件")
+            if admin and (not target_uid or target_uid == audit_actor):
+                # If admin specified no other target, check if admin's own hide exists;
+                # if admin wants to restore all hides on that event, clear them all.
+                existing_rows = db.execute(
+                    "SELECT uid FROM hides WHERE umo=? AND event_id=?",
+                    (umo, eid),
+                ).fetchall()
+                if not existing_rows:
+                    return {
+                        "restored": False,
+                        "reason": "not_hidden",
+                        "kind": "event",
+                        "event_id": eid,
+                    }
+                hidden_uids = [str(r["uid"]) for r in existing_rows]
+                db.execute(
+                    "DELETE FROM hides WHERE umo=? AND event_id=?",
+                    (umo, eid),
+                )
+            else:
+                existing_rows = db.execute(
+                    "SELECT uid FROM hides WHERE umo=? AND uid=? AND event_id=?",
+                    (umo, target_uid, eid),
+                ).fetchall()
+                if not existing_rows:
+                    return {
+                        "restored": False,
+                        "reason": "not_hidden",
+                        "kind": "event",
+                        "event_id": eid,
+                        "uid": target_uid,
+                    }
+                hidden_uids = [target_uid]
+                db.execute(
+                    "DELETE FROM hides WHERE umo=? AND uid=? AND event_id=?",
+                    (umo, target_uid, eid),
+                )
+            db.execute(
+                "INSERT INTO revisions(umo,entity,entity_id,before_data,actor,note,created) VALUES(?,?,?,?,?,?,?)",
+                (
+                    umo,
+                    "privacy_restore_event",
+                    str(eid),
+                    encode({"event_id": eid, "hidden_uids": hidden_uids}),
+                    audit_actor,
+                    audit_note,
+                    time.time(),
+                ),
+            )
+            self._bump(db, umo, invalidate=True, privacy=True)
+            return {
+                "restored": True,
+                "kind": "event",
+                "event_id": eid,
+                "uids": hidden_uids,
+            }
 
     def grade(self, umo, uid, rules=None):
         """Derive a transparent lifetime grade from distinct admitted contributions.

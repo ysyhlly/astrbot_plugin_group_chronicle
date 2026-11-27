@@ -154,8 +154,9 @@
         </details>
       </div>
       <div class="actions gc-progress-actions">
+        <button id="run-once" type="button" class="primary" data-series-text="立即整理/重试 1 批">立即整理/重试 1 批</button>
         <button id="pause" type="button" data-series-text="暂停本群整理">暂停本群整理</button>
-        <button id="resume" type="button" class="primary" data-series-text="恢复本群整理">恢复本群整理</button>
+        <button id="resume" type="button" data-series-text="恢复本群整理">恢复本群整理</button>
       </div>
     </div>
     <div id="progress-content" class="card gc-progress-card"></div>
@@ -172,6 +173,17 @@
     </div>
     <div class="gc-drawer-scroll" id="detail-scroll">
       <div id="detail-body" class="gc-detail-body"></div>
+      <div id="restore-panel" hidden class="gc-moderation gc-restore-panel">
+        <h3 data-series-text="撤销隐藏 / 恢复公开">撤销隐藏 / 恢复公开</h3>
+        <p class="muted" data-series-text="该词条当前处于隐私隐藏状态。管理员填写审计理由后可撤销隐藏并解除来源屏蔽，词条将回到隐藏前状态。">该词条当前处于隐私隐藏状态。管理员填写审计理由后可撤销隐藏并解除来源屏蔽，词条将回到隐藏前状态。</p>
+        <label>
+          <span data-series-text="恢复审计理由">恢复审计理由</span>
+          <input id="restore-note" maxlength="1000" placeholder="说明恢复原因（留空默认：管理员撤销隐藏恢复公开）" data-series-placeholder="说明恢复原因（留空默认：管理员撤销隐藏恢复公开）">
+        </label>
+        <div class="actions">
+          <button id="restore-entry" type="button" class="primary" data-series-text="撤销隐藏/恢复公开">撤销隐藏/恢复公开</button>
+        </div>
+      </div>
       <div id="moderation" class="gc-moderation">
         <h3 data-series-text="审核与修订">审核与修订</h3>
         <label>
