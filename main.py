@@ -70,6 +70,7 @@ from astrbot.api.star import Context, Star, StarTools
 if __package__:
     from .core.annual_report import build_annual_report, parse_annual_report_args
     from .core.biography import generate_biography
+    from .core.blindbox import build_on_this_day, run_blindbox
     from .core.culture_service import CultureService
     from .core.culture_web import CultureWeb
     from .core.deliver import build_export_markdown, deliver_text, split_text
@@ -99,6 +100,7 @@ if __package__:
         invalidate_lm_cache,
         lm_unavailable_reason,
     )
+    from .core.meme_evolution import build_meme_evolution_card, generate_meme_remix
     from .core.persona import resolve_system_prompt
     from .core.render import (
         clear_render_cache,
@@ -106,10 +108,17 @@ if __package__:
         normalize_render_theme,
         render_text_or_image,
     )
+    from .core.series_bridge import (
+        ingest_archived_topic_event,
+        publish_chronicle_milestone,
+        subscribe_topic_archived,
+        unsubscribe_event,
+    )
     from .core.store import ChronicleStore
 else:  # Top-level import is reserved for the test harness.
     from core.annual_report import build_annual_report, parse_annual_report_args
     from core.biography import generate_biography
+    from core.blindbox import build_on_this_day, run_blindbox
     from core.culture_service import CultureService
     from core.culture_web import CultureWeb
     from core.deliver import build_export_markdown, deliver_text, split_text
@@ -139,12 +148,19 @@ else:  # Top-level import is reserved for the test harness.
         invalidate_lm_cache,
         lm_unavailable_reason,
     )
+    from core.meme_evolution import build_meme_evolution_card, generate_meme_remix
     from core.persona import resolve_system_prompt
     from core.render import (
         clear_render_cache,
         markdown_to_html,
         normalize_render_theme,
         render_text_or_image,
+    )
+    from core.series_bridge import (
+        ingest_archived_topic_event,
+        publish_chronicle_milestone,
+        subscribe_topic_archived,
+        unsubscribe_event,
     )
     from core.store import ChronicleStore
 
@@ -185,6 +201,11 @@ class GroupChroniclePlugin(Star):
         self._bg_tasks: set[asyncio.Task] = set()
         #: 每周定时推送任务 ID
         self._weekly_job_id = "group_chronicle_weekly"
+        #: Wave 3 事件总线退订令牌 / 话题归档候选队列 / 活跃群史盲盒状态
+        self._event_bus_tokens: list[str] = []
+        self._archived_topic_cues: dict[str, list[dict[str, Any]]] = {}
+        self._active_blindboxes: dict[str, dict[str, Any]] = {}
+        self._wave3_keepsake_dedup: set[str] = set()
         self.history = HistoryService(self, self.store)
         self.culture = CultureService(self)
         self.culture_web = CultureWeb(self)
@@ -1125,6 +1146,58 @@ class GroupChroniclePlugin(Star):
             await self._setup_weekly_job()
         except Exception as e:  # noqa: BLE001 - 初始化异常不阻断插件加载
             logger.error(f"初始化失败, 定时任务注册已跳过: {e}", exc_info=True)
+        try:
+            tok = subscribe_topic_archived(
+                self.context, self._on_topic_archived_event, owner="group_chronicle"
+            )
+            if tok:
+                self._event_bus_tokens.append(tok)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"订阅 Dynamics Event Bus topic_archived 跳过: {e}")
+
+    async def _on_topic_archived_event(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Event Bus callback: collect high-signal archived topics as chronicle candidates."""
+        return await ingest_archived_topic_event(self, payload)
+
+    def get_archived_topic_cues(self, umo: str) -> list[dict[str, Any]]:
+        """Read-only accessor for recently collected topic_archived candidate cues."""
+        return list(self._archived_topic_cues.get(str(umo or ""), []))
+
+    def _schedule_milestone_keepsake(
+        self,
+        umo: str,
+        *,
+        title: str,
+        summary: str,
+        kind: str = "chronicle_edition",
+        tab: str = "editions",
+        event_id: int | None = None,
+        report_id: int | None = None,
+        existing_image_path: str = "",
+        importance: int = 3,
+    ) -> None:
+        """Schedule non-blocking polaroid artwork + 3D World keepsake + Event Bus milestone."""
+        if self._terminating or not self._cfg("enable_world_keepsake_sync", True):
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._spawn_bg(
+            publish_chronicle_milestone(
+                self,
+                umo,
+                title=title,
+                summary=summary,
+                kind=kind,
+                tab=tab,
+                event_id=event_id,
+                report_id=report_id,
+                existing_image_path=existing_image_path,
+                importance=importance,
+            ),
+            label=f"keepsake:{kind}:{umo}",
+        )
 
     async def _setup_weekly_job(self) -> None:
         """仅当启用每周推送且配置了目标群时, 注册 CronTrigger 周任务。"""
@@ -1217,6 +1290,12 @@ class GroupChroniclePlugin(Star):
         """插件卸载入口: 移除每周定时任务 / 清理投票状态与渲染缓存
         (任何异常只记录, 不抛出)。"""
         self._terminating = True
+        for tok in list(getattr(self, "_event_bus_tokens", [])):
+            unsubscribe_event(self.context, tok)
+        if hasattr(self, "_event_bus_tokens"):
+            self._event_bus_tokens.clear()
+        if hasattr(self, "_active_blindboxes"):
+            self._active_blindboxes.clear()
         invalidate_lm_cache()
         self.culture_web.close()
         panel = getattr(self, "_series_panels", None)
@@ -1367,9 +1446,133 @@ class GroupChroniclePlugin(Star):
     @filter.command("梗溯源")
     async def culture_origin(self, event: AstrMessageEvent, query: str = ""):
         try:
-            yield event.plain_result(await self.culture.command(event, "梗溯源", query))
+            tail = (
+                str(getattr(event, "message_str", ""))
+                .lstrip("/")
+                .partition("梗溯源")[2]
+                .strip()
+            )
+            res = await build_meme_evolution_card(self, event, tail or query)
+            umo = str(getattr(event, "unified_msg_origin", "") or "")
+            card_path = res.get("card_image_path")
+            meme_imgs = [p for p in (res.get("meme_images") or []) if p and os.path.isfile(p)]
+            has_card = bool(card_path and os.path.isfile(card_path))
+            if has_card or meme_imgs:
+                try:
+                    from astrbot.api.message_components import Image as _ImageComp
+                except ImportError:
+                    _ImageComp = None
+                if _ImageComp is not None:
+                    chain_items = []
+                    if has_card:
+                        chain_items.append(_ImageComp.fromFileSystem(card_path))
+                    for mp in meme_imgs[:3]:
+                        chain_items.append(_ImageComp.fromFileSystem(mp))
+                    if chain_items:
+                        try:
+                            await self._send(
+                                event,
+                                umo,
+                                MessageChain(chain=chain_items),
+                                prefer_context=False,
+                            )
+                        except Exception as exc:
+                            logger.debug(f"梗溯源图文发送失败，降级为纯文本: {exc}")
+            yield event.plain_result(res["text"])
         except (ValueError, PermissionError) as exc:
             yield event.plain_result(str(exc))
+
+    @filter.command("梗图演绎", alias={"梗演绎"})
+    async def meme_remix_command(self, event: AstrMessageEvent, query: str = ""):
+        """调用视觉工坊为本群热梗生成角色演绎专属表情图（无视觉插件时降级卡片/文本）。"""
+        umo = getattr(event, "unified_msg_origin", None)
+        if not umo:
+            yield event.plain_result("无法获取会话标识")
+            return
+        scope_ok, scope_reason = await self._check_group_scope(umo)
+        if not scope_ok:
+            yield event.plain_result(scope_reason)
+            return
+        raw_msg = str(getattr(event, "message_str", "") or "").lstrip("/")
+        tail = ""
+        for prefix in ("梗图演绎", "梗演绎"):
+            if prefix in raw_msg:
+                tail = raw_msg.partition(prefix)[2].strip()
+                break
+        term = tail or str(query or "").strip()
+        if not term:
+            yield event.plain_result("用法：/梗图演绎 <群梗词或ID>（将结合本群文化词库生成角色演绎表情图）。")
+            return
+        res = await generate_meme_remix(self, event, term)
+        img = res.get("image_path")
+        if img and os.path.isfile(img):
+            await deliver_text(
+                self.context,
+                event,
+                umo,
+                res["text"],
+                img,
+                prefer_context=False,
+                use_forward_nodes=False,
+                max_chars=int(self._cfg("max_reply_chars", 1500)),
+                node_name="梗图演绎",
+            )
+            return
+        yield event.plain_result(res["text"])
+
+    @filter.command("群史盲盒", alias={"史记盲盒"})
+    async def history_blindbox_command(self, event: AstrMessageEvent, arg: str = ""):
+        """随机抽取本群历史名场面或老梗出处进行轻量考据互动（支持「揭晓」查看答案）。"""
+        umo = getattr(event, "unified_msg_origin", None)
+        if not umo:
+            yield event.plain_result("无法获取会话标识")
+            return
+        raw_msg = str(getattr(event, "message_str", "") or "").lstrip("/")
+        tail = ""
+        for prefix in ("群史盲盒", "史记盲盒"):
+            if prefix in raw_msg:
+                tail = raw_msg.partition(prefix)[2].strip()
+                break
+        res = await run_blindbox(self, event, tail or arg)
+        yield event.plain_result(res["text"])
+
+    @filter.command("那年今日", alias={"历史上的今天"})
+    async def on_this_day_command(self, event: AstrMessageEvent, date_arg: str = ""):
+        """回顾往年今日的群大事与群梗诞生时刻，支持图文回顾卡。"""
+        umo = getattr(event, "unified_msg_origin", None)
+        if not umo:
+            yield event.plain_result("无法获取会话标识")
+            return
+        raw_msg = str(getattr(event, "message_str", "") or "").lstrip("/")
+        tail = ""
+        for prefix in ("那年今日", "历史上的今天"):
+            if prefix in raw_msg:
+                tail = raw_msg.partition(prefix)[2].strip()
+                break
+        group_name = await asyncio.to_thread(self._group_name_readonly, umo)
+        res = await build_on_this_day(
+            self,
+            umo,
+            date_arg=tail or date_arg,
+            group_name=group_name,
+            render_card=True,
+            push_mode=False,
+        )
+        img = res.get("image_path")
+        if res.get("has_items") and img and os.path.isfile(img):
+            await deliver_text(
+                self.context,
+                event,
+                umo,
+                res["text"],
+                img,
+                prefer_context=False,
+                use_forward_nodes=bool(self._cfg("use_forward_nodes", True)),
+                max_chars=int(self._cfg("max_reply_chars", 1500)),
+                node_name="那年今日",
+            )
+            return
+        yield event.plain_result(res["text"])
 
     @filter.command("文化纠正")
     async def culture_correct(
@@ -1884,6 +2087,19 @@ class GroupChroniclePlugin(Star):
                 raise _SkipWeek()
             if text.startswith("此时间范围尚无已入史的大事。"):
                 raise NoActivityError(text)
+            vol_days = int(days or self._cfg("chronicle_days", 7) or 7)
+            vol_label = {7: "周卷", 30: "月卷", 90: "季卷", 365: "年卷"}.get(
+                vol_days, f"{vol_days}天卷"
+            )
+            self._schedule_milestone_keepsake(
+                umo,
+                title=f"{group_name} · 群史记（{vol_label}）",
+                summary=text[:260],
+                kind="chronicle_edition",
+                tab="editions",
+                existing_image_path=image_path or "",
+                importance=3,
+            )
             return text, image_path
         iso_year, iso_week = datetime.now().isocalendar()[:2]
         existing = await asyncio.to_thread(self.store.get, umo, iso_year, iso_week)
@@ -2085,6 +2301,15 @@ class GroupChroniclePlugin(Star):
             except Exception as e:  # noqa: BLE001 - 持久化失败不阻断本次发送
                 logger.error(f"保存史记失败 (umo={umo}): {e}", exc_info=True)
 
+        self._schedule_milestone_keepsake(
+            umo,
+            title=f"{group_name} · {iso_year}-W{iso_week:02d} 群史记",
+            summary=text[:260],
+            kind="chronicle_edition",
+            tab="editions",
+            existing_image_path=image_path or "",
+            importance=3,
+        )
         return text, image_path
 
     @staticmethod
@@ -2261,7 +2486,8 @@ class GroupChroniclePlugin(Star):
             "• 人物等级 [@成员] / 人物传 [@成员] / 影响力榜 —— 查看贡献等级、传记与排行",
             "• 记一笔 标题｜经过与结果｜日期=YYYY-MM-DD —— 提交群大事线索（支持 @参与者）",
             "• 史记更正 <事件ID> <建议> —— 向管理员提交事件更正请求",
-            "• 群文化 [关键词] / 梗溯源 <词或ID> / 文化纠正 <ID> <说明> —— 查询群梗与黑话",
+            "• 群文化 [关键词] / 梗溯源 <词或ID> / 梗图演绎 <词> / 文化纠正 <ID> <说明> —— 查询群梗、图文溯源与演绎表情",
+            "• 群史盲盒 [大事|词条|揭晓] / 那年今日 [MMDD] —— 历史名场面考据盲盒与往年今日回顾卡",
             "• 史记隐藏 [事件ID] [全局] / 史记恢复 [事件ID] [全局] —— 预览确认隐藏与可审计恢复",
             "• 文化隐藏 <ID> [全局] / 文化恢复 <ID> [全局] —— 预览确认隐藏文化词条与可审计恢复",
             "  （注：隐藏默认仅作用于本插件，加「全局」可同步静音/解除群间记忆与群间学习）",
@@ -3686,6 +3912,34 @@ class GroupChroniclePlugin(Star):
                         "Weekly result delivered but delivery state could not be saved",
                         exc_info=True,
                     )
+                if self._cfg("enable_on_this_day_in_push", True):
+                    try:
+                        otd_group = await asyncio.to_thread(
+                            self._group_name_readonly, umo
+                        )
+                        otd = await build_on_this_day(
+                            self,
+                            umo,
+                            group_name=otd_group,
+                            render_card=False,
+                            push_mode=True,
+                        )
+                        if otd.get("has_items") and otd.get("text"):
+                            await deliver_text(
+                                self.context,
+                                None,
+                                umo,
+                                otd["text"],
+                                otd.get("image_path"),
+                                prefer_context=True,
+                                use_forward_nodes=bool(
+                                    self._cfg("use_forward_nodes", True)
+                                ),
+                                max_chars=int(self._cfg("max_reply_chars", 1500)),
+                                node_name="那年今日",
+                            )
+                    except Exception:
+                        logger.debug("Weekly push on-this-day appendix skipped", exc_info=True)
             else:
                 logger.warning("Weekly delivery failed; saved result remains pending")
 

@@ -2632,6 +2632,30 @@ class ArchiveStore:
                     return True
             return False
 
+    def attach_report_artwork(self, umo, artwork_path, deep_link=""):
+        """Attach a generated milestone polaroid artwork path to the latest public edition."""
+        clean_path = str(artwork_path or "").strip()
+        if not clean_path:
+            return False
+        with self.connection(write=True) as db:
+            row = db.execute(
+                "SELECT id,entry FROM reports WHERE umo=? AND invalid=0 ORDER BY id DESC LIMIT 1",
+                (umo,),
+            ).fetchone()
+            if not row:
+                return False
+            entry = json.loads(row["entry"])
+            if entry.get("report_kind") == "biography":
+                return False
+            entry["artwork_path"] = clean_path
+            if deep_link:
+                entry["keepsake_deep_link"] = str(deep_link)
+            db.execute(
+                "UPDATE reports SET entry=? WHERE id=?",
+                (encode(entry), row["id"]),
+            )
+            return True
+
     def import_legacy(self, entries):
         """Import old generated prose as editions, never as factual evidence.
 

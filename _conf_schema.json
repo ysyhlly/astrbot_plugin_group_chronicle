@@ -412,5 +412,19 @@
         "type": "bool",
         "default": true,
         "hint": "前置条件：仅兼容模式（history_enabled=false）生效；默认长期群史模式由长期人物档案与群文化系统替代。生成群史记时为影响力 Top-N 群友追加「群友图鉴」分节；关闭则不生成"
+    },
+    "enable_on_this_day_in_push": {
+        "group": "定时推送与调度",
+        "description": "📜 [定时推送] 随周推附带「那年今日」",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，每周史记推送当日若恰好存在往年同期的公开群大事或群梗，将低频附带一条「那年今日」历史回顾"
+    },
+    "enable_world_keepsake_sync": {
+        "group": "群间系列互联",
+        "description": "🏠 [系列互联] 史记与重大事件自动上架 3D 小屋纪念品",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，每当周/月/年群史卷册生成完成或重要度≥3 的群大事审核通过时，自动请求视觉工坊生成拍立得插画并上架至 3D 小屋照片墙/书架，同时广播 milestone_achieved 事件（未安装对应插件时静默跳过）"
     }
 }

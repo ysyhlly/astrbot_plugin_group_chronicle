@@ -531,6 +531,8 @@ class CultureWeb:
                         "char_count": len(text),
                         "summary": summary,
                         "event_ids": list(r.get("event_ids") or []),
+                        "artwork_path": str(r.get("artwork_path") or ""),
+                        "keepsake_deep_link": str(r.get("keepsake_deep_link") or ""),
                         "chronicle_text": text,
                     }
                     out.append(item)
@@ -683,6 +685,25 @@ class CultureWeb:
 
                 ok_ids, errs = await asyncio.to_thread(_run_event_batch)
                 self.service.history.cancel_operations(umo)
+                if action_name == "approve" and ok_ids:
+                    sched = getattr(
+                        self.service.plugin, "_schedule_milestone_keepsake", None
+                    )
+                    if callable(sched):
+                        for eid in ok_ids:
+                            ev_row = await asyncio.to_thread(
+                                store.event, umo, eid, public=True
+                            )
+                            if ev_row and int(ev_row.get("importance", 1)) >= 3:
+                                sched(
+                                    umo,
+                                    title=str(ev_row.get("title") or f"重大事件 #{eid}"),
+                                    summary=str(ev_row.get("detail") or "")[:260],
+                                    kind="major_event",
+                                    tab="events",
+                                    event_id=eid,
+                                    importance=int(ev_row.get("importance", 3)),
+                                )
                 return {"ok": True, "action": action_name, "succeeded": ok_ids, "failed": errs}
             if action_name == "merge":
                 eid = body.get("event_id")

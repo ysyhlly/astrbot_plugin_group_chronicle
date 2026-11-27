@@ -751,6 +751,22 @@ async def handle_command(service, event, supplied=None):
                     actor,
                     note=rest or command,
                 )
+                if command == "史记确认":
+                    approved_ev = await asyncio.to_thread(
+                        store.event, umo, event_id, public=True
+                    )
+                    if approved_ev and int(approved_ev.get("importance", 1)) >= 3:
+                        sched = getattr(plugin, "_schedule_milestone_keepsake", None)
+                        if callable(sched):
+                            sched(
+                                umo,
+                                title=str(approved_ev.get("title") or f"重大事件 #{event_id}"),
+                                summary=str(approved_ev.get("detail") or "")[:260],
+                                kind="major_event",
+                                tab="events",
+                                event_id=event_id,
+                                importance=int(approved_ev.get("importance", 3)),
+                            )
                 return f"事件 #{event_id} 已" + (
                     "确认入史，贡献等级已重新计算。"
                     if command == "史记确认"
